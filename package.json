@@ -13,10 +13,12 @@
 	},
 	"dependencies": {
 		"@base-ui/react": "^1.5.0",
+		"@better-auth/prisma-adapter": "^1.6.11",
 		"@fontsource-variable/geist": "^5.2.9",
 		"@prisma/adapter-pg": "^7.8.0",
 		"@prisma/client": "^7.8.0",
 		"@tanstack/react-router": "^1.170.7",
+		"better-auth": "^1.6.11",
 		"class-variance-authority": "^0.7.1",
 		"clsx": "^2.1.1",
 		"dotenv": "^17.4.2",

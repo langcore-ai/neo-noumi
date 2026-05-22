@@ -1,2 +1,8 @@
 # Cloudflare Workers 本地开发环境变量示例
 DATABASE_URL="postgresql://postgres:postgres@localhost:5432/neo_noumi?schema=public"
+
+# Better Auth 签名密钥，本地可通过 `bunx @better-auth/cli@latest secret` 生成
+BETTER_AUTH_SECRET="replace-with-a-random-secret"
+
+# Better Auth 对外访问地址，本地 Vite 默认端口为 5173
+BETTER_AUTH_URL="http://localhost:5173"

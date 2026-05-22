@@ -64,12 +64,17 @@ function App() {
 			<p className="read-the-docs mt-6 text-sm text-white/60">
 				Click on the logos to learn more
 			</p>
-			<Link
-				to="/shadcn"
-				className={buttonVariants({ variant: "outline", className: "mt-6" })}
-			>
-				查看 shadcn 组件示例
-			</Link>
+			<div className="mt-6 flex flex-wrap justify-center gap-3">
+				<Link to="/login" className={buttonVariants({ variant: "outline" })}>
+					登录
+				</Link>
+				<Link to="/register" className={buttonVariants()}>
+					注册
+				</Link>
+				<Link to="/shadcn" className={buttonVariants({ variant: "outline" })}>
+					查看 shadcn 组件示例
+				</Link>
+			</div>
 		</div>
 	);
 }

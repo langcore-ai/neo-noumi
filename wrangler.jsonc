@@ -17,6 +17,12 @@
 			"/api/*",
 		]
 	},
+	"kv_namespaces": [
+		{
+			"binding": "AUTH_KV",
+			"id": "b09257c62718424b86f04f3f38569b36"
+		}
+	],
 	"hyperdrive": [
 		{
 			"binding": "HYPERDRIVE",
