@@ -1,7 +1,9 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { cloudflare } from "@cloudflare/vite-plugin";
+import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
-	plugins: [react(), cloudflare()],
+	// 通过官方 Vite 插件接入 Tailwind，避免额外维护 PostCSS 配置
+	plugins: [react(), cloudflare(), tailwindcss()],
 });
