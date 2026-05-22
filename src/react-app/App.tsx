@@ -1,11 +1,11 @@
 // src/App.tsx
 
 import { useState } from "react";
+import { Button } from "@/components/ui/button";
 import reactLogo from "./assets/react.svg";
 import viteLogo from "/vite.svg";
 import cloudflareLogo from "./assets/Cloudflare_Logo.svg";
 import honoLogo from "./assets/hono.svg";
-import "./App.css";
 
 function App() {
 	const [count, setCount] = useState(0);
@@ -35,20 +35,18 @@ function App() {
 				Vite + React + Hono + Cloudflare
 			</h1>
 			<div className="card rounded-2xl border border-white/10 bg-white/5 shadow-lg shadow-black/20 backdrop-blur">
-				<button
-					className="rounded-lg bg-slate-900 px-4 py-2 font-medium text-white transition hover:bg-slate-800"
+				<Button
 					onClick={() => setCount((count) => count + 1)}
 					aria-label="increment"
 				>
 					count is {count}
-				</button>
+				</Button>
 				<p>
 					Edit <code>src/App.tsx</code> and save to test HMR
 				</p>
 			</div>
 			<div className="card rounded-2xl border border-white/10 bg-white/5 shadow-lg shadow-black/20 backdrop-blur">
-				<button
-					className="rounded-lg bg-slate-900 px-4 py-2 font-medium text-white transition hover:bg-slate-800"
+				<Button
 					onClick={() => {
 						fetch("/api/")
 							.then((res) => res.json() as Promise<{ name: string }>)
@@ -57,7 +55,7 @@ function App() {
 					aria-label="get name"
 				>
 					Name from API is: {name}
-				</button>
+				</Button>
 				<p>
 					Edit <code>worker/index.ts</code> to change the name
 				</p>
