@@ -12,7 +12,11 @@
 		"publish": true
 	},
 	"dependencies": {
+		"@prisma/adapter-pg": "^7.8.0",
+		"@prisma/client": "^7.8.0",
+		"dotenv": "^17.4.2",
 		"hono": "4.11.1",
+		"pg": "^8.21.0",
 		"react": "19.2.1",
 		"react-dom": "19.2.1"
 	},
@@ -40,7 +44,11 @@
 		"deploy": "wrangler deploy",
 		"dev": "vite",
 		"lint": "eslint .",
-		"preview": "npm run build && vite preview"
+		"preview": "bun run build && vite preview",
+		"prisma:generate": "dotenv -e .env -- prisma generate",
+		"prisma:migrate": "dotenv -e .env -- prisma migrate dev",
+		"prisma:db:pull": "dotenv -e .env -- prisma db pull",
+		"prisma:studio": "dotenv -e .env -- prisma studio"
 	},
 	"type": "module"
 }

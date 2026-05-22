@@ -1,0 +1,2 @@
+# Cloudflare Workers 本地开发环境变量示例
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/neo_noumi?schema=public"
