@@ -74,6 +74,9 @@ function App() {
 				<Link to="/shadcn" className={buttonVariants({ variant: "outline" })}>
 					查看 shadcn 组件示例
 				</Link>
+				<Link to="/chat" className={buttonVariants({ variant: "outline" })}>
+					打开 CCR Chat
+				</Link>
 			</div>
 		</div>
 	);

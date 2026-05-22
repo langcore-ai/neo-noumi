@@ -20,9 +20,27 @@ model User {
   updatedAt       DateTime
   sessions        Session[]
   accounts        Account[]
+  projects        Project[]
+  chatSessions    ChatSession[]
+  userContainer   UserContainer?
 
   @@unique([email])
   @@map("user")
+}
+
+model Project {
+  id          String       @id
+  name        String
+  description String?
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions    ChatSession[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+
+  @@index([userId, updatedAt])
+  @@map("projects")
 }
 
 model Session {
@@ -68,4 +86,142 @@ model Verification {
   updatedAt  DateTime?
 
   @@map("verification")
+}
+
+model ChatSession {
+  id                    String    @id
+  title                 String?
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId             String
+  project               Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  workerEpoch           Int       @default(0)
+  workerStatus          String    @default("idle")
+  containerStatus       String    @default("stopped")
+  sandboxId             String?
+  runnerProcessId       String?
+  workerAccessToken     String?
+  externalMetadata      Json      @default("{}")
+  requiresActionDetails Json?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  deletedAt             DateTime?
+  lastHeartbeatAt       DateTime?
+  clientEvents          ChatClientEvent[]
+  workerEvents          ChatWorkerEvent[]
+  internalEvents        ChatInternalEvent[]
+  deliveryUpdates       ChatDeliveryUpdate[]
+  operationLogs         ChatOperationLog[]
+  sessionStoreFiles     ChatSessionStoreFile[]
+
+  @@index([userId, updatedAt])
+  @@index([projectId, updatedAt])
+  @@map("chat_sessions")
+}
+
+model UserContainer {
+  id              String   @id
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sandboxId       String?
+  containerStatus String   @default("stopped")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("user_containers")
+}
+
+model ChatClientEvent {
+  id          Int        @id @default(autoincrement())
+  sessionId   String
+  session     ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  eventId     String     @unique
+  sequenceNum Int
+  eventType   String
+  source      String
+  payload     Json
+  status      String     @default("queued")
+  createdAt   DateTime   @default(now())
+
+  @@index([sessionId, sequenceNum])
+  @@unique([sessionId, sequenceNum])
+  @@map("chat_client_events")
+}
+
+model ChatWorkerEvent {
+  id          Int        @id @default(autoincrement())
+  sessionId   String
+  session     ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  eventId     String     @unique
+  workerEpoch Int
+  eventType   String
+  payload     Json
+  ephemeral   Boolean    @default(false)
+  createdAt   DateTime   @default(now())
+
+  @@index([sessionId, id])
+  @@map("chat_worker_events")
+}
+
+model ChatInternalEvent {
+  id            Int        @id @default(autoincrement())
+  sessionId     String
+  session       ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  eventId       String     @unique
+  workerEpoch   Int
+  eventType     String
+  payload       Json
+  eventMetadata Json?
+  isCompaction  Boolean    @default(false)
+  agentId       String?
+  createdAt     DateTime   @default(now())
+
+  @@index([sessionId, agentId, id])
+  @@map("chat_internal_events")
+}
+
+model ChatDeliveryUpdate {
+  id          Int        @id @default(autoincrement())
+  sessionId   String
+  session     ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  eventId     String
+  status      String
+  workerEpoch Int
+  createdAt   DateTime   @default(now())
+
+  @@index([sessionId, eventId])
+  @@map("chat_delivery_updates")
+}
+
+model ChatOperationLog {
+  id          Int        @id @default(autoincrement())
+  sessionId   String
+  session     ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  direction   String
+  category    String
+  eventId     String?
+  agentId     String?
+  toolName    String?
+  toolUseId   String?
+  requestId   String?
+  payload     Json
+  createdAt   DateTime   @default(now())
+
+  @@index([sessionId, id])
+  @@map("chat_operation_log")
+}
+
+model ChatSessionStoreFile {
+  id         Int        @id @default(autoincrement())
+  sessionId  String
+  session    ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  projectKey String
+  subpath    String
+  content    String
+  metadata   Json?
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  @@unique([sessionId, projectKey, subpath])
+  @@map("chat_session_store_files")
 }

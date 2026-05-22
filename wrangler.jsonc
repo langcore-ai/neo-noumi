@@ -2,7 +2,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "neo-noumi",
 	"main": "./src/worker/index.ts",
-	"compatibility_date": "2025-10-08",
+	"compatibility_date": "2025-11-25",
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
@@ -15,12 +15,41 @@
 		"not_found_handling": "single-page-application",
 		"run_worker_first":[
 			"/api/*",
+			"/v1/code/*",
 		]
 	},
 	"kv_namespaces": [
 		{
 			"binding": "AUTH_KV",
 			"id": "b09257c62718424b86f04f3f38569b36"
+		}
+	],
+	"containers": [
+		{
+			"name": "neo-noumi-sandbox",
+			"class_name": "NeoNoumiSandbox",
+			"image": "./Dockerfile",
+			"instance_type": "standard-1",
+			"max_instances": 10
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"class_name": "NeoNoumiSandbox",
+				"name": "NEO_NOUMI_SANDBOX"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["CcrSandbox"]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": ["NeoNoumiSandbox"],
+			"deleted_classes": ["CcrSandbox"]
 		}
 	],
 	"hyperdrive": [
