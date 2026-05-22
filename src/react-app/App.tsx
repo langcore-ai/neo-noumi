@@ -1,7 +1,8 @@
 // src/App.tsx
 
+import { Link } from "@tanstack/react-router";
 import { useState } from "react";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import reactLogo from "./assets/react.svg";
 import viteLogo from "/vite.svg";
 import cloudflareLogo from "./assets/Cloudflare_Logo.svg";
@@ -63,6 +64,12 @@ function App() {
 			<p className="read-the-docs mt-6 text-sm text-white/60">
 				Click on the logos to learn more
 			</p>
+			<Link
+				to="/shadcn"
+				className={buttonVariants({ variant: "outline", className: "mt-6" })}
+			>
+				查看 shadcn 组件示例
+			</Link>
 		</div>
 	);
 }
