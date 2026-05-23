@@ -670,13 +670,13 @@ export class CcrStore {
 		const pageRows = rows.slice(0, limit);
 		return {
 			data: pageRows.map((row) => ({
-				event_id: String(row.id),
+				event_id: row.eventId,
 				event_type: row.eventType,
 				payload: asJsonObject(row.payload),
 				event_metadata: row.eventMetadata ? asJsonObject(row.eventMetadata) : null,
 				is_compaction: row.isCompaction,
 				created_at: row.createdAt.toISOString(),
-				agent_id: row.agentId ?? undefined,
+				agent_id: row.agentId,
 			})),
 			next_cursor:
 				rows.length > limit ? String(pageRows[pageRows.length - 1]?.id) : null,
