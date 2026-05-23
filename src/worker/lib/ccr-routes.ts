@@ -7,7 +7,6 @@ import {
 	destroyCcrSandbox,
 	getCcrSandboxStatus,
 	startCcrSandbox,
-	stopCcrSandbox,
 	stopCcrSessionRunner,
 	type NeoNoumiSandboxBindings,
 } from "./ccr-sandbox";
@@ -212,43 +211,43 @@ async function streamChatTimeline(
 	try {
 		while (!closed) {
 			const lifecycle = await store.getSessionLifecycle(sessionId);
-				if (!lifecycle || lifecycle.deletedAt) {
-					await output.write(
-						formatSseControlFrame("done", {
-							reason: "deleted",
-						}),
-					);
-					return;
+			if (!lifecycle || lifecycle.deletedAt) {
+				await output.write(
+					formatSseControlFrame("done", {
+						reason: "deleted",
+					}),
+				);
+				return;
 			}
 			const events = await store.listChatTimeline(sessionId, cursor);
 			for (const event of events) {
 				cursor = Math.max(cursor, event.id);
-					lastEventAt = Date.now();
+				lastEventAt = Date.now();
+				await output.write(
+					formatSseDataFrame(event.id, "timeline", {
+						session_id: sessionId,
+						event,
+					}),
+				);
+				if (options.closeOnTerminal && isTerminalTimelineEvent(event)) {
 					await output.write(
-						formatSseDataFrame(event.id, "timeline", {
-							session_id: sessionId,
-							event,
+						formatSseControlFrame("done", {
+							reason: "terminal",
 						}),
 					);
-					if (options.closeOnTerminal && isTerminalTimelineEvent(event)) {
-						await output.write(
-							formatSseControlFrame("done", {
-								reason: "terminal",
-							}),
-						);
-						return;
+					return;
 				}
 			}
 			if (
 				options.closeOnTerminal &&
 				Date.now() - lastEventAt >= CHAT_STREAM_IDLE_TIMEOUT_MS
-				) {
-					await output.write(
-						formatSseControlFrame("done", {
-							reason: "idle_timeout",
-						}),
-					);
-					return;
+			) {
+				await output.write(
+					formatSseControlFrame("done", {
+						reason: "idle_timeout",
+					}),
+				);
+				return;
 			}
 			if (Date.now() - lastHeartbeatAt >= SSE_HEARTBEAT_INTERVAL_MS) {
 				await output.write(": heartbeat\n\n");
@@ -502,16 +501,32 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 	});
 
 	app.get("/api/ccr/sessions/:sessionId/container/status", async (c) => {
+		const store = createStore(c.env);
+		const sessionId = c.req.param("sessionId");
+		const session = await store.findUserSessionSummary(c.get("userId"), sessionId);
+		if (!session || session.deletedAt) {
+			return c.json({ error: "Session not found" }, 404);
+		}
 		return c.json(await getCcrSandboxStatus(c.env, c.get("userId")));
 	});
 
 	app.post("/api/ccr/sessions/:sessionId/container/stop", async (c) => {
 		const store = createStore(c.env);
-		return c.json(await stopCcrSandbox(c.env, store, c.get("userId")));
+		const sessionId = c.req.param("sessionId");
+		const session = await store.findUserSessionSummary(c.get("userId"), sessionId);
+		if (!session || session.deletedAt) {
+			return c.json({ error: "Session not found" }, 404);
+		}
+		return c.json(await stopCcrSessionRunner(c.env, store, c.get("userId"), sessionId));
 	});
 
 	app.post("/api/ccr/sessions/:sessionId/container/destroy", async (c) => {
 		const store = createStore(c.env);
+		const sessionId = c.req.param("sessionId");
+		const session = await store.findUserSessionSummary(c.get("userId"), sessionId);
+		if (!session || session.deletedAt) {
+			return c.json({ error: "Session not found" }, 404);
+		}
 		return c.json(await destroyCcrSandbox(c.env, store, c.get("userId")));
 	});
 

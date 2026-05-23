@@ -22,6 +22,9 @@ const DEFAULT_PAGE_SIZE = 100;
 /** 并发写入 client event 发生序号冲突时的最大重试次数 */
 const CLIENT_EVENT_SEQUENCE_RETRY_LIMIT = 3;
 
+/** Client event 等待 worker 消费的状态。 */
+const CLIENT_EVENT_STATUS_QUEUED = "queued";
+
 /** 默认项目名称 */
 const DEFAULT_PROJECT_NAME = "Default Project";
 
@@ -70,6 +73,15 @@ function isKeepAlivePayload(payload: JsonObject): boolean {
  */
 function isSystemInitPayload(payload: JsonObject): boolean {
 	return payload.type === "system" && payload.subtype === "init";
+}
+
+/**
+ * 判断错误是否是 Prisma 唯一约束冲突。
+ * @param error 原始错误
+ * @returns 是否是 P2002
+ */
+function isUniqueConstraintError(error: unknown): boolean {
+	return isJsonObject(error) && error.code === "P2002";
 }
 
 /** PostgreSQL backed chat session store */
@@ -478,14 +490,7 @@ export class CcrStore {
 			eventId: created.eventId,
 			payload,
 		});
-		return {
-			event_id: created.eventId,
-			sequence_num: created.sequenceNum,
-			event_type: created.eventType,
-			source: created.source,
-			payload: asJsonObject(created.payload),
-			created_at: created.createdAt.toISOString(),
-		};
+		return this.toClientEventDto(created);
 	}
 
 	/**
@@ -500,14 +505,7 @@ export class CcrStore {
 			orderBy: { sequenceNum: "asc" },
 			take: DEFAULT_PAGE_SIZE,
 		});
-		return rows.map((row) => ({
-			event_id: row.eventId,
-			sequence_num: row.sequenceNum,
-			event_type: row.eventType,
-			source: row.source,
-			payload: asJsonObject(row.payload),
-			created_at: row.createdAt.toISOString(),
-		}));
+		return rows.map((row) => this.toClientEventDto(row));
 	}
 
 	/**
@@ -522,19 +520,12 @@ export class CcrStore {
 				sessionId,
 				sequenceNum: { gt: fromSequence },
 				// 新 worker 从 0 建立 SSE 时不能重放已交付输入，否则旧消息会被再次执行并入库。
-				status: "queued",
+				status: CLIENT_EVENT_STATUS_QUEUED,
 			},
 			orderBy: { sequenceNum: "asc" },
 			take: DEFAULT_PAGE_SIZE,
 		});
-		return rows.map((row) => ({
-			event_id: row.eventId,
-			sequence_num: row.sequenceNum,
-			event_type: row.eventType,
-			source: row.source,
-			payload: asJsonObject(row.payload),
-			created_at: row.createdAt.toISOString(),
-		}));
+		return rows.map((row) => this.toClientEventDto(row));
 	}
 
 	/**
@@ -570,18 +561,24 @@ export class CcrStore {
 					continue;
 				}
 			}
-			await this.prisma.chatWorkerEvent.upsert({
-				where: { eventId },
-				create: {
-					sessionId,
-					eventId,
-					workerEpoch: epoch,
-					eventType,
-					payload,
-					ephemeral: Boolean(event.ephemeral),
-				},
-				update: {},
-			});
+			try {
+				await this.prisma.chatWorkerEvent.create({
+					data: {
+						sessionId,
+						eventId,
+						workerEpoch: epoch,
+						eventType,
+						payload,
+						ephemeral: Boolean(event.ephemeral),
+					},
+				});
+			} catch (error) {
+				// eventId 是 worker visible event 的幂等键；重复上报不应继续写 operation log。
+				if (isUniqueConstraintError(error)) {
+					continue;
+				}
+				throw error;
+			}
 			await this.recordOperation(sessionId, {
 				direction: "worker_to_route",
 				category: eventType,
@@ -589,6 +586,29 @@ export class CcrStore {
 				payload,
 			});
 		}
+	}
+
+	/**
+	 * 将 client event 数据库行转换成 CCR 协议 DTO。
+	 * @param row client event 数据库行
+	 * @returns 协议 DTO
+	 */
+	private toClientEventDto(row: {
+		eventId: string;
+		sequenceNum: number;
+		eventType: string;
+		source: string;
+		payload: unknown;
+		createdAt: Date;
+	}) {
+		return {
+			event_id: row.eventId,
+			sequence_num: row.sequenceNum,
+			event_type: row.eventType,
+			source: row.source,
+			payload: asJsonObject(row.payload),
+			created_at: row.createdAt.toISOString(),
+		};
 	}
 
 	/**
@@ -698,6 +718,17 @@ export class CcrStore {
 		updates: Array<{ event_id: string; status: string }>,
 	) {
 		for (const update of updates) {
+			if (!update.event_id) {
+				continue;
+			}
+			const updated = await this.prisma.chatClientEvent.updateMany({
+				where: { sessionId, eventId: update.event_id },
+				data: { status: update.status },
+			});
+			// delivery 是 client event 的状态转移；找不到原事件时不写孤儿审计行。
+			if (updated.count === 0) {
+				continue;
+			}
 			await this.prisma.chatDeliveryUpdate.create({
 				data: {
 					sessionId,
@@ -705,10 +736,6 @@ export class CcrStore {
 					status: update.status,
 					workerEpoch: epoch,
 				},
-			});
-			await this.prisma.chatClientEvent.updateMany({
-				where: { sessionId, eventId: update.event_id },
-				data: { status: update.status },
 			});
 		}
 	}

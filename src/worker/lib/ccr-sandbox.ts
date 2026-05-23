@@ -319,31 +319,6 @@ export async function getCcrSandboxStatus(
 }
 
 /**
- * 停止 CCR sandbox 内进程。
- */
-export async function stopCcrSandbox(
-	env: NeoNoumiSandboxBindings,
-	store: CcrStore,
-	userId: string,
-	options: { updateStore?: boolean } = {},
-) {
-	const sandbox = getCcrSandbox(env, userId);
-	const processes = await sandbox.listProcesses().catch(() => []);
-	if (Array.isArray(processes)) {
-		for (const process of processes) {
-			const id = getProcessId(process);
-			if (id) {
-				await sandbox.killProcess(id).catch(() => undefined);
-			}
-		}
-	}
-	if (options.updateStore !== false) {
-		await store.updateUserContainer(userId, { containerStatus: "stopped" });
-	}
-	return { ok: true };
-}
-
-/**
  * 停止指定 session 的 sandbox runner。
  */
 export async function stopCcrSessionRunner(

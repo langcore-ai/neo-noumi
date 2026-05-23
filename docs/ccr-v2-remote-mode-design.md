@@ -23,7 +23,7 @@
 - Cloudflare 资源使用 `NeoNoumiSandbox` / `NEO_NOUMI_SANDBOX` / `neo-noumi-sandbox` 命名，用户级 sandbox ID 使用 `neo-noumi-user-{userId}`。
 - 容器粒度是“一个用户一个 sandbox/container”，而不是“一个 session 一个容器”。
 - runner 粒度仍是“一个活跃 session 一个 Claude Code CLI 进程”；`chat_sessions.runnerProcessId` 记录 session 对应的容器内进程，防止同一用户多个 session 互相复用错 runner。
-- 删除活跃 session 时只停止该 session 的 runner；显式 stop/destroy 容器操作仍作用于当前用户的整个 sandbox。
+- 删除活跃 session 时只停止该 session 的 runner；session 级 stop 也只停止该 session 记录的 runner，并同步清理 `runnerProcessId` 与 session 容器状态。destroy 仍作用于当前用户的整个 sandbox，但必须先校验 URL 中的 session 属于当前用户。
 
 ## 两套机制的关系
 
@@ -577,6 +577,7 @@ data: {"event_id":"...","sequence_num":1,"event_type":"...","source":"...","payl
 - `ephemeral: true` 主要用于流式临时事件。
 - `payload.type === "keep_alive"` 只用于维持 worker 长连接，不写入 `chat_worker_events`，也不进入 operation log。
 - 同一 session、同一 worker epoch 的 `system/init` 只保留第一条，避免 runner 初始化元数据重复污染可见时间线。
+- `payload.uuid` 是 visible event 的幂等键；重复上报同一 uuid 时不再写 `chat_worker_events`，也不再写 operation log，避免审计流和事件表语义不一致。
 
 ### POST /worker/internal-events
 
@@ -662,6 +663,8 @@ GET /worker/internal-events?subagents=true
 ```text
 received | processing | processed
 ```
+
+说明：delivery update 只对已存在的 client event 生效；空 `event_id` 或找不到原始 client event 时会被忽略，避免写入孤儿 delivery 审计行。
 
 ### PUT /worker
 
