@@ -54,6 +54,24 @@ function asJsonObject(value: unknown): JsonObject {
 	return isJsonObject(value) ? value : {};
 }
 
+/**
+ * 判断事件 payload 是否只是连接保活。
+ * @param payload 事件 payload
+ * @returns 是否应跳过持久化
+ */
+function isKeepAlivePayload(payload: JsonObject): boolean {
+	return payload.type === "keep_alive";
+}
+
+/**
+ * 判断事件是否为 runner 初始化元数据。
+ * @param payload 事件 payload
+ * @returns 是否为 system/init 事件
+ */
+function isSystemInitPayload(payload: JsonObject): boolean {
+	return payload.type === "system" && payload.subtype === "init";
+}
+
 /** PostgreSQL backed chat session store */
 export class CcrStore {
 	constructor(private readonly prisma: PrismaClient) {}
@@ -478,7 +496,12 @@ export class CcrStore {
 	 */
 	async listClientEvents(sessionId: string, fromSequence: number) {
 		const rows = await this.prisma.chatClientEvent.findMany({
-			where: { sessionId, sequenceNum: { gt: fromSequence } },
+			where: {
+				sessionId,
+				sequenceNum: { gt: fromSequence },
+				// 新 worker 从 0 建立 SSE 时不能重放已交付输入，否则旧消息会被再次执行并入库。
+				status: "queued",
+			},
 			orderBy: { sequenceNum: "asc" },
 			take: DEFAULT_PAGE_SIZE,
 		});
@@ -505,8 +528,26 @@ export class CcrStore {
 	) {
 		for (const event of events) {
 			const payload = isJsonObject(event.payload) ? event.payload : {};
+			// keep_alive 只用于维持 worker 长连接，不进入业务事件表。
+			if (isKeepAlivePayload(payload)) {
+				continue;
+			}
 			const eventId = eventIdFromPayload(payload);
 			const eventType = String(payload.type ?? "unknown");
+			if (isSystemInitPayload(payload)) {
+				const existingSystemEvents = await this.prisma.chatWorkerEvent.findMany({
+					where: { sessionId, workerEpoch: epoch, eventType },
+					select: { payload: true },
+				});
+				// 同一 worker epoch 的 init 只表示同一次 runner 元数据，重复上报不应污染时间线。
+				if (
+					existingSystemEvents.some((item) =>
+						isSystemInitPayload(asJsonObject(item.payload)),
+					)
+				) {
+					continue;
+				}
+			}
 			await this.prisma.chatWorkerEvent.upsert({
 				where: { eventId },
 				create: {
@@ -541,6 +582,10 @@ export class CcrStore {
 	) {
 		for (const event of events) {
 			const payload = isJsonObject(event.payload) ? event.payload : {};
+			// keep_alive 没有审计价值，避免污染 internal event 历史。
+			if (isKeepAlivePayload(payload)) {
+				continue;
+			}
 			const eventId = eventIdFromPayload(payload);
 			const eventType = String(payload.type ?? "unknown");
 			await this.prisma.chatInternalEvent.upsert({

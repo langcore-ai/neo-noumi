@@ -254,6 +254,7 @@ export default {
 - subagent：Claude Code 调用 Task/Agent 后，route 能记录 `task_started`、`task_notification`、tool result，以及带 `agent_id` 的 subagent internal events。
 - SSE 稳定性：真实 CLI 曾在 15 秒心跳下约 12 秒空闲断连；route 心跳调整为 5 秒后，复测日志未再出现 `Stream read error` 或 `socket connection was closed unexpectedly`。
 - 业务 chat API：`POST /api/ccr/sessions/{sessionId}/messages` 在 `Accept: text/event-stream` 下会先返回 `session` SSE frame，再写入用户消息、启动真实远程模式 Claude Code CLI，并在同一个请求里持续输出 `timeline` frame；收到 `result` 后返回 `done` 并结束本次前端长连接。
+- 会话详情 API：`GET /api/ccr/sessions/{sessionId}` 返回 `session`、`clientEvents`、`timeline` 和 `internal`。route 会分页拉全这些事件；前端用 `clientEvents` 恢复用户已发送消息，用 `timeline` 恢复 worker 可见事件，刷新页面后仍能重建完整对话流。
 - Claude Code 的 `ANTHROPIC_BASE_URL` 应传 origin，例如 `https://ai-api.mandao.com`；CLI 会自行拼接 `/v1/messages`，如果传 `https://ai-api.mandao.com/v1` 会请求到 `/v1/v1/messages` 并表现为 `model_not_found`/404。本项目在写入 sandbox env 时会把末尾 `/v1` 规范化为 origin。
 - `/worker/events` 写入 terminal `result` 后会停止当前 session runner，并将 session 状态收敛为 `workerStatus=idle`、`containerStatus=stopped`、`runnerProcessId=null`；这个保底逻辑在后端 worker transport 层执行，不依赖前端 SSE 是否仍然连接，避免旧进程继续写入 `keep_alive`。
 
@@ -520,7 +521,7 @@ v1 的 `sdkUrl` 本身是 WebSocket URL；CCR v2 的 `sdkUrl` 是 session base U
 
 用途：SSE 下发 client-to-worker 事件。
 
-子进程通过这个流接收远端用户消息、控制事件、权限响应等。每个 SSE frame 的数据里至少需要包含服务端事件标识和 payload；B 侧收到后会通过 delivery endpoint 回报状态。
+子进程通过这个流接收远端用户消息、控制事件、权限响应等。每个 SSE frame 的数据里至少需要包含服务端事件标识和 payload；B 侧收到后会通过 delivery endpoint 回报状态。服务端只下发 `queued` 状态的 client event；已回报 `received` 的事件不能在新 worker epoch 中再次下发，否则会导致历史用户输入被重复执行并写入可见时间线。
 
 概念形态：
 
@@ -574,6 +575,8 @@ data: {"event_id":"...","sequence_num":1,"event_type":"...","source":"...","payl
 - `payload` 基本是 Claude Code stdout message 原始结构，并补 `uuid` 做幂等。
 - `stream_event` 会被客户端按 100ms 窗口合并，text delta 会变成 full-so-far 快照。
 - `ephemeral: true` 主要用于流式临时事件。
+- `payload.type === "keep_alive"` 只用于维持 worker 长连接，不写入 `chat_worker_events`，也不进入 operation log。
+- 同一 session、同一 worker epoch 的 `system/init` 只保留第一条，避免 runner 初始化元数据重复污染可见时间线。
 
 ### POST /worker/internal-events
 
@@ -600,6 +603,8 @@ data: {"event_id":"...","sequence_num":1,"event_type":"...","source":"...","payl
 ### GET /worker/internal-events
 
 用途：恢复 foreground agent 的 internal events。
+
+`payload.type === "keep_alive"` 不写入 `chat_internal_events`，避免保活包污染可恢复事件历史。
 
 响应：
 

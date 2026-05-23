@@ -123,6 +123,69 @@ function isTerminalWorkerEvent(event: WorkerVisibleEvent): boolean {
 }
 
 /**
+ * 拉取 session 详情所需的全部 client events。
+ * @param store CCR store
+ * @param sessionId session ID
+ * @returns 完整 client events
+ */
+async function listAllClientEvents(store: CcrStore, sessionId: string) {
+	const events: Awaited<ReturnType<CcrStore["listClientEvents"]>> = [];
+	let fromSequence = 0;
+	while (true) {
+		const page = await store.listClientEvents(sessionId, fromSequence);
+		if (page.length === 0) {
+			return events;
+		}
+		events.push(...page);
+		// sequence_num 单调递增，用最后一条作为下一页游标。
+		fromSequence = page[page.length - 1]?.sequence_num ?? fromSequence;
+	}
+}
+
+/**
+ * 拉取 session 详情所需的全部 timeline events。
+ * @param store CCR store
+ * @param sessionId session ID
+ * @returns 完整 timeline events
+ */
+async function listAllChatTimeline(store: CcrStore, sessionId: string) {
+	const events: Awaited<ReturnType<CcrStore["listChatTimeline"]>> = [];
+	let cursor = 0;
+	while (true) {
+		const page = await store.listChatTimeline(sessionId, cursor, 500);
+		if (page.length === 0) {
+			return events;
+		}
+		events.push(...page);
+		// id 单调递增，用最后一条作为下一页游标。
+		cursor = page[page.length - 1]?.id ?? cursor;
+	}
+}
+
+/**
+ * 拉取 session 详情所需的全部 foreground internal events。
+ * @param store CCR store
+ * @param sessionId session ID
+ * @returns 完整 internal events
+ */
+async function listAllForegroundInternalEvents(store: CcrStore, sessionId: string) {
+	const events: Awaited<ReturnType<CcrStore["listInternalEvents"]>>["data"] = [];
+	let cursor: number | undefined;
+	while (true) {
+		const page = await store.listInternalEvents(sessionId, {
+			subagents: false,
+			cursor,
+			limit: 500,
+		});
+		events.push(...page.data);
+		if (!page.next_cursor) {
+			return events;
+		}
+		cursor = Number(page.next_cursor);
+	}
+}
+
+/**
  * 流式输出 chat timeline。
  * @param output SSE 输出流
  * @param store CCR store
@@ -316,12 +379,16 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		if (!session) {
 			return c.json({ error: "Session not found" }, 404);
 		}
+		const [clientEvents, timeline, internal] = await Promise.all([
+			listAllClientEvents(store, sessionId),
+			listAllChatTimeline(store, sessionId),
+			listAllForegroundInternalEvents(store, sessionId),
+		]);
 		return c.json({
 			session,
-			timeline: await store.listChatTimeline(sessionId),
-			internal: (await store.listInternalEvents(sessionId, {
-				subagents: false,
-			})).data,
+			clientEvents,
+			timeline,
+			internal,
 		});
 	});
 
