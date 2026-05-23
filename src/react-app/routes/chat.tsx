@@ -169,6 +169,9 @@ function extractWorkerText(payload: Record<string, unknown>): string {
 	if (typeof payload.content === "string") {
 		return payload.content;
 	}
+	if (typeof payload.thinking === "string") {
+		return payload.thinking;
+	}
 	if (typeof payload.result === "string") {
 		return payload.result;
 	}
@@ -207,6 +210,7 @@ function isSupportTimelineEvent(event: TimelineEvent): boolean {
 		"system",
 		"tool_use",
 		"tool_result",
+		"thinking",
 		"result",
 		"unknown",
 	].includes(event.event_type);
@@ -1041,8 +1045,9 @@ function ChatPage() {
 function MessageBubble({ message }: { message: ChatMessage }) {
 	const isUser = message.role === "user";
 	const isTool = message.role === "tool";
+	const isThinking = message.meta === "thinking";
 	const isCollapsedRawEvent =
-		isTool && ["system", "result"].includes(message.meta ?? "");
+		isTool && ["system", "result", "thinking"].includes(message.meta ?? "");
 	return (
 		<article
 			className={cn(
@@ -1074,7 +1079,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 				</div>
 				{isCollapsedRawEvent ? (
 					<p className="text-xs text-muted-foreground">
-						原始事件状态：{message.status ?? "done"}
+						{isThinking ? message.content : `原始事件状态：${message.status ?? "done"}`}
 					</p>
 				) : (
 					<p className="whitespace-pre-wrap break-words leading-6">{message.content}</p>
