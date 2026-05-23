@@ -556,7 +556,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			c.req.raw.signal.addEventListener("abort", close, { once: true });
 			try {
 				while (!closed) {
-					const events = await store.listClientEvents(sessionId, fromSequence);
+					const events = await store.listQueuedClientEvents(sessionId, fromSequence);
 					for (const event of events) {
 						await output.write(
 							formatSseDataFrame(event.sequence_num, "client_event", event),

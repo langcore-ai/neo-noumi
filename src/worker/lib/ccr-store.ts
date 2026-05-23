@@ -496,6 +496,28 @@ export class CcrStore {
 	 */
 	async listClientEvents(sessionId: string, fromSequence: number) {
 		const rows = await this.prisma.chatClientEvent.findMany({
+			where: { sessionId, sequenceNum: { gt: fromSequence } },
+			orderBy: { sequenceNum: "asc" },
+			take: DEFAULT_PAGE_SIZE,
+		});
+		return rows.map((row) => ({
+			event_id: row.eventId,
+			sequence_num: row.sequenceNum,
+			event_type: row.eventType,
+			source: row.source,
+			payload: asJsonObject(row.payload),
+			created_at: row.createdAt.toISOString(),
+		}));
+	}
+
+	/**
+	 * 查询等待下发给 worker 的 client events。
+	 * @param sessionId session ID
+	 * @param fromSequence 起始序号
+	 * @returns 尚未交付的 events
+	 */
+	async listQueuedClientEvents(sessionId: string, fromSequence: number) {
+		const rows = await this.prisma.chatClientEvent.findMany({
 			where: {
 				sessionId,
 				sequenceNum: { gt: fromSequence },

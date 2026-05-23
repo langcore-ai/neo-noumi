@@ -521,7 +521,7 @@ v1 的 `sdkUrl` 本身是 WebSocket URL；CCR v2 的 `sdkUrl` 是 session base U
 
 用途：SSE 下发 client-to-worker 事件。
 
-子进程通过这个流接收远端用户消息、控制事件、权限响应等。每个 SSE frame 的数据里至少需要包含服务端事件标识和 payload；B 侧收到后会通过 delivery endpoint 回报状态。服务端只下发 `queued` 状态的 client event；已回报 `received` 的事件不能在新 worker epoch 中再次下发，否则会导致历史用户输入被重复执行并写入可见时间线。
+子进程通过这个流接收远端用户消息、控制事件、权限响应等。每个 SSE frame 的数据里至少需要包含服务端事件标识和 payload；B 侧收到后会通过 delivery endpoint 回报状态。worker stream 只下发 `queued` 状态的 client event；已回报 `received` 的事件不能在新 worker epoch 中再次下发，否则会导致历史用户输入被重复执行并写入可见时间线。会话详情接口仍读取全部 client event，用于恢复前端用户消息气泡。
 
 概念形态：
 
