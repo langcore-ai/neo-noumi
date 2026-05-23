@@ -256,7 +256,8 @@ export default {
 - 业务 chat API：`POST /api/ccr/sessions/{sessionId}/messages` 在 `Accept: text/event-stream` 下会先返回 `session` SSE frame，再写入用户消息、启动真实远程模式 Claude Code CLI，并在同一个请求里持续输出 `timeline` frame；收到 `result` 后返回 `done` 并结束本次前端长连接。
 - 会话详情 API：`GET /api/ccr/sessions/{sessionId}` 返回 `session`、`clientEvents`、`timeline` 和 `internal`。route 会分页拉全这些事件；前端用 `clientEvents` 恢复用户已发送消息，用 `timeline` 恢复 worker 可见事件，刷新页面后仍能重建完整对话流。
 - Claude Code 的 `ANTHROPIC_BASE_URL` 应传 origin，例如 `https://ai-api.mandao.com`；CLI 会自行拼接 `/v1/messages`，如果传 `https://ai-api.mandao.com/v1` 会请求到 `/v1/v1/messages` 并表现为 `model_not_found`/404。本项目在写入 sandbox env 时会把末尾 `/v1` 规范化为 origin。
-- `/worker/events` 写入 terminal `result` 后会停止当前 session runner，并将 session 状态收敛为 `workerStatus=idle`、`containerStatus=stopped`、`runnerProcessId=null`；这个保底逻辑在后端 worker transport 层执行，不依赖前端 SSE 是否仍然连接，避免旧进程继续写入 `keep_alive`。
+- `/worker/events` 写入 terminal `result` 后会停止当前 session runner，并将 session 状态收敛为 `workerStatus=idle`、`containerStatus=stopped`、`runnerProcessId=null`；worker transport 鉴权时会从 token 绑定的 session 回填 owner userId，确保停止的是 `neo-noumi-user-{userId}` 对应的真实 sandbox。这个保底逻辑在后端 worker transport 层执行，不依赖前端 SSE 是否仍然连接，避免旧进程继续写入 `keep_alive`。
+- chat 输入写入 client event 后如果 runner 启动失败，本次新增的 queued client events 会被标记为 `failed`；`/worker/events/stream` 只下发 `queued`，避免下一次启动误执行已经失败返回给前端的旧输入。
 
 远程模式的启动时序要求：
 

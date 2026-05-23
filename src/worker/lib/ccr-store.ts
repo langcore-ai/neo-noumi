@@ -25,6 +25,9 @@ const CLIENT_EVENT_SEQUENCE_RETRY_LIMIT = 3;
 /** Client event 等待 worker 消费的状态。 */
 const CLIENT_EVENT_STATUS_QUEUED = "queued";
 
+/** Client event 已入库但 runner 启动失败，不应再下发给 worker。 */
+const CLIENT_EVENT_STATUS_FAILED = "failed";
+
 /** 默认项目名称 */
 const DEFAULT_PROJECT_NAME = "Default Project";
 
@@ -299,21 +302,27 @@ export class CcrStore {
 	}
 
 	/**
-	 * 校验 sandbox worker 访问 token。
+	 * 校验 sandbox worker 访问 token，并返回所属用户。
 	 * @param sessionId session ID
 	 * @param token 请求携带的 token
-	 * @returns token 是否有效
+	 * @returns 通过鉴权的 session owner；失败返回 null
 	 */
-	async verifyWorkerAccessToken(sessionId: string, token: string): Promise<boolean> {
+	async authenticateWorkerAccessToken(
+		sessionId: string,
+		token: string,
+	): Promise<{ userId: string } | null> {
 		const session = await this.prisma.chatSession.findUnique({
 			where: { id: sessionId },
-			select: { workerAccessToken: true, deletedAt: true },
+			select: { workerAccessToken: true, deletedAt: true, userId: true },
 		});
-		return Boolean(
-			session?.workerAccessToken &&
-				session.workerAccessToken === token &&
-				!session.deletedAt,
-		);
+		if (
+			!session?.workerAccessToken ||
+			session.workerAccessToken !== token ||
+			session.deletedAt
+		) {
+			return null;
+		}
+		return { userId: session.userId };
 	}
 
 	/**
@@ -423,21 +432,44 @@ export class CcrStore {
 	 * @param messages 用户消息列表
 	 */
 	async enqueueChatInput(sessionId: string, messages: ChatMessageInput[]) {
+		const events: Array<Awaited<ReturnType<CcrStore["enqueueClientEvent"]>>> = [];
 		for (const message of messages) {
-			await this.enqueueClientEvent(
-				sessionId,
-				{
-					type: "user",
-					message: {
-						role: message.role,
-						content: message.content,
+			events.push(
+				await this.enqueueClientEvent(
+					sessionId,
+					{
+						type: "user",
+						message: {
+							role: message.role,
+							content: message.content,
+						},
+						session_id: sessionId,
+						parent_tool_use_id: null,
 					},
-					session_id: sessionId,
-					parent_tool_use_id: null,
-				},
-				{ eventType: "user", source: "chat-api" },
+					{ eventType: "user", source: "chat-api" },
+				),
 			);
 		}
+		return events;
+	}
+
+	/**
+	 * 标记已入库的 client events 启动失败。
+	 * @param sessionId session ID
+	 * @param eventIds client event IDs
+	 */
+	async markClientEventsFailed(sessionId: string, eventIds: string[]) {
+		if (eventIds.length === 0) {
+			return;
+		}
+		await this.prisma.chatClientEvent.updateMany({
+			where: {
+				sessionId,
+				eventId: { in: eventIds },
+				status: CLIENT_EVENT_STATUS_QUEUED,
+			},
+			data: { status: CLIENT_EVENT_STATUS_FAILED },
+		});
 	}
 
 	/**

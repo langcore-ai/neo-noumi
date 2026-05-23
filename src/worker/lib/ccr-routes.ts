@@ -311,9 +311,14 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		}
 		const store = createStore(c.env);
 		const token = readBearerToken(c.req.header("authorization") ?? null);
-		if (!token || !(await store.verifyWorkerAccessToken(sessionId, token))) {
+		const workerAuth = token
+			? await store.authenticateWorkerAccessToken(sessionId, token)
+			: null;
+		if (!workerAuth) {
 			return c.json({ error: "Unauthorized worker" }, 401);
 		}
+		// Worker 协议没有登录态；后续容器操作必须使用 token 绑定的 session owner。
+		c.set("userId", workerAuth.userId);
 		await next();
 	});
 
@@ -438,6 +443,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 				c.req.query("cursor"),
 			);
 			return stream(c, async (output) => {
+				let acceptedEvents: Awaited<ReturnType<CcrStore["enqueueChatInput"]>> = [];
 				try {
 					// 先写入 session frame，让浏览器在 sandbox 启动前就建立长连接。
 					await output.write(
@@ -445,14 +451,23 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 							session,
 						}),
 					);
-					await store.enqueueChatInput(sessionId, messages);
-					await startCcrSandbox(
-						c.req.raw,
-						c.env,
-						store,
-						c.get("userId"),
-						sessionId,
-					);
+					acceptedEvents = await store.enqueueChatInput(sessionId, messages);
+					try {
+						await startCcrSandbox(
+							c.req.raw,
+							c.env,
+							store,
+							c.get("userId"),
+							sessionId,
+						);
+					} catch (error) {
+						// 输入已入库但 runner 未启动时，不能继续保留 queued，避免下次启动误执行旧输入。
+						await store.markClientEventsFailed(
+							sessionId,
+							acceptedEvents.map((event) => event.event_id),
+						);
+						throw error;
+					}
 					await output.write(
 						formatSseControlFrame("session", {
 							session: await store.findUserSessionSummary(c.get("userId"), sessionId),
@@ -482,8 +497,17 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 				}
 			});
 		}
-		await store.enqueueChatInput(sessionId, messages);
-		await startCcrSandbox(c.req.raw, c.env, store, c.get("userId"), sessionId);
+		const acceptedEvents = await store.enqueueChatInput(sessionId, messages);
+		try {
+			await startCcrSandbox(c.req.raw, c.env, store, c.get("userId"), sessionId);
+		} catch (error) {
+			// 非 SSE 调用同样要收敛输入状态，确保 worker 队列只包含可继续执行的事件。
+			await store.markClientEventsFailed(
+				sessionId,
+				acceptedEvents.map((event) => event.event_id),
+			);
+			throw error;
+		}
 		return c.json({
 			session: await store.findUserSessionSummary(c.get("userId"), sessionId),
 			timeline: await store.listChatTimeline(sessionId),
