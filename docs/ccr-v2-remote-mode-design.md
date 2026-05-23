@@ -16,14 +16,17 @@
 - 如果 B 是执行容器，B 必须具备 Claude Code CLI、workspace、`.claude/skills`、`CLAUDE.md`、`.mcp.json`、settings 和项目工具链。
 - A 上需要执行的外部工具，不应接管 `Read/Edit/Bash` 等内置工具；应建成单独外部工具通道，并通过 CCR 事件或 MCP/RPC 让 B 等待并接收结果。
 
-## 当前业务化落地
+## 当前实现快照
 
 - 数据模型已拆成 `projects`、`chat_sessions`、`user_containers`：一个用户可以有多个 project，session 必须归属某个用户和某个 project。
 - `chat_sessions.userId` 和 `chat_sessions.projectId` 是非空外键，创建 session 前会校验 project 属于当前登录用户，避免跨用户挂载 session。
 - Cloudflare 资源使用 `NeoNoumiSandbox` / `NEO_NOUMI_SANDBOX` / `neo-noumi-sandbox` 命名，用户级 sandbox ID 使用 `neo-noumi-user-{userId}`。
 - 容器粒度是“一个用户一个 sandbox/container”，而不是“一个 session 一个容器”。
 - runner 粒度仍是“一个活跃 session 一个 Claude Code CLI 进程”；`chat_sessions.runnerProcessId` 记录 session 对应的容器内进程，防止同一用户多个 session 互相复用错 runner。
-- 删除活跃 session 时只停止该 session 的 runner；session 级 stop 也只停止该 session 记录的 runner，并同步清理 `runnerProcessId` 与 session 容器状态。destroy 仍作用于当前用户的整个 sandbox，但必须先校验 URL 中的 session 属于当前用户。
+- 启动 runner 前，A 会从 `claude-code` sessionStore 或 internal events 恢复容器内 Claude 本地状态，并据此决定 Claude CLI 参数：没有历史 foreground transcript 时使用 `--session-id`，已有历史 transcript 时使用 `--resume`。
+- `/worker/internal-events` 和 `/worker` metadata 仍是 CCR resume 的权威来源；`claude-code` sessionStore 是镜像与兼容读写入口，不应被理解为 Claude CCR resume 唯一读取源。
+- 删除活跃 session 时只停止该 session 的 runner；`/runner/stop` 也只停止该 session 记录的 runner，并同步清理 `runnerProcessId` 与 session 容器状态。
+- `/container/stop` 作用于当前用户的整个 sandbox/container，但必须先校验 URL 中的 session 属于当前用户；停止后会把该用户挂在同一 sandbox 上的运行态 session 收敛为 `idle/stopped`。
 
 ## 两套机制的关系
 
@@ -80,6 +83,13 @@ claude --print \
 ```
 
 新会话首轮使用 `--session-id {sessionId}`，确保 Claude Code 按指定 ID 创建新的 print 会话；已有 foreground transcript 的会话使用 `--resume {sessionId}`，触发 Claude Code 的恢复分支。
+
+当前代码中的判定点在 `src/worker/lib/ccr-sandbox.ts`：
+
+- `restoreClaudeLocalState()` 在启动 runner 前恢复 Claude 本地状态，并返回 `sessionMode`。
+- `transcript_events === 0` 时传给 runner 的 mode 是 `new`，runner 使用 `--session-id`。
+- `transcript_events > 0` 时传给 runner 的 mode 是 `resume`，runner 使用 `--resume`。
+- `sandbox_started` operation log 会记录 `claude_session_mode` 和 `transcript_events`，用于排查线上实际启动参数。
 
 CCR v2 相关环境变量：
 
@@ -242,7 +252,7 @@ export default {
 - Claude Code `2.1.145+` 是否完全信任 Cloudflare 注入 CA；若系统 trust store 不生效，需要确认 `NODE_EXTRA_CA_CERTS` 是否被它使用。
 - `GET /worker/events/stream` 的 SSE 长连接在 outbound HTTPS handler 中是否保持流式转发，不被缓冲或过早关闭。
 - `POST /worker/events`、`/internal-events`、`/events/delivery`、`/heartbeat` 在 handler 重写后是否保持原始 body 和认证头。
-- 容器休眠、冷启动和 rolling deploy 时，Claude Code worker epoch、sessionStore、workspace 和 route 侧 SQLite 状态是否仍然一致。
+- 容器休眠、冷启动和 rolling deploy 时，Claude Code worker epoch、sessionStore、workspace 和 route 侧 PostgreSQL 状态是否仍然一致。
 
 因此当前判断是：Cloudflare Containers outbound interception 是更接近产品化的方向，但完成标准应以实际 POC 证明 `SSE connected`、`worker registered`、事件写回和 result 落库，而不是仅凭 handler 配置存在。
 
@@ -906,18 +916,29 @@ A CCR service
 ### 恢复链路
 
 ```text
-1. A 检测到 session 需要继续执行，按需创建新的 B 容器。
-2. B runner 调用 A:
+1. A 检测到 session 需要继续执行，按需创建或复用用户级 B 容器。
+2. A 旋转当前 session 的 worker access token，并把 session/container 状态标记为 starting。
+3. A 在启动 B runner 前恢复 Claude 本地状态：
+   - 先读取 `project_key = "claude-code"` 的 sessionStore 文件。
+   - 如果旧会话还没有 sessionStore 镜像，则从 internal events 回填 sessionStore。
+   - 把 sessionStore 文件 materialize 到 `/root/.claude/projects/-workspace/`。
+   - 如果 foreground sessionStore 缺失，则用 foreground internal events 兜底写 `{sessionId}.jsonl`。
+   - 从 foreground 与 subagent JSONL 中恢复 Claude memory 文件。
+4. A 根据恢复到的 foreground transcript 事件数决定 runner mode：
+   - 0 条：`new`，Claude CLI 使用 `--session-id {sessionId}`。
+   - 大于 0 条：`resume`，Claude CLI 使用 `--resume {sessionId}`。
+5. A 写入 sandbox runner/env 脚本并启动进程。
+6. B runner 调用 A:
    POST /v1/code/sessions/{sessionId}/worker/register
-3. A 递增并返回新的 worker_epoch。
-4. B runner 设置 CLAUDE_CODE_WORKER_EPOCH，并启动 Claude Code CLI。
-5. B runner 启动前，A 按 sessionId 将 foreground internal events materialize 为本地 transcript jsonl。
-6. B runner 启动前，A 按已成功执行的 Claude memory `Write` 工具调用恢复 `/root/.claude/projects/-workspace/memory/` 下的文件；`tool_use` 只是写入意图，必须等待对应 `tool_result` 非错误后才能认为文件状态成立。
-7. Claude Code CLI 连接 A 的 CCR routes。
-8. Claude Code 通过 GET /worker 读取 external_metadata。
-9. Claude Code 通过 GET /worker/internal-events 读取 foreground internal events。
-10. 如果存在 subagent，Claude Code 通过 GET /worker/internal-events?subagents=true 读取子 agent internal events。
-11. Claude Code 基于本地 transcript、A 返回的数据和恢复后的 memory 文件重建会话状态并继续处理后续事件。
+7. A 递增并返回新的 worker_epoch。
+8. B runner 设置 CLAUDE_CODE_WORKER_EPOCH，并启动 Claude Code CLI。
+9. Claude Code CLI 连接 A 的 CCR routes。
+10. Claude Code 通过 GET /worker 读取 external_metadata。
+11. 如果 CLI 以 `--resume` 启动，`claude-code-reverse` 会进入 `hydrateFromCCRv2InternalEvents()`：
+    - 通过 GET /worker/internal-events 读取 foreground internal events。
+    - 通过 GET /worker/internal-events?subagents=true 读取 subagent internal events。
+    - 把这些事件重新写成本地 transcript 后再 `loadConversationForResume()`。
+12. Claude Code 基于本地 transcript、A 返回的数据和恢复后的 memory 文件重建会话状态并继续处理后续事件。
 ```
 
 ### A 主服务的持久化义务
@@ -968,10 +989,9 @@ type CcrInternalEvent = {
 
 ### internal-events 读取规则
 
-- MVP 可以先按 `sessionId + sequence` 全量返回，优先保证正确性。
-- 后续可以利用 `is_compaction` 优化，只返回最后一次 compaction 边界之后的事件。
+- 当前实现按 session 读取恢复窗口，并利用 `is_compaction` 只返回最后一次 compaction 边界之后的事件；为了保留 compact boundary 本身，查询游标会回退到 `compactionId - 1`。
 - `GET /worker/internal-events` 返回 foreground agent 事件。
-- `GET /worker/internal-events?subagents=true` 返回非 foreground agents 的事件，并保留 `agent_id`。
+- `GET /worker/internal-events?subagents=true` 返回非 foreground agents 的事件，并保留 `agent_id`；subagent 恢复会对每个 agent 单独应用 compact 边界，再按数据库顺序合并分页。
 - `worker_epoch` 重建时会变化，但 internal events 属于 `sessionId`，不属于某个 epoch。
 - 旧 worker 的 epoch 不匹配时必须返回 `409`，避免旧容器继续写入污染恢复源。
 
@@ -1013,30 +1033,37 @@ Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metada
 
 - `project_key = "claude-code"`。
 - foreground transcript 写入 `{sessionId}.jsonl`。
-- subagent transcript 写入 `{sessionId}/subagents/agent-{agentId}.jsonl`。
-- 容器启动前会先检查 `claude-code` sessionStore；旧会话如果还没有任何镜像，会先从 `chat_internal_events.payload` 回填 sessionStore，再恢复到 `/root/.claude/projects/-workspace/` 下。
-- 如果 Agent SDK 已经直接写入 foreground sessionStore，容器恢复时以该文件为主源，不再用 internal events 覆盖；只有 foreground sessionStore 缺失时才用 internal events 生成本地 transcript。
-- memory 恢复会读取 foreground 与 subagent sessionStore JSONL 中已成功执行的 `Write` 工具调用，避免 subagent 写入 `/root/.claude/projects/-workspace/memory/` 后冷启动丢失。
+- 普通 subagent transcript 写入 `{sessionId}/subagents/agent-{agentId}.jsonl`。
+- 如果 internal event metadata 或 payload 中存在安全的 `agent_transcript_subdir` / `transcript_subdir`，subagent transcript 会写入 `{sessionId}/subagents/{subdir}/agent-{agentId}.jsonl`，用于贴近 `claude-code-reverse` 的 `agentTranscriptSubdirs` 语义。
+- `/session-store/read` 与 `/session-store/list` 在 `project_key = "claude-code"` 且没有文件时，会触发一次从 internal events 到 sessionStore 的旧会话回填。
+- internal events 镜像只会覆盖由 `source = "ccr_internal_events"` 生成的 sessionStore 文件；直接通过 sessionStore 写入的文件不会被 internal events 镜像覆盖。
+- 容器启动前会把 `claude-code` sessionStore 文件恢复到 `/root/.claude/projects/-workspace/` 下；memory 恢复会读取 foreground 与 subagent JSONL 中已成功执行的 `Write` 工具调用。
 
-这样 Agent SDK/sessionStore 读取路径能拿到 Claude Code 原生 JSONL，本项目也不会把 sessionStore 和 CCR internal events 同时变成两个互相竞争的权威来源。
+需要特别区分：
 
-## MVP 建议
+- 对 Claude Code CCR `--resume` 路径来说，`claude-code-reverse` 会调用 `hydrateFromCCRv2InternalEvents()`，所以 CLI 恢复对话链的直接读取源仍是 `/worker/internal-events`。
+- sessionStore 在当前项目中主要承担镜像、兼容 Agent SDK 读写、冷启动前 materialize 本地副本、以及辅助 memory 恢复；它不是 CCR `--resume` 绕过 internal events 的替代协议。
+- 如果只向 sessionStore 写 foreground transcript，但没有对应 internal events，当前 Claude CCR `--resume` 不会仅凭 sessionStore 恢复对话链。
 
-### v1 协议骨架
+## 当前状态与后续
+
+### 已实现的协议骨架
 
 - 实现 `/worker/register`。
 - 实现 `/worker/events/stream` SSE。
 - 实现 `/worker/events` 收集 worker 输出。
 - 实现 `/worker/heartbeat` 和 `/worker` 状态上报。
-- 固定单 session、单 worker、单进程。
+- 支持用户级 sandbox、session 级 runner、worker epoch 防旧进程写入。
 
-### v2 internal events 与 resume
+### 已实现的 internal events 与 resume
 
 - 实现 `/worker/internal-events` 写入和分页读取。
 - 保存 transcript、compaction、agent_id。
-- 验证容器销毁后重新启动能恢复 session。
+- 按 foreground/subagent compact 边界返回恢复窗口。
+- 启动前恢复 Claude local transcript 与 memory，并按是否存在历史 transcript 选择 `--session-id` 或 `--resume`。
+- 把 internal events 当前恢复窗口镜像到 `claude-code` sessionStore。
 
-### v3 A-side 外部工具
+### 尚未闭环的 A-side 外部工具
 
 - 定义一个 A-side mock tool。
 - 让 B 产生可等待的外部工具请求。
@@ -1050,6 +1077,7 @@ Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metada
 - 只实现 happy path 很容易跑通 demo，但 resume、delivery、epoch 替换和重复事件会影响稳定性。
 - A-side tool 回填必须严格处理 `request_id`、顺序和幂等。
 - 如果 B 上配置缺失，Claude Code 会读不到 skills、MCP 或项目 memory；A 的本地配置不会自动生效。
+- 直接写 sessionStore 不能替代 `/worker/internal-events`；Claude CCR `--resume` 当前仍会从 internal events hydrate 对话链。
 - 冷启动容器会影响首 token 延迟，需要后续考虑镜像预热、warm pool 或 workspace 缓存。
 
 ## 源码参考
@@ -1060,7 +1088,9 @@ Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metada
 - `src/bridge/bridgeMain.ts`：remote-control session spawn 和 CCR v2 分支。
 - `src/bridge/sessionRunner.ts`：子 Claude Code CLI 启动参数和环境变量。
 - `src/cli/remoteIO.ts`：`--sdk-url` 进入 RemoteIO。
+- `src/cli/print.ts`：`--resume` 在 print mode 下触发 CCR v2 hydrate，再进入 `loadConversationForResume()`。
 - `src/cli/transports/transportUtils.ts`：CCR v2 使用 SSE + POST。
 - `src/cli/transports/ccrClient.ts`：worker events、internal-events、delivery、heartbeat、worker state。
 - `src/cli/transports/SSETransport.ts`：SSE stream 解析。
+- `src/utils/sessionStorage.ts`：transcript 路径、subagent transcript 路径、`hydrateFromCCRv2InternalEvents()` 和 `loadTranscriptFile()`。
 - `src/utils/sessionState.ts`：`idle/running/requires_action` 和 `external_metadata`。
