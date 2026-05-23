@@ -34,6 +34,54 @@ const DEFAULT_PROJECT_NAME = "Default Project";
 /** 用户级 sandbox ID 前缀，用于按用户复用同一个容器。 */
 const USER_SANDBOX_ID_PREFIX = "neo-noumi-user";
 
+/** Claude Code Agent SDK transcript 在 sessionStore 中使用的 project key。 */
+export const CLAUDE_SESSION_STORE_PROJECT_KEY = "claude-code";
+
+/** sessionStore 中 foreground transcript 的相对路径。 */
+const foregroundTranscriptSubpath = (sessionId: string) => `${sessionId}.jsonl`;
+
+/** sessionStore 中 subagent transcript 的相对路径。 */
+const subagentTranscriptSubpath = (sessionId: string, agentId: string) =>
+	`${sessionId}/subagents/agent-${agentId}.jsonl`;
+
+/** sessionStore 中 subagent transcript 的路径前缀。 */
+const subagentTranscriptPrefix = (sessionId: string) => `${sessionId}/subagents/`;
+
+/**
+ * 计算恢复窗口查询游标，保留最新 compact boundary 本身。
+ * @param cursor 客户端分页游标
+ * @param compactionId 最新 compact boundary 的数据库 ID
+ * @returns Prisma gt 游标
+ */
+function restoreCursor(cursor: number, compactionId: number): number {
+	return Math.max(cursor, compactionId > 0 ? compactionId - 1 : 0);
+}
+
+/**
+ * 从 internal event 中读取 Claude Code subagent transcript 子目录。
+ * @param event internal event DTO
+ * @returns 子目录；不存在时返回 null
+ */
+function readAgentTranscriptSubdir(event: {
+	payload: JsonObject;
+	event_metadata: JsonObject | null;
+}): string | null {
+	const candidates = [
+		event.event_metadata?.agent_transcript_subdir,
+		event.event_metadata?.transcript_subdir,
+		event.payload.agent_transcript_subdir,
+		event.payload.transcript_subdir,
+	];
+	const subdir = candidates.find(
+		(candidate) =>
+			typeof candidate === "string" &&
+			candidate.length > 0 &&
+			!candidate.includes("..") &&
+			!candidate.includes("/"),
+	);
+	return typeof subdir === "string" ? subdir : null;
+}
+
 /**
  * 生成随机事件 ID。
  * @returns UUID
@@ -654,6 +702,7 @@ export class CcrStore {
 		epoch: number,
 		events: WorkerInternalEvent[],
 	) {
+		let changed = false;
 		for (const event of events) {
 			const payload = isJsonObject(event.payload) ? event.payload : {};
 			// keep_alive 没有审计价值，避免污染 internal event 历史。
@@ -676,7 +725,42 @@ export class CcrStore {
 				},
 				update: {},
 			});
+			changed = true;
 		}
+		if (changed) {
+			await this.syncClaudeSessionStoreFromInternalEvents(sessionId);
+		}
+	}
+
+	/**
+	 * 查询指定范围内最后一次 compact 边界的数据库顺序 ID。
+	 * @param sessionId session ID
+	 * @param agentId 子 agent ID；null 表示 foreground
+	 * @returns compact 边界之后才需要恢复的起始 ID
+	 */
+	private async findLastCompactionId(sessionId: string, agentId: string | null) {
+		const row = await this.prisma.chatInternalEvent.findFirst({
+			where: { sessionId, agentId, isCompaction: true },
+			orderBy: { id: "desc" },
+			select: { id: true },
+		});
+		return row?.id ?? 0;
+	}
+
+	/**
+	 * 查询所有存在 internal events 的 subagent ID。
+	 * @param sessionId session ID
+	 * @returns subagent ID 列表
+	 */
+	private async listInternalEventAgentIds(sessionId: string) {
+		const rows = await this.prisma.chatInternalEvent.findMany({
+			where: { sessionId, agentId: { not: null } },
+			select: { agentId: true },
+			distinct: ["agentId"],
+		});
+		return rows
+			.map((row) => row.agentId)
+			.filter((agentId): agentId is string => typeof agentId === "string");
 	}
 
 	/**
@@ -690,15 +774,23 @@ export class CcrStore {
 		options: { subagents: boolean; cursor?: number; limit?: number },
 	) {
 		const limit = Math.min(Math.max(options.limit ?? DEFAULT_PAGE_SIZE, 1), 500);
-		const rows = await this.prisma.chatInternalEvent.findMany({
-			where: {
-				sessionId,
-				id: { gt: options.cursor ?? 0 },
-				agentId: options.subagents ? { not: null } : null,
-			},
-			orderBy: { id: "asc" },
-			take: limit + 1,
-		});
+		const cursor = options.cursor ?? 0;
+		const rows = options.subagents
+			? await this.listSubagentInternalEventRows(sessionId, cursor, limit + 1)
+			: await this.prisma.chatInternalEvent.findMany({
+					where: {
+						sessionId,
+						id: {
+							gt: restoreCursor(
+								cursor,
+								await this.findLastCompactionId(sessionId, null),
+							),
+						},
+						agentId: null,
+					},
+					orderBy: { id: "asc" },
+					take: limit + 1,
+				});
 		const pageRows = rows.slice(0, limit);
 		return {
 			data: pageRows.map((row) => ({
@@ -713,6 +805,197 @@ export class CcrStore {
 			next_cursor:
 				rows.length > limit ? String(pageRows[pageRows.length - 1]?.id) : null,
 		};
+	}
+
+	/**
+	 * 查询 subagent internal events，并对每个 agent 单独应用 compact 边界。
+	 * @param sessionId session ID
+	 * @param cursor 全局分页游标
+	 * @param take 查询数量
+	 * @returns 已按服务端稳定顺序排序的事件行
+	 */
+	private async listSubagentInternalEventRows(
+		sessionId: string,
+		cursor: number,
+		take: number,
+	) {
+		const agentIds = await this.listInternalEventAgentIds(sessionId);
+		const rows = (
+			await Promise.all(
+				agentIds.map(async (agentId) => {
+					const compactionId = await this.findLastCompactionId(sessionId, agentId);
+					return this.prisma.chatInternalEvent.findMany({
+						where: {
+							sessionId,
+							agentId,
+							id: { gt: restoreCursor(cursor, compactionId) },
+						},
+						orderBy: { id: "asc" },
+						take,
+					});
+				}),
+			)
+		)
+			.flat()
+			.sort((a, b) => a.id - b.id);
+		return rows.slice(0, take);
+	}
+
+	/**
+	 * 拉取完整 internal event 恢复窗口。
+	 * @param sessionId session ID
+	 * @param subagents 是否读取子 agent
+	 * @returns 当前恢复窗口内的 internal events
+	 */
+	private async listAllInternalEventsForRestore(sessionId: string, subagents: boolean) {
+		const events: Array<{
+			event_id: string;
+			event_type: string;
+			payload: JsonObject;
+			event_metadata: JsonObject | null;
+			is_compaction: boolean;
+			created_at: string;
+			agent_id: string | null;
+		}> = [];
+		let cursor: number | undefined;
+		while (true) {
+			const page = await this.listInternalEvents(sessionId, {
+				subagents,
+				cursor,
+				limit: 500,
+			});
+			events.push(...page.data);
+			if (!page.next_cursor) {
+				return events;
+			}
+			// next_cursor 是数据库顺序 ID，和 event_id 的幂等 UUID 语义不同。
+			cursor = Number(page.next_cursor);
+		}
+	}
+
+	/**
+	 * 写入由 internal events 生成的 Claude sessionStore 镜像。
+	 * @param sessionId session ID
+	 * @param subpath sessionStore 相对路径
+	 * @param content JSONL 内容
+	 * @param metadata 镜像元数据
+	 */
+	private async writeClaudeSessionStoreMirrorFile(
+		sessionId: string,
+		subpath: string,
+		content: string,
+		metadata: JsonObject,
+	) {
+		const existing = await this.readSessionStoreFile(
+			sessionId,
+			CLAUDE_SESSION_STORE_PROJECT_KEY,
+			subpath,
+		);
+		if (existing && existing.metadata?.source !== "ccr_internal_events") {
+			// 直接 sessionStore 写入是恢复主源；internal events 镜像不能覆盖它。
+			return;
+		}
+		await this.writeSessionStoreFile(
+			sessionId,
+			CLAUDE_SESSION_STORE_PROJECT_KEY,
+			subpath,
+			content,
+			metadata,
+		);
+	}
+
+	/**
+	 * 将 internal events 镜像到 Claude Code Agent SDK sessionStore。
+	 * @param sessionId session ID
+	 */
+	private async syncClaudeSessionStoreFromInternalEvents(sessionId: string) {
+		const foregroundEvents = await this.listAllInternalEventsForRestore(sessionId, false);
+		await this.writeClaudeSessionStoreMirrorFile(
+			sessionId,
+			foregroundTranscriptSubpath(sessionId),
+			foregroundEvents.map((event) => JSON.stringify(event.payload)).join("\n") +
+				(foregroundEvents.length > 0 ? "\n" : ""),
+			{
+				source: "ccr_internal_events",
+				transcript_kind: "foreground",
+				event_count: foregroundEvents.length,
+			},
+		);
+
+		const subagentEvents = await this.listAllInternalEventsForRestore(sessionId, true);
+		const subpaths = new Set<string>();
+		const eventsBySubpath = new Map<string, JsonObject[]>();
+		for (const event of subagentEvents) {
+			if (!event.agent_id) {
+				continue;
+			}
+			const transcriptSubdir = readAgentTranscriptSubdir(event);
+			const subpath = transcriptSubdir
+				? `${sessionId}/subagents/${transcriptSubdir}/agent-${event.agent_id}.jsonl`
+				: subagentTranscriptSubpath(sessionId, event.agent_id);
+			const entries = eventsBySubpath.get(subpath) ?? [];
+			entries.push(event.payload);
+			eventsBySubpath.set(subpath, entries);
+		}
+		for (const [subpath, payloads] of eventsBySubpath) {
+			subpaths.add(subpath);
+			await this.writeClaudeSessionStoreMirrorFile(
+				sessionId,
+				subpath,
+				payloads.map((payload) => JSON.stringify(payload)).join("\n") + "\n",
+				{
+					source: "ccr_internal_events",
+					transcript_kind: "subagent",
+					event_count: payloads.length,
+				},
+			);
+		}
+		for (const file of await this.listSessionStoreFiles(
+			sessionId,
+			CLAUDE_SESSION_STORE_PROJECT_KEY,
+			subagentTranscriptPrefix(sessionId),
+		)) {
+			if (subpaths.has(file.subpath)) {
+				continue;
+			}
+			const existing = await this.readSessionStoreFile(
+				sessionId,
+				CLAUDE_SESSION_STORE_PROJECT_KEY,
+				file.subpath,
+			);
+			if (existing?.metadata?.source === "ccr_internal_events") {
+				await this.deleteSessionStoreFile(
+					sessionId,
+					CLAUDE_SESSION_STORE_PROJECT_KEY,
+					file.subpath,
+				);
+			}
+		}
+	}
+
+	/**
+	 * 旧会话缺少 Claude Code sessionStore 镜像时，从 internal events 回填一次。
+	 * @param sessionId session ID
+	 * @returns 是否发生了回填
+	 */
+	async ensureClaudeSessionStoreFromInternalEvents(sessionId: string): Promise<boolean> {
+		const existingFiles = await this.listSessionStoreFiles(
+			sessionId,
+			CLAUDE_SESSION_STORE_PROJECT_KEY,
+			sessionId,
+		);
+		if (existingFiles.length > 0) {
+			return false;
+		}
+		const existingEvent = await this.prisma.chatInternalEvent.findFirst({
+			where: { sessionId },
+			select: { id: true },
+		});
+		if (!existingEvent) {
+			return false;
+		}
+		await this.syncClaudeSessionStoreFromInternalEvents(sessionId);
+		return true;
 	}
 
 	/**
@@ -836,6 +1119,33 @@ export class CcrStore {
 			containerStatus: "stopped",
 			runnerProcessId: null,
 		});
+	}
+
+	/**
+	 * 清理用户级容器销毁后遗留的 session runner 状态。
+	 * @param userId 用户 ID
+	 * @param sandboxId 被停止的 sandbox ID
+	 * @returns 被清理的 session 数量
+	 */
+	async clearUserContainerSessionRunners(userId: string, sandboxId: string) {
+		const result = await this.prisma.chatSession.updateMany({
+			where: {
+				userId,
+				deletedAt: null,
+				sandboxId,
+				OR: [
+					{ runnerProcessId: { not: null } },
+					{ containerStatus: { in: ["starting", "running"] } },
+				],
+			},
+			data: {
+				workerStatus: "idle",
+				containerStatus: "stopped",
+				sandboxId: null,
+				runnerProcessId: null,
+			},
+		});
+		return result.count;
 	}
 
 	/**

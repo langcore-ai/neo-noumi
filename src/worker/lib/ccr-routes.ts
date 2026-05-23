@@ -1,13 +1,14 @@
 import { stream } from "hono/streaming";
-import type { Hono } from "hono";
+import type { Context, Hono } from "hono";
 import { createPrismaClient } from "./prisma";
 import { createAuth } from "./auth";
-import { CcrStore } from "./ccr-store";
+import { CLAUDE_SESSION_STORE_PROJECT_KEY, CcrStore } from "./ccr-store";
 import {
 	destroyCcrSandbox,
 	getCcrSandboxStatus,
 	startCcrSandbox,
 	stopCcrSessionRunner,
+	stopCcrUserContainer,
 	type NeoNoumiSandboxBindings,
 } from "./ccr-sandbox";
 import { getStringField, isJsonObject, readJsonObject, toJsonValue } from "./ccr-json";
@@ -32,6 +33,12 @@ type SseOutput = {
 	write: (chunk: string) => Promise<unknown>;
 	/** 暂停一段时间，避免忙轮询 */
 	sleep: (ms: number) => Promise<unknown>;
+};
+
+/** 可设置响应头的 Hono 上下文最小接口。 */
+type HeaderContext = {
+	/** 设置响应头 */
+	header: (name: string, value: string) => void;
 };
 
 /** CCR route 需要的 Worker 绑定 */
@@ -85,6 +92,23 @@ function formatSseDataFrame(id: number, eventName: string, data: unknown): strin
  */
 function formatSseControlFrame(eventName: string, data: unknown): string {
 	return `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
+ * 创建 SSE 响应，统一设置协议头后再交给 Hono 写流。
+ * @param c Hono 上下文
+ * @param cb 流式写入回调
+ * @returns SSE response
+ */
+function streamSse(
+	c: HeaderContext,
+	cb: Parameters<typeof stream>[1],
+) {
+	// `hono/streaming` 只提供流式 body，不会自动声明 SSE 协议语义。
+	c.header("Content-Type", "text/event-stream; charset=utf-8");
+	c.header("Cache-Control", "no-cache, no-transform");
+	c.header("X-Content-Type-Options", "nosniff");
+	return stream(c as Context, cb);
 }
 
 /**
@@ -442,7 +466,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 				c.req.header("Last-Event-ID"),
 				c.req.query("cursor"),
 			);
-			return stream(c, async (output) => {
+			return streamSse(c, async (output) => {
 				let acceptedEvents: Awaited<ReturnType<CcrStore["enqueueChatInput"]>> = [];
 				try {
 					// 先写入 session frame，让浏览器在 sandbox 启动前就建立长连接。
@@ -541,6 +565,17 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		if (!session || session.deletedAt) {
 			return c.json({ error: "Session not found" }, 404);
 		}
+		// 容器粒度是用户级；stop 必须销毁 sandbox，才能验证冷启动恢复链路。
+		return c.json(await stopCcrUserContainer(c.env, store, c.get("userId")));
+	});
+
+	app.post("/api/ccr/sessions/:sessionId/runner/stop", async (c) => {
+		const store = createStore(c.env);
+		const sessionId = c.req.param("sessionId");
+		const session = await store.findUserSessionSummary(c.get("userId"), sessionId);
+		if (!session || session.deletedAt) {
+			return c.json({ error: "Session not found" }, 404);
+		}
 		return c.json(await stopCcrSessionRunner(c.env, store, c.get("userId"), sessionId));
 	});
 
@@ -565,7 +600,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			c.req.header("Last-Event-ID"),
 			c.req.query("cursor"),
 		);
-		return stream(c, async (output) => {
+		return streamSse(c, async (output) => {
 			await streamChatTimeline(output, store, sessionId, cursor, c.req.raw.signal, {
 				closeOnTerminal: false,
 			});
@@ -585,7 +620,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			c.req.header("Last-Event-ID"),
 			c.req.query("from_sequence_num"),
 		);
-		return stream(c, async (output) => {
+		return streamSse(c, async (output) => {
 			let closed = false;
 			let lastHeartbeatAt = Date.now();
 			await output.write(": ccr pg stream ready\n\n");
@@ -652,10 +687,12 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 
 	app.get("/v1/code/sessions/:sessionId/worker/internal-events", async (c) => {
 		const store = createStore(c.env);
+		const limit = Number(c.req.query("limit") ?? 0);
 		return c.json(
 			await store.listInternalEvents(c.req.param("sessionId"), {
 				subagents: c.req.query("subagents") === "true",
 				cursor: Number(c.req.query("cursor") ?? 0),
+				limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
 			}),
 		);
 	});
@@ -729,32 +766,38 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 
 	app.post("/v1/code/sessions/:sessionId/session-store/read", async (c) => {
 		const store = createStore(c.env);
+		const sessionId = c.req.param("sessionId");
 		const body = await readJsonObject(c.req.raw);
 		const projectKey = getStringField(body, "project_key");
 		const subpath = getStringField(body, "subpath");
 		if (!projectKey || !subpath) {
 			return c.json({ error: "project_key and subpath are required" }, 400);
 		}
-		const file = await store.readSessionStoreFile(
-			c.req.param("sessionId"),
-			projectKey,
-			subpath,
-		);
+		let file = await store.readSessionStoreFile(sessionId, projectKey, subpath);
+		if (!file && projectKey === CLAUDE_SESSION_STORE_PROJECT_KEY) {
+			// 旧会话可能先有 internal events，Agent SDK 首次读取时再补齐 sessionStore。
+			await store.ensureClaudeSessionStoreFromInternalEvents(sessionId);
+			file = await store.readSessionStoreFile(sessionId, projectKey, subpath);
+		}
 		return file ? c.json({ file }) : c.json({ error: "not found" }, 404);
 	});
 
 	app.get("/v1/code/sessions/:sessionId/session-store/list", async (c) => {
 		const store = createStore(c.env);
+		const sessionId = c.req.param("sessionId");
 		const projectKey = c.req.query("project_key");
 		if (!projectKey) {
 			return c.json({ error: "project_key is required" }, 400);
 		}
+		const prefix = c.req.query("prefix") ?? "";
+		let files = await store.listSessionStoreFiles(sessionId, projectKey, prefix);
+		if (files.length === 0 && projectKey === CLAUDE_SESSION_STORE_PROJECT_KEY) {
+			// list 为空时触发一次回填，让旧会话也能被 sessionStore 枚举到。
+			await store.ensureClaudeSessionStoreFromInternalEvents(sessionId);
+			files = await store.listSessionStoreFiles(sessionId, projectKey, prefix);
+		}
 		return c.json({
-			files: await store.listSessionStoreFiles(
-				c.req.param("sessionId"),
-				projectKey,
-				c.req.query("prefix") ?? "",
-			),
+			files,
 		});
 	});
 

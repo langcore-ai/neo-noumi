@@ -114,6 +114,18 @@ async function readError(response: Response): Promise<string> {
 }
 
 /**
+ * 校验响应是否为 SSE。
+ * @param response fetch 响应
+ */
+function assertSseResponse(response: Response) {
+	const contentType = response.headers.get("content-type") ?? "";
+	// 后端如果退化成普通流或 JSON 200，前端不能继续按 SSE 静默解析。
+	if (!contentType.toLowerCase().startsWith("text/event-stream")) {
+		throw new Error(`Chat stream content-type is invalid: ${contentType || "missing"}`);
+	}
+}
+
+/**
  * 判断值是否是普通对象。
  * @param value 待判断值
  * @returns 是否是对象
@@ -151,6 +163,34 @@ function stringifyContent(value: unknown): string {
 }
 
 /**
+ * 读取 assistant content block 的内部类型。
+ * @param payload worker payload
+ * @returns content block 类型；没有时返回 null
+ */
+function getAssistantContentType(payload: Record<string, unknown>): string | null {
+	const message = isRecord(payload.message) ? payload.message : null;
+	const content = Array.isArray(message?.content) ? message.content : [];
+	const block = content.find((item) => {
+		return isRecord(item) && typeof item.type === "string";
+	});
+	return isRecord(block) && typeof block.type === "string" ? block.type : null;
+}
+
+/**
+ * 计算 timeline 的展示语义类型。
+ * @param event timeline event
+ * @returns 用于 UI 归类和折叠的类型
+ */
+function getTimelineDisplayType(event: TimelineEvent): string {
+	const contentType = getAssistantContentType(event.payload);
+	// Claude Code 会把 thinking/tool_use 包在 assistant message 里，UI 应按内层 block 类型展示。
+	if (contentType === "thinking" || contentType === "tool_use") {
+		return contentType;
+	}
+	return event.event_type;
+}
+
+/**
  * 从 Claude Code payload 中提取面向用户的文本。
  * @param payload worker payload
  * @returns 消息文本
@@ -158,6 +198,18 @@ function stringifyContent(value: unknown): string {
 function extractWorkerText(payload: Record<string, unknown>): string {
 	const message = isRecord(payload.message) ? payload.message : null;
 	if (message) {
+		const contentBlocks = Array.isArray(message.content) ? message.content : [];
+		const thinking = contentBlocks
+			.map((item) => {
+				return isRecord(item) && typeof item.thinking === "string"
+					? item.thinking
+					: "";
+			})
+			.filter(Boolean)
+			.join("\n");
+		if (thinking) {
+			return thinking;
+		}
 		const content = stringifyContent(message.content);
 		if (content) {
 			return content;
@@ -222,17 +274,41 @@ function isSupportTimelineEvent(event: TimelineEvent): boolean {
  * @returns 页面消息
  */
 function timelineEventToMessage(event: TimelineEvent): ChatMessage {
-	const isAssistant = event.event_type === "assistant";
+	const displayType = getTimelineDisplayType(event);
+	const isAssistant = displayType === "assistant";
 	const isResult = event.event_type === "result" || event.payload.type === "result";
 	return {
 		id: `timeline-${event.id}`,
-		role: isAssistant ? "assistant" : isSupportTimelineEvent(event) ? "tool" : "system",
+		role: isAssistant ? "assistant" : isSupportTimelineEvent({ ...event, event_type: displayType }) ? "tool" : "system",
 		content: extractWorkerText(event.payload),
 		createdAt: event.created_at,
 		status: isResult ? "done" : event.ephemeral ? "streaming" : "done",
-		meta: event.event_type,
+		meta: displayType,
 		raw: event.payload,
 	};
+}
+
+/**
+ * 生成工具调用的折叠摘要。
+ * @param raw 原始 timeline payload
+ * @returns 工具调用摘要
+ */
+function getToolUseSummary(raw: unknown): string {
+	if (!isRecord(raw)) {
+		return "工具调用";
+	}
+	const message = isRecord(raw.message) ? raw.message : null;
+	const content = Array.isArray(message?.content) ? message.content : [];
+	const toolUse = content.find((item) => {
+		return isRecord(item) && item.type === "tool_use";
+	});
+	const name =
+		typeof raw.name === "string"
+			? raw.name
+			: isRecord(toolUse) && typeof toolUse.name === "string"
+				? toolUse.name
+				: "";
+	return name ? `工具调用：${name}` : "工具调用";
 }
 
 /**
@@ -523,6 +599,7 @@ function ChatPage() {
 		if (!response.ok) {
 			throw new Error(await readError(response));
 		}
+		assertSseResponse(response);
 		if (!response.body) {
 			throw new Error("Chat stream response body is empty");
 		}
@@ -894,7 +971,7 @@ function ChatPage() {
 							onClick={() => void callContainer("stop")}
 						>
 							<SquareIcon data-icon="inline-start" />
-							停止
+							停止容器
 						</Button>
 					</div>
 				</header>
@@ -1046,8 +1123,9 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 	const isUser = message.role === "user";
 	const isTool = message.role === "tool";
 	const isThinking = message.meta === "thinking";
+	const isToolUse = message.meta === "tool_use";
 	const isCollapsedRawEvent =
-		isTool && ["system", "result", "thinking"].includes(message.meta ?? "");
+		isTool && ["system", "result", "thinking", "tool_use"].includes(message.meta ?? "");
 	return (
 		<article
 			className={cn(
@@ -1079,7 +1157,11 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 				</div>
 				{isCollapsedRawEvent ? (
 					<p className="text-xs text-muted-foreground">
-						{isThinking ? message.content : `原始事件状态：${message.status ?? "done"}`}
+						{isThinking
+							? message.content
+							: isToolUse
+								? getToolUseSummary(message.raw)
+								: `原始事件状态：${message.status ?? "done"}`}
 					</p>
 				) : (
 					<p className="whitespace-pre-wrap break-words leading-6">{message.content}</p>

@@ -1,5 +1,7 @@
 import { Sandbox, getSandbox } from "@cloudflare/sandbox";
-import type { CcrStore } from "./ccr-store";
+import { CLAUDE_SESSION_STORE_PROJECT_KEY, type CcrStore } from "./ccr-store";
+import { isJsonObject } from "./ccr-json";
+import type { JsonObject } from "./ccr-types";
 
 /** Claude Code 允许的官方域名，用于 outbound HTTPS interception。 */
 const CLAUDE_APPROVED_HOST = "api.anthropic.com";
@@ -12,6 +14,20 @@ const RUNNER_PATH = "/workspace/ccr-runner.sh";
 
 /** Sandbox 内敏感环境变量文件路径 */
 const ENV_PATH = "/workspace/ccr-env.sh";
+
+/** Claude Code 在容器内使用的项目状态目录。 */
+const CLAUDE_PROJECT_STATE_DIR = "/root/.claude/projects/-workspace";
+
+/** Claude Code 本地 transcript 文件路径。 */
+const claudeTranscriptPath = (sessionId: string) =>
+	`${CLAUDE_PROJECT_STATE_DIR}/${sessionId}.jsonl`;
+
+/** Claude Code sessionStore 文件在容器内的恢复路径。 */
+const claudeSessionStorePath = (subpath: string) =>
+	`${CLAUDE_PROJECT_STATE_DIR}/${subpath}`;
+
+/** 启动前恢复 internal events 的分页大小。 */
+const TRANSCRIPT_RESTORE_PAGE_SIZE = 500;
 
 /** Claude Code 默认模型；固定到网关可识别的 Sonnet 模型，避免 CLI 选择 Opus 后缀模型。 */
 const CLAUDE_MODEL = "claude-sonnet-4-6";
@@ -74,6 +90,7 @@ set -eu
 
 SESSION_ID="$1"
 WORKER_ACCESS_TOKEN="$2"
+CLAUDE_SESSION_MODE="\${3:-new}"
 SDK_URL="https://${CLAUDE_APPROVED_HOST}/v1/code/sessions/$SESSION_ID"
 AUTH_HEADER="Authorization: Bearer $WORKER_ACCESS_TOKEN"
 
@@ -90,9 +107,13 @@ export CURL_CA_BUNDLE=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 export SSL_CERT_FILE=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 
 if [ "\${NEO_NOUMI_ENABLE_REAL_CLAUDE:-0}" = "1" ] && command -v claude >/dev/null 2>&1; then
+  CLAUDE_SESSION_ARG="--session-id"
+  if [ "$CLAUDE_SESSION_MODE" = "resume" ]; then
+    CLAUDE_SESSION_ARG="--resume"
+  fi
   exec claude --print \
     --sdk-url "https://${CLAUDE_APPROVED_HOST}/v1/code/sessions/$SESSION_ID" \
-    --session-id "$SESSION_ID" \
+    "$CLAUDE_SESSION_ARG" "$SESSION_ID" \
     --model "\${CLAUDE_MODEL:-${CLAUDE_MODEL}}" \
     --input-format stream-json \
     --output-format stream-json \
@@ -127,6 +148,269 @@ function shellQuote(value: string | undefined): string {
 		return "''";
 	}
 	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * 读取 POSIX 路径的父目录。
+ * @param filePath 文件路径
+ * @returns 父目录
+ */
+function dirname(filePath: string): string {
+	const index = filePath.lastIndexOf("/");
+	return index > 0 ? filePath.slice(0, index) : "/";
+}
+
+/**
+ * 判断 sessionStore 相对路径是否允许写入 Claude 项目状态目录。
+ * @param sessionId session ID
+ * @param subpath sessionStore 相对路径
+ * @returns 是否安全
+ */
+function isSafeSessionStoreSubpath(sessionId: string, subpath: string): boolean {
+	return (
+		(subpath === `${sessionId}.jsonl` ||
+			subpath.startsWith(`${sessionId}/subagents/`)) &&
+		!subpath.includes("..") &&
+		!subpath.startsWith("/")
+	);
+}
+
+/**
+ * 判断 sessionStore 文件是否是 foreground transcript。
+ * @param sessionId session ID
+ * @param subpath sessionStore 相对路径
+ * @returns 是否为 foreground transcript
+ */
+function isForegroundTranscriptSubpath(sessionId: string, subpath: string): boolean {
+	return subpath === `${sessionId}.jsonl`;
+}
+
+/**
+ * 从 sessionStore JSONL 内容中恢复 transcript payload。
+ * @param content JSONL 内容
+ * @returns 可用于恢复 memory 的 payload 列表
+ */
+function parseSessionStorePayloads(content: string): JsonObject[] {
+	const payloads: JsonObject[] = [];
+	for (const line of content.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) {
+			continue;
+		}
+		try {
+			const parsed = JSON.parse(trimmed) as unknown;
+			if (isJsonObject(parsed)) {
+				payloads.push(parsed);
+			}
+		} catch {
+			// sessionStore 可能被外部适配器写入非 JSONL 内容，跳过坏行保留启动能力。
+		}
+	}
+	return payloads;
+}
+
+/** Claude memory 写入意图。 */
+type MemoryWriteIntent = {
+	/** tool_use ID，用于和 tool_result 对齐 */
+	toolUseId: string;
+	/** memory 文件路径 */
+	filePath: string;
+	/** 待写入内容 */
+	content: string;
+};
+
+/** Claude 本次启动应使用的会话模式。 */
+type ClaudeSessionMode = "new" | "resume";
+
+/** Claude 本地状态恢复结果。 */
+type ClaudeLocalStateRestoreResult = {
+	/** 启动 CLI 时应使用的会话模式 */
+	sessionMode: ClaudeSessionMode;
+	/** 本次恢复到本地的 transcript 事件数 */
+	transcriptEvents: number;
+};
+
+/**
+ * 从 assistant payload 中提取 Claude memory 写入意图。
+ * @param payload internal event payload
+ * @returns 待 tool_result 确认的 memory 写入
+ */
+function extractMemoryWriteIntents(payload: JsonObject): MemoryWriteIntent[] {
+	const message = isJsonObject(payload.message) ? payload.message : {};
+	const content = Array.isArray(message.content) ? message.content : [];
+	const writes: MemoryWriteIntent[] = [];
+	for (const block of content) {
+		if (!isJsonObject(block) || block.type !== "tool_use" || block.name !== "Write") {
+			continue;
+		}
+		const toolUseId = typeof block.id === "string" ? block.id : "";
+		const input = isJsonObject(block.input) ? block.input : {};
+		const filePath = typeof input.file_path === "string" ? input.file_path : "";
+		const fileContent = typeof input.content === "string" ? input.content : undefined;
+		if (
+			toolUseId &&
+			fileContent !== undefined &&
+			filePath.startsWith(`${CLAUDE_PROJECT_STATE_DIR}/memory/`)
+		) {
+			writes.push({ toolUseId, filePath, content: fileContent });
+		}
+	}
+	return writes;
+}
+
+/**
+ * 从 user payload 中提取已成功完成的 tool_use ID。
+ * @param payload internal event payload
+ * @returns 成功执行的 tool_use ID 列表
+ */
+function extractSuccessfulToolResultIds(payload: JsonObject): string[] {
+	const message = isJsonObject(payload.message) ? payload.message : {};
+	const content = Array.isArray(message.content) ? message.content : [];
+	return content
+		.filter((block) => {
+			return (
+				isJsonObject(block) &&
+				block.type === "tool_result" &&
+				typeof block.tool_use_id === "string" &&
+				block.is_error !== true
+			);
+		})
+		.map((block) => String((block as JsonObject).tool_use_id));
+}
+
+/**
+ * 拉取 foreground internal events，并保持服务端入库顺序。
+ * @param store CCR store
+ * @param sessionId session ID
+ * @returns internal event payload 列表
+ */
+async function listForegroundInternalPayloads(
+	store: CcrStore,
+	sessionId: string,
+): Promise<JsonObject[]> {
+	const payloads: JsonObject[] = [];
+	let cursor: number | undefined;
+	while (true) {
+		const page = await store.listInternalEvents(sessionId, {
+			subagents: false,
+			cursor,
+			limit: TRANSCRIPT_RESTORE_PAGE_SIZE,
+		});
+		payloads.push(...page.data.map((event) => event.payload));
+		if (!page.next_cursor) {
+			return payloads;
+		}
+		// next_cursor 是服务端稳定顺序字段，不是 internal event UUID。
+		cursor = Number(page.next_cursor);
+	}
+}
+
+/**
+ * 恢复 Claude Code 依赖的容器本地状态。
+ * @param sandbox sandbox client
+ * @param store CCR store
+ * @param sessionId session ID
+ */
+async function restoreClaudeLocalState(
+	sandbox: ReturnType<typeof getCcrSandbox>,
+	store: CcrStore,
+	sessionId: string,
+): Promise<ClaudeLocalStateRestoreResult> {
+	let sessionStoreFiles = await store.listSessionStoreFiles(
+		sessionId,
+		CLAUDE_SESSION_STORE_PROJECT_KEY,
+		sessionId,
+	);
+	if (sessionStoreFiles.length === 0) {
+		// 旧会话没有 Claude sessionStore 镜像时，先从 internal events 回填一次。
+		await store.ensureClaudeSessionStoreFromInternalEvents(sessionId);
+		sessionStoreFiles = await store.listSessionStoreFiles(
+			sessionId,
+			CLAUDE_SESSION_STORE_PROJECT_KEY,
+			sessionId,
+		);
+	}
+	let transcriptPayloads: JsonObject[] = [];
+	const memoryPayloads: JsonObject[] = [];
+	let hasForegroundSessionStore = false;
+	const pendingMemoryWrites = new Map<string, MemoryWriteIntent>();
+	const memoryFiles = new Map<string, string>();
+	let restoredSessionStoreFiles = 0;
+	for (const file of sessionStoreFiles) {
+		if (!isSafeSessionStoreSubpath(sessionId, file.subpath)) {
+			continue;
+		}
+		const storedFile = await store.readSessionStoreFile(
+			sessionId,
+			CLAUDE_SESSION_STORE_PROJECT_KEY,
+			file.subpath,
+		);
+		if (!storedFile) {
+			continue;
+		}
+		const targetPath = claudeSessionStorePath(file.subpath);
+		// sessionStore 中保存的是 Claude Code 原生 JSONL，启动前要恢复为本地副本。
+		await sandbox.exec(`mkdir -p ${shellQuote(dirname(targetPath))}`);
+		await sandbox.writeFile(targetPath, storedFile.content);
+		restoredSessionStoreFiles += 1;
+		const parsedPayloads = parseSessionStorePayloads(storedFile.content);
+		memoryPayloads.push(...parsedPayloads);
+		if (isForegroundTranscriptSubpath(sessionId, file.subpath)) {
+			// foreground sessionStore 是恢复主源，存在时不再用 internal events 覆盖。
+			hasForegroundSessionStore = true;
+			transcriptPayloads = parsedPayloads;
+		}
+	}
+	if (!hasForegroundSessionStore) {
+		transcriptPayloads = await listForegroundInternalPayloads(store, sessionId);
+		// foreground 缺失时补 internal events；已恢复的 subagent sessionStore 仍参与 memory 推导。
+		memoryPayloads.push(...transcriptPayloads);
+	}
+	for (const payload of memoryPayloads) {
+		for (const memoryWrite of extractMemoryWriteIntents(payload)) {
+			pendingMemoryWrites.set(memoryWrite.toolUseId, memoryWrite);
+		}
+		for (const toolUseId of extractSuccessfulToolResultIds(payload)) {
+			const memoryWrite = pendingMemoryWrites.get(toolUseId);
+			if (!memoryWrite) {
+				continue;
+			}
+			// 只有执行成功的 Write 才能恢复；同一路径以后写入为准。
+			memoryFiles.set(memoryWrite.filePath, memoryWrite.content);
+			pendingMemoryWrites.delete(toolUseId);
+		}
+	}
+
+	await sandbox.exec(
+		`mkdir -p ${shellQuote(CLAUDE_PROJECT_STATE_DIR)} ${shellQuote(
+			`${CLAUDE_PROJECT_STATE_DIR}/memory`,
+		)}`,
+	);
+	if (!hasForegroundSessionStore && transcriptPayloads.length > 0) {
+		// 只有没有 foreground sessionStore 时，才用 internal events 兜底生成本地 transcript。
+		await sandbox.writeFile(
+			claudeTranscriptPath(sessionId),
+			`${transcriptPayloads.map((payload) => JSON.stringify(payload)).join("\n")}\n`,
+		);
+	}
+	for (const [filePath, content] of memoryFiles) {
+		await sandbox.exec(`mkdir -p ${shellQuote(dirname(filePath))}`);
+		await sandbox.writeFile(filePath, content);
+	}
+	await store.recordOperation(sessionId, {
+		direction: "route_internal",
+		category: "sandbox_state_restored",
+		payload: {
+			transcript_events: transcriptPayloads.length,
+			session_store_files: restoredSessionStoreFiles,
+			memory_files: memoryFiles.size,
+		},
+	});
+	return {
+		// 有历史 transcript 才进入 Claude Code resume 分支；新会话首轮仍使用 --session-id。
+		sessionMode: transcriptPayloads.length > 0 ? "resume" : "new",
+		transcriptEvents: transcriptPayloads.length,
+	};
 }
 
 /**
@@ -257,6 +541,7 @@ export async function startCcrSandbox(
 		containerStatus: "starting",
 		sandboxId,
 	});
+	const restoredState = await restoreClaudeLocalState(sandbox, store, sessionId);
 	await sandbox.writeFile(ENV_PATH, buildEnvScript(env));
 	await sandbox.writeFile(RUNNER_PATH, buildRunnerScript());
 	await sandbox.exec(`chmod 600 ${ENV_PATH}`);
@@ -271,6 +556,7 @@ export async function startCcrSandbox(
 					RUNNER_PATH,
 					shellQuote(sessionId),
 					shellQuote(workerAccessToken),
+					shellQuote(restoredState.sessionMode),
 					"> /workspace/ccr-runner.log 2>&1",
 				].join(" "),
 			),
@@ -287,6 +573,8 @@ export async function startCcrSandbox(
 		payload: {
 			sandbox_id: sandboxId,
 			process_id: process.id,
+			claude_session_mode: restoredState.sessionMode,
+			transcript_events: restoredState.transcriptEvents,
 		},
 	});
 	return {
@@ -344,16 +632,21 @@ export async function stopCcrSessionRunner(
 /**
  * 销毁 CCR sandbox。
  */
-export async function destroyCcrSandbox(
+export async function stopCcrUserContainer(
 	env: NeoNoumiSandboxBindings,
 	store: CcrStore,
 	userId: string,
 ) {
 	const sandbox = getCcrSandbox(env, userId);
+	const sandboxId = `neo-noumi-user-${userId}`;
 	await sandbox.destroy();
+	const clearedSessions = await store.clearUserContainerSessionRunners(userId, sandboxId);
 	await store.updateUserContainer(userId, {
-		containerStatus: "destroyed",
+		containerStatus: "stopped",
 		sandboxId: null,
 	});
-	return { ok: true };
+	return { ok: true, sandbox_id: sandboxId, cleared_sessions: clearedSessions };
 }
+
+/** @deprecated 使用 stopCcrUserContainer 表达用户级容器停止语义。 */
+export const destroyCcrSandbox = stopCcrUserContainer;
