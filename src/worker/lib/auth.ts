@@ -1,7 +1,21 @@
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { username } from "better-auth/plugins";
+import { deleteKvCache, readKvJsonCache, writeKvJsonCache } from "./kv-cache";
 import { createPrismaClient } from "./prisma";
+
+/** Better Auth session 缓存在 AUTH_KV 下使用的目录。 */
+const BETTER_AUTH_CACHE_KEY_PREFIX = ["auth", "session"] as const;
+
+/**
+ * 生成 Better Auth session cache key。
+ * @param key Better Auth secondary storage 传入的原始 key
+ * @returns 去除重复 session 目录后的分层 key
+ */
+function buildBetterAuthCacheKey(key: string) {
+	const normalizedKey = key.replace(/^session[:/]+/, "");
+	return [...BETTER_AUTH_CACHE_KEY_PREFIX, normalizedKey];
+}
 
 /** Auth 运行所需的 Cloudflare Worker 绑定 */
 export interface AuthBindings {
@@ -43,22 +57,25 @@ function getDatabaseUrl(env: AuthBindings): string {
  * @param kv Cloudflare KV namespace
  * @returns Better Auth secondary storage 实现
  */
-function createKvSecondaryStorage(kv: KVNamespace) {
+export function createKvSecondaryStorage(kv: KVNamespace) {
 	return {
-		get: async (key: string) => kv.get(`better-auth:${key}`),
+		get: async (key: string) =>
+			readKvJsonCache<string>(kv, buildBetterAuthCacheKey(key), {
+				deleteInvalid: true,
+				parse: (value) => {
+					if (typeof value !== "string") {
+						throw new Error("Invalid Better Auth cache value");
+					}
+					return value;
+				},
+			}),
 		set: async (key: string, value: string, ttl?: number) => {
-			const storageKey = `better-auth:${key}`;
-
-			// Workers KV 的 expirationTtl 最小值为 60 秒，低于该值时按持久写入处理
-			if (ttl && ttl >= 60) {
-				await kv.put(storageKey, value, { expirationTtl: ttl });
-				return;
-			}
-
-			await kv.put(storageKey, value);
+			// Workers KV 的 expirationTtl 最小值为 60 秒，低于该值时沿用旧行为按持久写入处理。
+			const options = ttl && ttl >= 60 ? { expirationTtl: ttl } : undefined;
+			await writeKvJsonCache(kv, buildBetterAuthCacheKey(key), value, options);
 		},
 		delete: async (key: string) => {
-			await kv.delete(`better-auth:${key}`);
+			await deleteKvCache(kv, buildBetterAuthCacheKey(key));
 		},
 	};
 }
