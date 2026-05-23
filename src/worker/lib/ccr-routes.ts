@@ -60,7 +60,9 @@ function createStore(env: CcrBindings): CcrStore {
 	if (!databaseUrl) {
 		throw new Error("DATABASE_URL or HYPERDRIVE.connectionString is required");
 	}
-	return new CcrStore(createPrismaClient(databaseUrl));
+	return new CcrStore(createPrismaClient(databaseUrl), {
+		aiProxyCredentialSecret: env.AI_PROXY_CREDENTIAL_SECRET,
+	});
 }
 
 /**
@@ -339,6 +341,33 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 	app.get("/api/ccr/projects", async (c) => {
 		const store = createStore(c.env);
 		return c.json({ projects: await store.listProjects(c.get("userId")) });
+	});
+
+	app.get("/api/ccr/ai-proxy/credentials", async (c) => {
+		const store = createStore(c.env);
+		return c.json({
+			credentials: await store.listAiProxyCredentials(c.get("userId")),
+		});
+	});
+
+	app.post("/api/ccr/ai-proxy/credentials/default", async (c) => {
+		const body = await readJsonObject(c.req.raw);
+		const store = createStore(c.env);
+		let credential;
+		try {
+			credential = await store.upsertDefaultAiProxyCredential(c.get("userId"), {
+				name: getStringField(body, "name"),
+				provider: getStringField(body, "provider"),
+				baseUrl: getStringField(body, "baseUrl"),
+				apiKey: getStringField(body, "apiKey"),
+			});
+		} catch (error) {
+			return c.json(
+				{ error: error instanceof Error ? error.message : "Invalid credential" },
+				400,
+			);
+		}
+		return c.json({ credential });
 	});
 
 	app.post("/api/ccr/projects", async (c) => {

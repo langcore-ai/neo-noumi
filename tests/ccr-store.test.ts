@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Prisma } from "../src/generated/prisma/client";
 import {
 	CcrStore,
+	normalizeAiProxyCredentialInput,
 	normalizeProjectCreateInput,
 	normalizeProjectUpdateInput,
 } from "../src/worker/lib/ccr-store";
@@ -16,6 +17,21 @@ type CcrStorePrisma = ConstructorParameters<typeof CcrStore>[0];
  */
 function createStoreFromFakePrisma(fake: unknown): CcrStore {
 	return new CcrStore(fake as CcrStorePrisma);
+}
+
+/**
+ * 计算测试用 AI Proxy token 哈希，保持断言贴近数据库保存形态。
+ * @param token token 原文
+ * @returns 十六进制 SHA-256
+ */
+async function hashTestToken(token: string): Promise<string> {
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(token),
+	);
+	return [...new Uint8Array(digest)]
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
 }
 
 describe("normalizeProjectCreateInput", () => {
@@ -80,6 +96,23 @@ describe("mergeJsonObject", () => {
 		).toEqual({
 			model: "haiku",
 			task_summary: "old summary",
+		});
+	});
+});
+
+describe("normalizeAiProxyCredentialInput", () => {
+	test("normalizes AI proxy credential defaults and /v1 base URL", () => {
+		expect(
+			normalizeAiProxyCredentialInput({
+				name: "  Mandao  ",
+				baseUrl: "https://ai-api.example.com/v1",
+				apiKey: "  sk-test  ",
+			}),
+		).toEqual({
+			name: "Mandao",
+			provider: "anthropic",
+			baseUrl: "https://ai-api.example.com",
+			apiKey: "sk-test",
 		});
 	});
 });
@@ -149,6 +182,73 @@ describe("CcrStore worker lifecycle guards", () => {
 			store.insertWorkerEvents("session-1", 2, [{ payload: { type: "assistant" } }]),
 		).resolves.toBe(false);
 		expect(calls).toEqual(["claim"]);
+	});
+
+	test("encrypts user default AI proxy credential before storing", async () => {
+		let storedApiKeyCiphertext = "";
+		const tx = {
+			aiProxyCredential: {
+				updateMany: async () => ({ count: 1 }),
+				create: async (args: { data: { apiKeyCiphertext: string } }) => {
+					storedApiKeyCiphertext = args.data.apiKeyCiphertext;
+					return {
+						id: "credential-1",
+						name: "Default Anthropic Proxy",
+						provider: "anthropic",
+						baseUrl: "https://api.anthropic.com",
+						isDefault: true,
+						createdAt: new Date(),
+						updatedAt: new Date(),
+					};
+				},
+			},
+		};
+		const store = new CcrStore(
+			{
+				$transaction: async (fn: (transaction: unknown) => Promise<unknown>) => fn(tx),
+			} as CcrStorePrisma,
+			{ aiProxyCredentialSecret: "unit-test-secret" },
+		);
+
+		await store.upsertDefaultAiProxyCredential("user-1", {
+			apiKey: "sk-real-secret",
+		});
+
+		expect(storedApiKeyCiphertext).toStartWith("v1:");
+		expect(storedApiKeyCiphertext).not.toContain("sk-real-secret");
+	});
+
+	test("rejects AI proxy token when session moved to another sandbox", async () => {
+		const token = "nnaip_unit_test_token";
+		const expectedTokenHash = await hashTestToken(token);
+		let currentSessionSandboxId = "sandbox-current";
+		const store = createStoreFromFakePrisma({
+			aiProxyToken: {
+				findUnique: async (args: { where: { tokenHash: string } }) => {
+					expect(args.where.tokenHash).toBe(expectedTokenHash);
+					return {
+						userId: "user-1",
+						sessionId: "session-1",
+						sandboxId: "sandbox-old",
+						expiresAt: new Date(Date.now() + 60_000),
+						revokedAt: null,
+						session: {
+							deletedAt: null,
+							sandboxId: currentSessionSandboxId,
+						},
+					};
+				},
+			},
+		});
+
+		await expect(store.authenticateAiProxyToken(token)).resolves.toBeNull();
+
+		currentSessionSandboxId = "sandbox-old";
+		await expect(store.authenticateAiProxyToken(token)).resolves.toEqual({
+			userId: "user-1",
+			sessionId: "session-1",
+			sandboxId: "sandbox-old",
+		});
 	});
 
 	test("clears stale requires_action details when worker returns to idle", async () => {

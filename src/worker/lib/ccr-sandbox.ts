@@ -1,14 +1,13 @@
 import { Sandbox, getSandbox } from "@cloudflare/sandbox";
 import { CLAUDE_SESSION_STORE_PROJECT_KEY, type CcrStore } from "./ccr-store";
 import { isJsonObject } from "./ccr-json";
-import { CCR_SDK_APPROVED_HOST, normalizeClaudeBaseUrl } from "./ccr-protocol";
+import { CCR_SDK_APPROVED_HOST } from "./ccr-protocol";
+import {
+	ANTHROPIC_API_HOST,
+	proxyAnthropicApiRequest,
+	type AiProxyBindings,
+} from "./ccr-ai-proxy";
 import type { JsonObject } from "./ccr-types";
-
-/** 默认 Anthropic API host；只允许直连，不能被 CCR outbound handler 接管。 */
-const ANTHROPIC_API_HOST = "api.anthropic.com";
-
-/** 当前验证过的 Anthropic 兼容网关域名；匹配 allowedHosts 后由容器直连公网。 */
-const ANTHROPIC_COMPAT_HOSTS = ["ai-api.mandao.com", "maas.geneasy.ai"];
 
 /** Sandbox 内 CCR runner 脚本路径 */
 const RUNNER_PATH = "/workspace/ccr-runner.sh";
@@ -34,7 +33,7 @@ const TRANSCRIPT_RESTORE_PAGE_SIZE = 500;
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 
 /** Neo Noumi sandbox Worker 绑定 */
-export interface NeoNoumiSandboxBindings {
+export interface NeoNoumiSandboxBindings extends AiProxyBindings {
 	/** Sandbox Durable Object binding */
 	NEO_NOUMI_SANDBOX: DurableObjectNamespace<NeoNoumiSandbox>;
 	/** 当前 Worker 对外 base URL */
@@ -45,14 +44,16 @@ export interface NeoNoumiSandboxBindings {
 	NEO_NOUMI_ENABLE_REAL_CLAUDE?: string;
 	/** 旧版真实执行开关；仅用于部署过渡兼容。 */
 	CCR_ENABLE_REAL_CLAUDE?: string;
-	/** Claude Code API Key；作为 Worker secret 注入后传给 sandbox 进程 */
+	/** Claude Code API Key；仅由 Worker AI Proxy 转发时读取，不会注入 sandbox。 */
 	ANTHROPIC_API_KEY?: string;
-	/** Anthropic 兼容 API base URL；可用于接入代理网关 */
+	/** Anthropic 兼容 API base URL；仅由 Worker AI Proxy 转发时读取。 */
 	ANTHROPIC_BASE_URL?: string;
 	/** Claude Code 模型名；默认固定使用 claude-sonnet-4-6 */
 	CLAUDE_MODEL?: string;
-	/** Claude Code OAuth token；按部署环境需要作为 secret 注入 */
-	CLAUDE_CODE_OAUTH_TOKEN?: string;
+	/** AI Proxy fallback credential 使用的鉴权头类型。 */
+	AI_PROXY_AUTH_HEADER?: string;
+	/** 用户级 AI Proxy credential 加密密钥。 */
+	AI_PROXY_CREDENTIAL_SECRET?: string;
 }
 
 /** Cloudflare Sandbox，用于运行 Neo Noumi chat worker。 */
@@ -62,7 +63,6 @@ export class NeoNoumiSandbox extends Sandbox {
 	allowedHosts = [
 		CCR_SDK_APPROVED_HOST,
 		ANTHROPIC_API_HOST,
-		...ANTHROPIC_COMPAT_HOSTS,
 	];
 }
 
@@ -83,6 +83,9 @@ NeoNoumiSandbox.outboundByHost = {
 		const target = new URL(url.pathname + url.search, baseUrl);
 		return fetch(new Request(target, request));
 	},
+	[ANTHROPIC_API_HOST]: async (request: Request, env: Env) => {
+		return proxyAnthropicApiRequest(request, env as Env & AiProxyBindings);
+	},
 };
 
 /**
@@ -95,7 +98,8 @@ set -eu
 
 SESSION_ID="$1"
 WORKER_ACCESS_TOKEN="$2"
-CLAUDE_SESSION_MODE="\${3:-new}"
+AI_PROXY_TOKEN="$3"
+CLAUDE_SESSION_MODE="\${4:-new}"
 SDK_URL="https://${CCR_SDK_APPROVED_HOST}/v1/code/sessions/$SESSION_ID"
 AUTH_HEADER="Authorization: Bearer $WORKER_ACCESS_TOKEN"
 
@@ -110,6 +114,8 @@ export CLAUDE_CODE_POST_FOR_SESSION_INGRESS_V2=1
 export NODE_EXTRA_CA_CERTS=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 export CURL_CA_BUNDLE=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 export SSL_CERT_FILE=/etc/cloudflare/certs/cloudflare-containers-ca.crt
+export ANTHROPIC_BASE_URL="https://${ANTHROPIC_API_HOST}"
+export ANTHROPIC_API_KEY="$AI_PROXY_TOKEN"
 
 if [ "\${NEO_NOUMI_ENABLE_REAL_CLAUDE:-0}" = "1" ] && command -v claude >/dev/null 2>&1; then
   CLAUDE_SESSION_ARG="--session-id"
@@ -428,12 +434,7 @@ function buildEnvScript(env: NeoNoumiSandboxBindings): string {
 		`export NEO_NOUMI_ENABLE_REAL_CLAUDE=${shellQuote(
 			env.NEO_NOUMI_ENABLE_REAL_CLAUDE ?? env.CCR_ENABLE_REAL_CLAUDE,
 		)}`,
-		`export ANTHROPIC_API_KEY=${shellQuote(env.ANTHROPIC_API_KEY)}`,
-		`export ANTHROPIC_BASE_URL=${shellQuote(
-			normalizeClaudeBaseUrl(env.ANTHROPIC_BASE_URL),
-		)}`,
 		`export CLAUDE_MODEL=${shellQuote(env.CLAUDE_MODEL ?? CLAUDE_MODEL)}`,
-		`export CLAUDE_CODE_OAUTH_TOKEN=${shellQuote(env.CLAUDE_CODE_OAUTH_TOKEN)}`,
 		"",
 	].join("\n");
 }
@@ -447,11 +448,9 @@ function redactSecrets(value: unknown): unknown {
 	if (typeof value === "string") {
 		return value
 			.replaceAll(/sk-[A-Za-z0-9_-]+/g, "[REDACTED]")
+			.replaceAll(/nnaip_[A-Za-z0-9_-]+/g, "[REDACTED]")
 			.replaceAll(/ANTHROPIC_API_KEY='[^']*'/g, "ANTHROPIC_API_KEY='[REDACTED]'")
-			.replaceAll(
-				/CLAUDE_CODE_OAUTH_TOKEN='[^']*'/g,
-				"CLAUDE_CODE_OAUTH_TOKEN='[REDACTED]'",
-			);
+			.replaceAll(/AI_PROXY_TOKEN='[^']*'/g, "AI_PROXY_TOKEN='[REDACTED]'");
 	}
 	if (Array.isArray(value)) {
 		return value.map(redactSecrets);
@@ -518,6 +517,7 @@ export async function startCcrSandbox(
 	}
 	await store.getUserContainer(userId);
 	const workerAccessToken = await store.rotateWorkerAccessToken(sessionId);
+	const aiProxyToken = await store.rotateAiProxyToken(userId, sessionId, sandboxId);
 	await store.updateUserContainer(userId, {
 		containerStatus: "starting",
 		sandboxId,
@@ -541,6 +541,7 @@ export async function startCcrSandbox(
 					RUNNER_PATH,
 					shellQuote(sessionId),
 					shellQuote(workerAccessToken),
+					shellQuote(aiProxyToken),
 					shellQuote(restoredState.sessionMode),
 					"> /workspace/ccr-runner.log 2>&1",
 				].join(" "),
@@ -632,6 +633,7 @@ export async function stopCcrSessionRunner(
 			await store.clearDeletedSessionRunner(sessionId);
 		}
 	}
+	await store.revokeAiProxyTokensForSession(sessionId);
 	const remainingProcesses = await sandbox.listProcesses().catch(() => []);
 	if (Array.isArray(remainingProcesses) && remainingProcesses.length === 0) {
 		// 用户级容器没有其它会话 runner 时，才把用户容器标为 stopped。

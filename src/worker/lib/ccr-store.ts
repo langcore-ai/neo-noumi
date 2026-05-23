@@ -8,6 +8,7 @@ import {
 	isKeepAlivePayload,
 	isSystemInitPayload,
 	mergeClientEventDeliveryStatus,
+	normalizeClaudeBaseUrl,
 } from "./ccr-protocol";
 import type {
 	ChatMessageInput,
@@ -39,6 +40,21 @@ const PROJECT_DESCRIPTION_MAX_LENGTH = 500;
 
 /** Serializable 事务冲突的最大重试次数。 */
 const SERIALIZABLE_TRANSACTION_RETRY_LIMIT = 3;
+
+/** AI Proxy token 前缀，用于和真实上游 key 做肉眼区分。 */
+const AI_PROXY_TOKEN_PREFIX = "nnaip_";
+
+/** AI Proxy token 默认有效期，单位毫秒。 */
+const AI_PROXY_TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
+
+/** 默认 AI Proxy credential 名称。 */
+const DEFAULT_AI_PROXY_CREDENTIAL_NAME = "Default Anthropic Proxy";
+
+/** AI Proxy credential 名称最大长度。 */
+const AI_PROXY_CREDENTIAL_NAME_MAX_LENGTH = 80;
+
+/** AI Proxy credential 密文版本前缀。 */
+const AI_PROXY_CREDENTIAL_CIPHERTEXT_PREFIX = "v1:";
 
 /** 用户级 sandbox ID 前缀，用于按用户复用同一个容器。 */
 const USER_SANDBOX_ID_PREFIX = "neo-noumi-user";
@@ -97,6 +113,96 @@ function readAgentTranscriptSubdir(event: {
  */
 function newEventId(): string {
 	return crypto.randomUUID();
+}
+
+/**
+ * 生成 AI Proxy token 原文。
+ * @returns 只会暴露给容器的短期 proxy token
+ */
+function newAiProxyToken(): string {
+	return `${AI_PROXY_TOKEN_PREFIX}${crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+/**
+ * 计算 token 哈希，数据库只保存不可逆摘要。
+ * @param token token 原文
+ * @returns 十六进制 SHA-256
+ */
+async function hashToken(token: string): Promise<string> {
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(token),
+	);
+	return [...new Uint8Array(digest)]
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+}
+
+/**
+ * 从 secret 派生 AES-GCM key。
+ * @param secret Worker secret
+ * @returns WebCrypto key
+ */
+async function importAiProxyCredentialKey(secret: string): Promise<CryptoKey> {
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(secret),
+	);
+	return crypto.subtle.importKey("raw", digest, "AES-GCM", false, [
+		"encrypt",
+		"decrypt",
+	]);
+}
+
+/**
+ * 编码 base64url。
+ * @param bytes 原始字节
+ * @returns base64url 字符串
+ */
+function encodeBase64Url(bytes: Uint8Array): string {
+	let binary = "";
+	for (const byte of bytes) {
+		binary += String.fromCharCode(byte);
+	}
+	return btoa(binary)
+		.replaceAll("+", "-")
+		.replaceAll("/", "_")
+		.replaceAll("=", "");
+}
+
+/**
+ * 解码 base64url。
+ * @param value base64url 字符串
+ * @returns 原始字节
+ */
+function decodeBase64Url(value: string): Uint8Array {
+	const base64 = value.replaceAll("-", "+").replaceAll("_", "/");
+	const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+	const binary = atob(padded);
+	return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+/**
+ * 清洗 AI Proxy credential 输入。
+ * @param input 原始输入
+ * @returns 可持久化 credential 字段
+ */
+export function normalizeAiProxyCredentialInput(input: {
+	name?: string | null;
+	baseUrl?: string | null;
+	apiKey?: string | null;
+	provider?: string | null;
+}) {
+	const baseUrl = normalizeClaudeBaseUrl(input.baseUrl?.trim() || undefined);
+	return {
+		name: (input.name?.trim() || DEFAULT_AI_PROXY_CREDENTIAL_NAME).slice(
+			0,
+			AI_PROXY_CREDENTIAL_NAME_MAX_LENGTH,
+		),
+		provider: input.provider?.trim() || "anthropic",
+		baseUrl: baseUrl || "https://api.anthropic.com",
+		apiKey: input.apiKey?.trim() ?? "",
+	};
 }
 
 /**
@@ -239,7 +345,62 @@ const projectSessionLifecycleSelect = {
 
 /** PostgreSQL backed chat session store */
 export class CcrStore {
-	constructor(private readonly prisma: PrismaClient) {}
+	constructor(
+		private readonly prisma: PrismaClient,
+		private readonly options: { aiProxyCredentialSecret?: string } = {},
+	) {}
+
+	/**
+	 * 加密 AI Proxy API key。
+	 * @param apiKey API key 明文
+	 * @returns 可持久化密文
+	 */
+	private async encryptAiProxyApiKey(apiKey: string): Promise<string> {
+		const secret = this.options.aiProxyCredentialSecret;
+		if (!secret) {
+			throw new Error("AI_PROXY_CREDENTIAL_SECRET is required");
+		}
+		const iv = crypto.getRandomValues(new Uint8Array(12));
+		const key = await importAiProxyCredentialKey(secret);
+		const ciphertext = new Uint8Array(
+			await crypto.subtle.encrypt(
+				{ name: "AES-GCM", iv },
+				key,
+				new TextEncoder().encode(apiKey),
+			),
+		);
+		return `${AI_PROXY_CREDENTIAL_CIPHERTEXT_PREFIX}${encodeBase64Url(
+			iv,
+		)}.${encodeBase64Url(ciphertext)}`;
+	}
+
+	/**
+	 * 解密 AI Proxy API key。
+	 * @param ciphertext 密文
+	 * @returns API key 明文
+	 */
+	private async decryptAiProxyApiKey(ciphertext: string): Promise<string> {
+		const secret = this.options.aiProxyCredentialSecret;
+		if (!secret) {
+			throw new Error("AI_PROXY_CREDENTIAL_SECRET is required");
+		}
+		if (!ciphertext.startsWith(AI_PROXY_CREDENTIAL_CIPHERTEXT_PREFIX)) {
+			throw new Error("Unsupported AI proxy credential format");
+		}
+		const [encodedIv, encodedCiphertext] = ciphertext
+			.slice(AI_PROXY_CREDENTIAL_CIPHERTEXT_PREFIX.length)
+			.split(".");
+		if (!encodedIv || !encodedCiphertext) {
+			throw new Error("Invalid AI proxy credential ciphertext");
+		}
+		const key = await importAiProxyCredentialKey(secret);
+		const plaintext = await crypto.subtle.decrypt(
+			{ name: "AES-GCM", iv: decodeBase64Url(encodedIv) },
+			key,
+			decodeBase64Url(encodedCiphertext),
+		);
+		return new TextDecoder().decode(plaintext);
+	}
 
 	/**
 	 * 在 worker 写入前锁定当前活跃 session。
@@ -569,6 +730,195 @@ export class CcrStore {
 			throw new Error("Session not found");
 		}
 		return token;
+	}
+
+	/**
+	 * 为当前 session 签发短期 AI Proxy token。
+	 * @param userId 用户 ID
+	 * @param sessionId session ID
+	 * @param sandboxId 用户级 sandbox ID
+	 * @returns 只注入容器的短期 token 原文
+	 */
+	async rotateAiProxyToken(
+		userId: string,
+		sessionId: string,
+		sandboxId: string,
+	): Promise<string> {
+		const token = newAiProxyToken();
+		const tokenHash = await hashToken(token);
+		const expiresAt = new Date(Date.now() + AI_PROXY_TOKEN_TTL_MS);
+		await runSerializableTransaction(this.prisma, async (tx) => {
+			const session = await tx.chatSession.findFirst({
+				where: { id: sessionId, userId, deletedAt: null },
+				select: { id: true },
+			});
+			if (!session) {
+				throw new Error("Session not found");
+			}
+			// 新 runner 启动时吊销同 session 的旧 token，避免旧容器继续打模型请求。
+			await tx.aiProxyToken.updateMany({
+				where: { sessionId, revokedAt: null },
+				data: { revokedAt: new Date() },
+			});
+			await tx.aiProxyToken.create({
+				data: {
+					id: crypto.randomUUID(),
+					tokenHash,
+					userId,
+					sessionId,
+					sandboxId,
+					expiresAt,
+				},
+			});
+		});
+		return token;
+	}
+
+	/**
+	 * 吊销 session 的 AI Proxy token。
+	 * @param sessionId session ID
+	 */
+	async revokeAiProxyTokensForSession(sessionId: string) {
+		await this.prisma.aiProxyToken.updateMany({
+			where: { sessionId, revokedAt: null },
+			data: { revokedAt: new Date() },
+		});
+	}
+
+	/**
+	 * 校验 AI Proxy token 并恢复所属 session。
+	 * @param token 容器提交的 proxy token
+	 * @returns token 绑定上下文；无效时返回 null
+	 */
+	async authenticateAiProxyToken(token: string): Promise<{
+		userId: string;
+		sessionId: string;
+		sandboxId: string;
+	} | null> {
+		if (!token.startsWith(AI_PROXY_TOKEN_PREFIX)) {
+			return null;
+		}
+		const tokenHash = await hashToken(token);
+		const row = await this.prisma.aiProxyToken.findUnique({
+			where: { tokenHash },
+			select: {
+				userId: true,
+				sessionId: true,
+				sandboxId: true,
+				expiresAt: true,
+				revokedAt: true,
+				session: {
+					select: {
+						deletedAt: true,
+						sandboxId: true,
+					},
+				},
+			},
+		});
+		if (
+			!row ||
+			row.revokedAt ||
+			row.expiresAt.getTime() <= Date.now() ||
+			row.session.deletedAt ||
+			row.session.sandboxId !== row.sandboxId
+		) {
+			return null;
+		}
+		return {
+			userId: row.userId,
+			sessionId: row.sessionId,
+			sandboxId: row.sandboxId,
+		};
+	}
+
+	/**
+	 * 创建或替换用户默认 AI Proxy credential。
+	 * @param userId 用户 ID
+	 * @param input credential 输入
+	 * @returns credential 摘要
+	 */
+	async upsertDefaultAiProxyCredential(
+		userId: string,
+		input: { name?: string | null; baseUrl?: string | null; apiKey?: string | null; provider?: string | null },
+	) {
+		const normalized = normalizeAiProxyCredentialInput(input);
+		if (!normalized.apiKey) {
+			throw new Error("API key is required");
+		}
+		const encryptedApiKey = await this.encryptAiProxyApiKey(normalized.apiKey);
+		return runSerializableTransaction(this.prisma, async (tx) => {
+			await tx.aiProxyCredential.updateMany({
+				where: { userId, deletedAt: null, isDefault: true },
+				data: { isDefault: false },
+			});
+			return tx.aiProxyCredential.create({
+				data: {
+					id: crypto.randomUUID(),
+					userId,
+					name: normalized.name,
+					provider: normalized.provider,
+					baseUrl: normalized.baseUrl,
+					apiKeyCiphertext: encryptedApiKey,
+					isDefault: true,
+				},
+				select: {
+					id: true,
+					name: true,
+					provider: true,
+					baseUrl: true,
+					isDefault: true,
+					createdAt: true,
+					updatedAt: true,
+				},
+			});
+		});
+	}
+
+	/**
+	 * 读取用户 AI Proxy credentials 摘要。
+	 * @param userId 用户 ID
+	 * @returns 不包含 API key 的 credential 列表
+	 */
+	async listAiProxyCredentials(userId: string) {
+		return this.prisma.aiProxyCredential.findMany({
+			where: { userId, deletedAt: null },
+			orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }],
+			select: {
+				id: true,
+				name: true,
+				provider: true,
+				baseUrl: true,
+				isDefault: true,
+				createdAt: true,
+				updatedAt: true,
+			},
+		});
+	}
+
+	/**
+	 * 读取用户默认 AI Proxy credential，包含转发所需 API key。
+	 * @param userId 用户 ID
+	 * @returns credential；不存在时返回 null
+	 */
+	async getDefaultAiProxyCredential(userId: string) {
+		const credential = await this.prisma.aiProxyCredential.findFirst({
+			where: { userId, deletedAt: null, isDefault: true },
+			orderBy: { updatedAt: "desc" },
+			select: {
+				id: true,
+				provider: true,
+				baseUrl: true,
+				apiKeyCiphertext: true,
+			},
+		});
+		return credential
+			? {
+					id: credential.id,
+					provider: credential.provider,
+					baseUrl: credential.baseUrl,
+					apiKey: await this.decryptAiProxyApiKey(credential.apiKeyCiphertext),
+				}
+			: null;
 	}
 
 	/**
