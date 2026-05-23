@@ -20,7 +20,9 @@
 
 - 数据模型已拆成 `projects`、`chat_sessions`、`user_containers`：一个用户可以有多个 project，session 必须归属某个用户和某个 project。
 - `chat_sessions.userId` 和 `chat_sessions.projectId` 是非空外键，创建 session 前会校验 project 属于当前登录用户，避免跨用户挂载 session。
+- `/projects` 是 project 管理页面，基于 `/api/ccr/projects` 提供列表、创建、编辑和软删除；删除 project 会同步移除其下未删除 session，并对活跃 session 后台停止 runner，聊天页只展示未删除 project/session。
 - Cloudflare 资源使用 `NeoNoumiSandbox` / `NEO_NOUMI_SANDBOX` / `neo-noumi-sandbox` 命名，用户级 sandbox ID 使用 `neo-noumi-user-{userId}`。
+- Cloudflare outbound interception 的 CCR `--sdk-url` host 使用 `beacon.claude-ai.staging.ant.dev`；`api.anthropic.com` 只作为真实 Anthropic API 直连 host，避免把 `/v1/messages` 推理请求误路由回本服务的 CCR routes。
 - 容器粒度是“一个用户一个 sandbox/container”，而不是“一个 session 一个容器”。
 - runner 粒度仍是“一个活跃 session 一个 Claude Code CLI 进程”；`chat_sessions.runnerProcessId` 记录 session 对应的容器内进程，防止同一用户多个 session 互相复用错 runner。
 - 启动 runner 前，A 会从 `claude-code` sessionStore 或 internal events 恢复容器内 Claude 本地状态，并据此决定 Claude CLI 参数：没有历史 foreground transcript 时使用 `--session-id`，已有历史 transcript 时使用 `--resume`。
@@ -329,7 +331,7 @@ worker_epoch = 当前执行者版本
 它不是安全凭证，安全仍然依赖 `Authorization: Bearer {workerJwt}`。它的职责是并发和生命周期一致性控制：
 
 - 防止旧 worker 继续写入。同一个 session 下如果旧 B 容器网络卡住，A 又启动了新 B 容器，两个 worker 可能短时间同时存在；服务端只应接受最新 epoch 的写入。
-- 支持容器重启、抢占和恢复。新 worker 注册后拿到新的 epoch，旧 worker 再写 `/worker/events`、`/worker/internal-events`、`PUT /worker` 或 heartbeat 时应收到 `409`。
+- 支持容器重启、抢占和恢复。新 worker 注册后拿到新的 epoch，旧 worker 再写 `/worker/events`、`/worker/internal-events`、`/worker/events/delivery`、`PUT /worker` 或 heartbeat 时应收到 `409`；已进入删除态的 session 也必须拒绝 worker 写入。
 - 保证事件归属。所有 worker 写请求都带 `worker_epoch`，服务端用它判断事件是否来自当前有效 worker。
 - 避免双写和乱序。没有 epoch 时，旧容器恢复网络后可能继续写 assistant events、internal events 或状态，导致 session 状态被污染。
 
@@ -535,7 +537,7 @@ v1 的 `sdkUrl` 本身是 WebSocket URL；CCR v2 的 `sdkUrl` 是 session base U
 
 用途：SSE 下发 client-to-worker 事件。
 
-子进程通过这个流接收远端用户消息、控制事件、权限响应等。每个 SSE frame 的数据里至少需要包含服务端事件标识和 payload；B 侧收到后会通过 delivery endpoint 回报状态。worker stream 只下发 `queued` 状态的 client event；已回报 `received` 的事件不能在新 worker epoch 中再次下发，否则会导致历史用户输入被重复执行并写入可见时间线。会话详情接口仍读取全部 client event，用于恢复前端用户消息气泡。
+子进程通过这个流接收远端用户消息、控制事件、权限响应等。每个 SSE frame 的数据里至少需要包含服务端事件标识和 payload；B 侧收到后会通过 delivery endpoint 回报状态。worker stream 只下发活跃 session 的 `queued` 状态 client event；已回报 `received` 的事件不能在新 worker epoch 中再次下发，否则会导致历史用户输入被重复执行并写入可见时间线。会话删除后 stream 返回 `done` 控制 frame 并结束，避免删除态 session 继续空轮询或收到旧事件。会话详情接口仍读取全部 client event，用于恢复前端用户消息气泡。
 
 概念形态：
 
@@ -730,7 +732,7 @@ received | processing | processed
 }
 ```
 
-`external_metadata` 使用类似 RFC 7396 的 merge patch 语义，字段为 `null` 表示服务端应删除或清空对应状态。
+`external_metadata` 使用类似 RFC 7396 的 merge patch 语义，字段为 `null` 表示服务端应删除或清空对应状态。`requires_action_details: null` 或 `worker_status` 回到非 `requires_action` 时，也应同步清空服务端保存的待处理动作，避免旧 action 污染下一轮状态恢复。
 
 ### GET /worker
 
@@ -1037,6 +1039,7 @@ Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metada
 - 如果 internal event metadata 或 payload 中存在安全的 `agent_transcript_subdir` / `transcript_subdir`，subagent transcript 会写入 `{sessionId}/subagents/{subdir}/agent-{agentId}.jsonl`，用于贴近 `claude-code-reverse` 的 `agentTranscriptSubdirs` 语义。
 - `/session-store/read` 与 `/session-store/list` 在 `project_key = "claude-code"` 且没有文件时，会触发一次从 internal events 到 sessionStore 的旧会话回填。
 - internal events 镜像只会覆盖由 `source = "ccr_internal_events"` 生成的 sessionStore 文件；直接通过 sessionStore 写入的文件不会被 internal events 镜像覆盖。
+- sessionStore 写入和删除只接受活跃 session；session 进入删除态后不能再通过 worker token 改写 transcript 镜像。
 - 容器启动前会把 `claude-code` sessionStore 文件恢复到 `/root/.claude/projects/-workspace/` 下；memory 恢复会读取 foreground 与 subagent JSONL 中已成功执行的 `Write` 工具调用。
 
 需要特别区分：

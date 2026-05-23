@@ -1,5 +1,14 @@
-import type { PrismaClient } from "../../generated/prisma/client";
+import { Prisma, type PrismaClient } from "../../generated/prisma/client";
 import { isJsonObject, mergeJsonObject, toJsonValue } from "./ccr-json";
+import {
+	CLIENT_EVENT_STATUS_FAILED,
+	CLIENT_EVENT_STATUS_QUEUED,
+	asCcrPayload,
+	eventIdFromPayload,
+	isKeepAlivePayload,
+	isSystemInitPayload,
+	mergeClientEventDeliveryStatus,
+} from "./ccr-protocol";
 import type {
 	ChatMessageInput,
 	JsonObject,
@@ -19,17 +28,17 @@ const DEFAULT_EXTERNAL_METADATA: JsonObject = {
 /** 默认分页大小 */
 const DEFAULT_PAGE_SIZE = 100;
 
-/** 并发写入 client event 发生序号冲突时的最大重试次数 */
-const CLIENT_EVENT_SEQUENCE_RETRY_LIMIT = 3;
-
-/** Client event 等待 worker 消费的状态。 */
-const CLIENT_EVENT_STATUS_QUEUED = "queued";
-
-/** Client event 已入库但 runner 启动失败，不应再下发给 worker。 */
-const CLIENT_EVENT_STATUS_FAILED = "failed";
-
 /** 默认项目名称 */
 const DEFAULT_PROJECT_NAME = "Default Project";
+
+/** Project 名称最大长度，避免 UI 和数据库写入过长的非业务内容。 */
+const PROJECT_NAME_MAX_LENGTH = 80;
+
+/** Project 描述最大长度，用于管理页摘要展示。 */
+const PROJECT_DESCRIPTION_MAX_LENGTH = 500;
+
+/** Serializable 事务冲突的最大重试次数。 */
+const SERIALIZABLE_TRANSACTION_RETRY_LIMIT = 3;
 
 /** 用户级 sandbox ID 前缀，用于按用户复用同一个容器。 */
 const USER_SANDBOX_ID_PREFIX = "neo-noumi-user";
@@ -91,15 +100,6 @@ function newEventId(): string {
 }
 
 /**
- * 从 payload 提取幂等 ID。
- * @param payload 事件 payload
- * @returns 事件 ID
- */
-function eventIdFromPayload(payload: JsonObject): string {
-	return typeof payload.uuid === "string" ? payload.uuid : newEventId();
-}
-
-/**
  * 将 Prisma JSON 值收敛为 JSON 对象。
  * @param value Prisma JSON 值
  * @returns JSON 对象
@@ -109,35 +109,175 @@ function asJsonObject(value: unknown): JsonObject {
 }
 
 /**
- * 判断事件 payload 是否只是连接保活。
- * @param payload 事件 payload
- * @returns 是否应跳过持久化
- */
-function isKeepAlivePayload(payload: JsonObject): boolean {
-	return payload.type === "keep_alive";
-}
-
-/**
- * 判断事件是否为 runner 初始化元数据。
- * @param payload 事件 payload
- * @returns 是否为 system/init 事件
- */
-function isSystemInitPayload(payload: JsonObject): boolean {
-	return payload.type === "system" && payload.subtype === "init";
-}
-
-/**
- * 判断错误是否是 Prisma 唯一约束冲突。
+ * 判断错误是否是可重试的事务冲突。
  * @param error 原始错误
- * @returns 是否是 P2002
+ * @returns 是否可重试
  */
-function isUniqueConstraintError(error: unknown): boolean {
-	return isJsonObject(error) && error.code === "P2002";
+function isRetryableTransactionError(error: unknown): boolean {
+	if (!isJsonObject(error)) {
+		return false;
+	}
+	return error.code === "P2034" || error.code === "40001";
 }
+
+/**
+ * 执行带重试的 Serializable 事务。
+ * @param prisma Prisma client
+ * @param fn 事务体
+ * @returns 事务结果
+ */
+async function runSerializableTransaction<T>(
+	prisma: PrismaClient,
+	fn: Parameters<PrismaClient["$transaction"]>[0] extends (tx: infer Tx) => unknown
+		? (tx: Tx) => Promise<T>
+		: never,
+): Promise<T> {
+	let lastError: unknown = new Error("Serializable transaction failed");
+	for (let attempt = 0; attempt < SERIALIZABLE_TRANSACTION_RETRY_LIMIT; attempt += 1) {
+		try {
+			return await prisma.$transaction(fn, {
+				isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+			});
+		} catch (error) {
+			lastError = error;
+			if (!isRetryableTransactionError(error)) {
+				throw error;
+			}
+			if (attempt === SERIALIZABLE_TRANSACTION_RETRY_LIMIT - 1) {
+				throw error;
+			}
+			// 序列化冲突通常来自并发写同一 project/session，短暂退避后再重试。
+			await sleep(10 * 2 ** attempt + Math.floor(Math.random() * 5));
+		}
+	}
+	throw lastError;
+}
+
+/**
+ * 暂停一小段时间。
+ * @param ms 毫秒数
+ */
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 清洗创建 project 的表单输入。
+ * @param input 原始输入
+ * @returns 可写入数据库的 project 字段
+ */
+export function normalizeProjectCreateInput(input: {
+	name?: string | null;
+	description?: string | null;
+}) {
+	const trimmedName = input.name?.trim() ?? "";
+	const trimmedDescription = input.description?.trim() ?? "";
+
+	return {
+		// 空名称回落到默认名称，保持历史创建接口的兼容行为。
+		name: (trimmedName || DEFAULT_PROJECT_NAME).slice(0, PROJECT_NAME_MAX_LENGTH),
+		description: trimmedDescription
+			? trimmedDescription.slice(0, PROJECT_DESCRIPTION_MAX_LENGTH)
+			: null,
+	};
+}
+
+/**
+ * 清洗更新 project 的表单输入。
+ * @param input 原始输入，字段为 undefined 时表示调用方没有要求更新
+ * @returns 可写入数据库的 project 字段
+ */
+export function normalizeProjectUpdateInput(input: {
+	name?: string | null;
+	description?: string | null;
+}) {
+	const data: { name?: string; description?: string | null } = {};
+
+	if (input.name !== undefined) {
+		const trimmedName = input.name?.trim() ?? "";
+		// 显式提交空名称时沿用创建逻辑的默认名称；未提交 name 时不修改原名称。
+		data.name = (trimmedName || DEFAULT_PROJECT_NAME).slice(0, PROJECT_NAME_MAX_LENGTH);
+	}
+	if (input.description !== undefined) {
+		const trimmedDescription = input.description?.trim() ?? "";
+		data.description = trimmedDescription
+			? trimmedDescription.slice(0, PROJECT_DESCRIPTION_MAX_LENGTH)
+			: null;
+	}
+
+	return data;
+}
+
+/** 面向 UI/API 的安全会话字段，避免把 worker token 返回给浏览器。 */
+const chatSessionSummarySelect = {
+	id: true,
+	title: true,
+	userId: true,
+	projectId: true,
+	workerEpoch: true,
+	workerStatus: true,
+	containerStatus: true,
+	sandboxId: true,
+	externalMetadata: true,
+	requiresActionDetails: true,
+	createdAt: true,
+	updatedAt: true,
+	deletedAt: true,
+	lastHeartbeatAt: true,
+} as const;
+
+/** Project 删除前需要用于后台清理 runner 的 session 生命周期字段。 */
+const projectSessionLifecycleSelect = {
+	id: true,
+	sandboxId: true,
+	runnerProcessId: true,
+	containerStatus: true,
+	deletedAt: true,
+	userId: true,
+	projectId: true,
+} as const;
 
 /** PostgreSQL backed chat session store */
 export class CcrStore {
 	constructor(private readonly prisma: PrismaClient) {}
+
+	/**
+	 * 在 worker 写入前锁定当前活跃 session。
+	 * @param tx Prisma 事务 client
+	 * @param sessionId session ID
+	 * @returns session 仍然活跃时返回 true
+	 */
+	private async claimActiveSession(
+		tx: Prisma.TransactionClient,
+		sessionId: string,
+	): Promise<boolean> {
+		const result = await tx.chatSession.updateMany({
+			where: { id: sessionId, deletedAt: null },
+			// sessionStore 写入来自 worker 侧，锁定 session 行可避免删除态继续被写入。
+			data: { lastHeartbeatAt: new Date() },
+		});
+		return result.count > 0;
+	}
+
+	/**
+	 * 在 worker epoch 写入前锁定当前活跃 session。
+	 * @param tx Prisma 事务 client
+	 * @param sessionId session ID
+	 * @param epoch worker epoch
+	 * @returns session 仍然活跃且 epoch 匹配时返回 true
+	 */
+	private async claimActiveWorkerEpoch(
+		tx: Prisma.TransactionClient,
+		sessionId: string,
+		epoch: number,
+	): Promise<boolean> {
+		const result = await tx.chatSession.updateMany({
+			where: { id: sessionId, workerEpoch: epoch, deletedAt: null },
+			// 写入 heartbeat 时间可锁定 session 行，避免删除和 worker 上报并发穿透。
+			data: { lastHeartbeatAt: new Date() },
+		});
+		return result.count > 0;
+	}
 
 	/**
 	 * 确保用户默认 project 存在。
@@ -159,14 +299,18 @@ export class CcrStore {
 	 * 创建 project。
 	 * @param userId 用户 ID
 	 * @param name project 名称
+	 * @param description project 描述
 	 * @returns project
 	 */
-	async createProject(userId: string, name?: string) {
+	async createProject(userId: string, name?: string, description?: string) {
+		const input = normalizeProjectCreateInput({ name, description });
+
 		return this.prisma.project.create({
 			data: {
 				id: crypto.randomUUID(),
 				userId,
-				name: name?.trim() || DEFAULT_PROJECT_NAME,
+				name: input.name,
+				description: input.description,
 			},
 		});
 	}
@@ -181,6 +325,14 @@ export class CcrStore {
 			where: { userId, deletedAt: null },
 			orderBy: { updatedAt: "desc" },
 			take: 50,
+			include: {
+				_count: {
+					select: {
+						// 管理页只统计未软删除会话，避免已删除会话影响当前项目概览。
+						sessions: { where: { deletedAt: null } },
+					},
+				},
+			},
 		});
 	}
 
@@ -193,6 +345,61 @@ export class CcrStore {
 	async findUserProject(userId: string, projectId: string) {
 		return this.prisma.project.findFirst({
 			where: { id: projectId, userId, deletedAt: null },
+		});
+	}
+
+	/**
+	 * 更新用户自己的 project。
+	 * @param userId 用户 ID
+	 * @param projectId project ID
+	 * @param input project 表单输入
+	 * @returns 更新后的 project；不存在或不属于用户时返回 null
+	 */
+	async updateProject(
+		userId: string,
+		projectId: string,
+		input: { name?: string | null; description?: string | null },
+	) {
+		const normalized = normalizeProjectUpdateInput(input);
+		if (Object.keys(normalized).length === 0) {
+			return this.findUserProject(userId, projectId);
+		}
+		const result = await this.prisma.project.updateMany({
+			where: { id: projectId, userId, deletedAt: null },
+			data: normalized,
+		});
+		if (result.count === 0) {
+			return null;
+		}
+		return this.findUserProject(userId, projectId);
+	}
+
+	/**
+	 * 软删除用户自己的 project，并同步隐藏其下会话。
+	 * @param userId 用户 ID
+	 * @param projectId project ID
+	 * @returns 删除结果和本次删除影响到的 session 生命周期
+	 */
+	async deleteProject(userId: string, projectId: string) {
+		const now = new Date();
+		return runSerializableTransaction(this.prisma, async (tx) => {
+			const project = await tx.project.updateMany({
+				where: { id: projectId, userId, deletedAt: null },
+				data: { deletedAt: now },
+			});
+			if (project.count === 0) {
+				return { deleted: false, sessions: [] };
+			}
+			const sessions = await tx.chatSession.findMany({
+				where: { projectId, userId, deletedAt: null },
+				select: projectSessionLifecycleSelect,
+			});
+			// 项目从管理页删除后，其下会话也不应继续出现在聊天历史里。
+			await tx.chatSession.updateMany({
+				where: { projectId, userId, deletedAt: null },
+				data: { containerStatus: "deleting", deletedAt: now },
+			});
+			return { deleted: true, sessions };
 		});
 	}
 
@@ -228,13 +435,27 @@ export class CcrStore {
 	 * @returns session 摘要
 	 */
 	async createSession(userId: string, projectId: string, title?: string) {
-		const project = await this.findUserProject(userId, projectId);
-		if (!project) {
-			return null;
-		}
 		// 使用裸 UUID 即可；Cloudflare sandbox 名称会在容器层单独加业务前缀。
 		const sessionId = crypto.randomUUID();
-		return this.ensureSession(sessionId, title, userId, project.id);
+		return runSerializableTransaction(this.prisma, async (tx) => {
+			const project = await tx.project.findFirst({
+				where: { id: projectId, userId, deletedAt: null },
+				select: { id: true },
+			});
+			if (!project) {
+				return null;
+			}
+			return tx.chatSession.create({
+				data: {
+					id: sessionId,
+					title,
+					userId,
+					projectId: project.id,
+					externalMetadata: DEFAULT_EXTERNAL_METADATA,
+				},
+				select: chatSessionSummarySelect,
+			});
+		});
 	}
 
 	/**
@@ -246,6 +467,7 @@ export class CcrStore {
 			where: { userId, projectId, deletedAt: null },
 			orderBy: { updatedAt: "desc" },
 			take: 50,
+			select: chatSessionSummarySelect,
 		});
 	}
 
@@ -340,7 +562,7 @@ export class CcrStore {
 	async rotateWorkerAccessToken(sessionId: string): Promise<string> {
 		const token = crypto.randomUUID();
 		const result = await this.prisma.chatSession.updateMany({
-			where: { id: sessionId },
+			where: { id: sessionId, deletedAt: null },
 			data: { workerAccessToken: token },
 		});
 		if (result.count === 0) {
@@ -379,39 +601,25 @@ export class CcrStore {
 	 * @returns 新 epoch
 	 */
 	async registerWorker(sessionId: string): Promise<number> {
-		const session = await this.prisma.chatSession.findUniqueOrThrow({
-			where: { id: sessionId },
-			select: { workerEpoch: true },
-		});
-		const nextEpoch = session.workerEpoch + 1;
-		await this.prisma.chatSession.updateMany({
-			where: { id: sessionId },
+		const [session] = await this.prisma.chatSession.updateManyAndReturn({
+			where: { id: sessionId, deletedAt: null },
 			data: {
-				workerEpoch: nextEpoch,
+				// epoch 必须在数据库内原子递增，避免两个 runner 同时注册拿到同一代际。
+				workerEpoch: { increment: 1 },
 				workerStatus: "idle",
 				containerStatus: "running",
 			},
+			select: { workerEpoch: true },
 		});
+		if (!session) {
+			throw new Error("Session not found or deleting");
+		}
 		await this.recordOperation(sessionId, {
 			direction: "route_internal",
 			category: "worker_registered",
-			payload: { worker_epoch: nextEpoch },
+			payload: { worker_epoch: session.workerEpoch },
 		});
-		return nextEpoch;
-	}
-
-	/**
-	 * 判断 worker epoch 是否仍为当前有效值。
-	 * @param sessionId session ID
-	 * @param epoch worker epoch
-	 * @returns 是否有效
-	 */
-	async isCurrentEpoch(sessionId: string, epoch: number): Promise<boolean> {
-		const session = await this.prisma.chatSession.findUnique({
-			where: { id: sessionId },
-			select: { workerEpoch: true },
-		});
-		return session?.workerEpoch === epoch;
+		return session.workerEpoch;
 	}
 
 	/**
@@ -435,42 +643,71 @@ export class CcrStore {
 	/**
 	 * 更新 worker 状态。
 	 * @param sessionId session ID
+	 * @param epoch worker epoch
 	 * @param body 请求体
+	 * @returns 是否接受本次 worker 上报
 	 */
-	async updateWorker(sessionId: string, body: JsonObject) {
-		const session = await this.prisma.chatSession.findUniqueOrThrow({
-			where: { id: sessionId },
-			select: { externalMetadata: true },
-		});
-		const externalMetadata = isJsonObject(body.external_metadata)
-			? body.external_metadata
-			: undefined;
-		const requiresActionDetails = isJsonObject(body.requires_action_details)
-			? body.requires_action_details
-			: undefined;
-		const workerStatus =
-			typeof body.worker_status === "string" ? body.worker_status : undefined;
+	async updateWorker(sessionId: string, epoch: number, body: JsonObject): Promise<boolean> {
+		return this.prisma.$transaction(async (tx) => {
+			if (!(await this.claimActiveWorkerEpoch(tx, sessionId, epoch))) {
+				return false;
+			}
+			const session = await tx.chatSession.findFirst({
+				where: { id: sessionId, workerEpoch: epoch, deletedAt: null },
+				select: { externalMetadata: true },
+			});
+			if (!session) {
+				return false;
+			}
+			const externalMetadata = isJsonObject(body.external_metadata)
+				? body.external_metadata
+				: undefined;
+			const workerStatus =
+				typeof body.worker_status === "string" ? body.worker_status : undefined;
+			const hasRequiresActionDetails = Object.hasOwn(
+				body,
+				"requires_action_details",
+			);
+			const requiresActionDetailsPayload = isJsonObject(body.requires_action_details)
+				? body.requires_action_details
+				: null;
+			const requiresActionDetails = requiresActionDetailsPayload
+				? requiresActionDetailsPayload
+				: hasRequiresActionDetails && body.requires_action_details === null
+					? Prisma.DbNull
+					: workerStatus && workerStatus !== "requires_action"
+						? Prisma.DbNull
+						: undefined;
 
-		await this.prisma.chatSession.updateMany({
-			where: { id: sessionId },
-			data: {
-				workerStatus,
-				externalMetadata: mergeJsonObject(
-					asJsonObject(session.externalMetadata),
-					externalMetadata,
-				),
-				requiresActionDetails,
-			},
-		});
-		await this.recordOperation(sessionId, {
-			direction: "worker_to_route",
-			category: workerStatus === "requires_action" ? "requires_action" : "worker_state",
-			payload: body,
-			requestId:
-				requiresActionDetails &&
-				typeof requiresActionDetails.request_id === "string"
-					? requiresActionDetails.request_id
-					: undefined,
+			const result = await tx.chatSession.updateMany({
+				where: { id: sessionId, workerEpoch: epoch, deletedAt: null },
+				data: {
+					workerStatus,
+					externalMetadata: mergeJsonObject(
+						asJsonObject(session.externalMetadata),
+						externalMetadata,
+					),
+					requiresActionDetails,
+				},
+			});
+			if (result.count === 0) {
+				return false;
+			}
+			await tx.chatOperationLog.create({
+				data: {
+					sessionId,
+					direction: "worker_to_route",
+					category:
+						workerStatus === "requires_action" ? "requires_action" : "worker_state",
+					requestId:
+						requiresActionDetailsPayload &&
+						typeof requiresActionDetailsPayload.request_id === "string"
+							? requiresActionDetailsPayload.request_id
+							: undefined,
+					payload: toJsonValue(body) ?? {},
+				},
+			});
+			return true;
 		});
 	}
 
@@ -534,36 +771,28 @@ export class CcrStore {
 	) {
 		const eventType = options.eventType ?? String(payload.type ?? "message");
 		const source = options.source ?? "route";
-		let created;
-		for (let attempt = 0; attempt < CLIENT_EVENT_SEQUENCE_RETRY_LIMIT; attempt += 1) {
-			const last = await this.prisma.chatClientEvent.findFirst({
-				where: { sessionId },
-				orderBy: { sequenceNum: "desc" },
-				select: { sequenceNum: true },
+		const created = await this.prisma.$transaction(async (tx) => {
+			const [session] = await tx.chatSession.updateManyAndReturn({
+				where: { id: sessionId, deletedAt: null },
+				// client event 序号由 session 行集中分配，避免并发读 max(sequenceNum) 抢号。
+				data: { nextClientSequence: { increment: 1 } },
+				select: { nextClientSequence: true },
 			});
-			const sequenceNum = (last?.sequenceNum ?? 0) + 1;
-			try {
-				created = await this.prisma.chatClientEvent.create({
-					data: {
-						sessionId,
-						eventId: newEventId(),
-						sequenceNum,
-						eventType,
-						source,
-						payload,
-					},
-				});
-				break;
-			} catch (error) {
-				// 并发写入可能抢到相同 sequenceNum，重试后重新读取最新序号。
-				if (attempt === CLIENT_EVENT_SEQUENCE_RETRY_LIMIT - 1) {
-					throw error;
-				}
+			if (!session) {
+				throw new Error("Session not found or deleting");
 			}
-		}
-		if (!created) {
-			throw new Error("Failed to create CCR client event");
-		}
+			const sequenceNum = session.nextClientSequence - 1;
+			return tx.chatClientEvent.create({
+				data: {
+					sessionId,
+					eventId: newEventId(),
+					sequenceNum,
+					eventType,
+					source,
+					payload,
+				},
+			});
+		});
 		await this.recordOperation(sessionId, {
 			direction: "route_to_worker",
 			category: eventType,
@@ -592,12 +821,13 @@ export class CcrStore {
 	 * 查询等待下发给 worker 的 client events。
 	 * @param sessionId session ID
 	 * @param fromSequence 起始序号
-	 * @returns 尚未交付的 events
+	 * @returns 尚未交付的 events；session 已删除时返回 null
 	 */
 	async listQueuedClientEvents(sessionId: string, fromSequence: number) {
 		const rows = await this.prisma.chatClientEvent.findMany({
 			where: {
 				sessionId,
+				session: { deletedAt: null },
 				sequenceNum: { gt: fromSequence },
 				// 新 worker 从 0 建立 SSE 时不能重放已交付输入，否则旧消息会被再次执行并入库。
 				status: CLIENT_EVENT_STATUS_QUEUED,
@@ -605,6 +835,16 @@ export class CcrStore {
 			orderBy: { sequenceNum: "asc" },
 			take: DEFAULT_PAGE_SIZE,
 		});
+		if (rows.length === 0) {
+			const session = await this.prisma.chatSession.findFirst({
+				where: { id: sessionId, deletedAt: null },
+				select: { id: true },
+			});
+			// SSE 长连接必须在 session 删除后主动结束，避免 worker 继续空轮询或收到旧事件。
+			if (!session) {
+				return null;
+			}
+		}
 		return rows.map((row) => this.toClientEventDto(row));
 	}
 
@@ -613,36 +853,40 @@ export class CcrStore {
 	 * @param sessionId session ID
 	 * @param epoch worker epoch
 	 * @param events worker events
+	 * @returns 是否接受本次 worker 上报
 	 */
 	async insertWorkerEvents(
 		sessionId: string,
 		epoch: number,
 		events: WorkerVisibleEvent[],
-	) {
-		for (const event of events) {
-			const payload = isJsonObject(event.payload) ? event.payload : {};
-			// keep_alive 只用于维持 worker 长连接，不进入业务事件表。
-			if (isKeepAlivePayload(payload)) {
-				continue;
+	): Promise<boolean> {
+		return this.prisma.$transaction(async (tx) => {
+			if (!(await this.claimActiveWorkerEpoch(tx, sessionId, epoch))) {
+				return false;
 			}
-			const eventId = eventIdFromPayload(payload);
-			const eventType = String(payload.type ?? "unknown");
-			if (isSystemInitPayload(payload)) {
-				const existingSystemEvents = await this.prisma.chatWorkerEvent.findMany({
-					where: { sessionId, workerEpoch: epoch, eventType },
-					select: { payload: true },
-				});
-				// 同一 worker epoch 的 init 只表示同一次 runner 元数据，重复上报不应污染时间线。
-				if (
-					existingSystemEvents.some((item) =>
-						isSystemInitPayload(asJsonObject(item.payload)),
-					)
-				) {
+			for (const event of events) {
+				const payload = asCcrPayload(event.payload);
+				// keep_alive 只用于维持 worker 长连接，不进入业务事件表。
+				if (isKeepAlivePayload(payload)) {
 					continue;
 				}
-			}
-			try {
-				await this.prisma.chatWorkerEvent.create({
+				const eventId = eventIdFromPayload(payload, newEventId);
+				const eventType = String(payload.type ?? "unknown");
+				if (isSystemInitPayload(payload)) {
+					const existingSystemEvents = await tx.chatWorkerEvent.findMany({
+						where: { sessionId, workerEpoch: epoch, eventType },
+						select: { payload: true },
+					});
+					// 同一 worker epoch 的 init 只表示同一次 runner 元数据，重复上报不应污染时间线。
+					if (
+						existingSystemEvents.some((item) =>
+							isSystemInitPayload(asJsonObject(item.payload)),
+						)
+					) {
+						continue;
+					}
+				}
+				const created = await tx.chatWorkerEvent.createMany({
 					data: {
 						sessionId,
 						eventId,
@@ -651,21 +895,24 @@ export class CcrStore {
 						payload,
 						ephemeral: Boolean(event.ephemeral),
 					},
+					// eventId 是 worker visible event 的幂等键；重复上报不应继续写 operation log。
+					skipDuplicates: true,
 				});
-			} catch (error) {
-				// eventId 是 worker visible event 的幂等键；重复上报不应继续写 operation log。
-				if (isUniqueConstraintError(error)) {
+				if (created.count === 0) {
 					continue;
 				}
-				throw error;
+				await tx.chatOperationLog.create({
+					data: {
+						sessionId,
+						direction: "worker_to_route",
+						category: eventType,
+						eventId,
+						payload: toJsonValue(payload) ?? {},
+					},
+				});
 			}
-			await this.recordOperation(sessionId, {
-				direction: "worker_to_route",
-				category: eventType,
-				eventId,
-				payload,
-			});
-		}
+			return true;
+		});
 	}
 
 	/**
@@ -696,40 +943,51 @@ export class CcrStore {
 	 * @param sessionId session ID
 	 * @param epoch worker epoch
 	 * @param events internal events
+	 * @returns 是否接受本次 worker 上报
 	 */
 	async insertInternalEvents(
 		sessionId: string,
 		epoch: number,
 		events: WorkerInternalEvent[],
-	) {
-		let changed = false;
-		for (const event of events) {
-			const payload = isJsonObject(event.payload) ? event.payload : {};
-			// keep_alive 没有审计价值，避免污染 internal event 历史。
-			if (isKeepAlivePayload(payload)) {
-				continue;
+	): Promise<boolean> {
+		const changed = await this.prisma.$transaction(async (tx) => {
+			if (!(await this.claimActiveWorkerEpoch(tx, sessionId, epoch))) {
+				return null;
 			}
-			const eventId = eventIdFromPayload(payload);
-			const eventType = String(payload.type ?? "unknown");
-			await this.prisma.chatInternalEvent.upsert({
-				where: { eventId },
-				create: {
-					sessionId,
-					eventId,
-					workerEpoch: epoch,
-					eventType,
-					payload,
-					eventMetadata: event.event_metadata ?? undefined,
-					isCompaction: Boolean(event.is_compaction),
-					agentId: event.agent_id,
-				},
-				update: {},
-			});
-			changed = true;
+			let createdAny = false;
+			for (const event of events) {
+				const payload = asCcrPayload(event.payload);
+				// keep_alive 没有审计价值，避免污染 internal event 历史。
+				if (isKeepAlivePayload(payload)) {
+					continue;
+				}
+				const eventId = eventIdFromPayload(payload, newEventId);
+				const eventType = String(payload.type ?? "unknown");
+				const created = await tx.chatInternalEvent.createMany({
+					data: {
+						sessionId,
+						eventId,
+						workerEpoch: epoch,
+						eventType,
+						payload,
+						eventMetadata: event.event_metadata ?? undefined,
+						isCompaction: Boolean(event.is_compaction),
+						agentId: event.agent_id ?? null,
+					},
+					// internal event 也以 eventId 做幂等，重复恢复不应触发无意义镜像重建。
+					skipDuplicates: true,
+				});
+				createdAny ||= created.count > 0;
+			}
+			return createdAny;
+		});
+		if (changed === null) {
+			return false;
 		}
 		if (changed) {
 			await this.syncClaudeSessionStoreFromInternalEvents(sessionId);
 		}
+		return true;
 	}
 
 	/**
@@ -909,6 +1167,13 @@ export class CcrStore {
 	 * @param sessionId session ID
 	 */
 	private async syncClaudeSessionStoreFromInternalEvents(sessionId: string) {
+		const activeSession = await this.prisma.chatSession.findFirst({
+			where: { id: sessionId, deletedAt: null },
+			select: { id: true },
+		});
+		if (!activeSession) {
+			return;
+		}
 		const foregroundEvents = await this.listAllInternalEventsForRestore(sessionId, false);
 		await this.writeClaudeSessionStoreMirrorFile(
 			sessionId,
@@ -1026,53 +1291,72 @@ export class CcrStore {
 	 * @param sessionId session ID
 	 * @param epoch worker epoch
 	 * @param updates 更新列表
+	 * @returns 是否接受本次 worker 上报
 	 */
 	async insertDeliveryUpdates(
 		sessionId: string,
 		epoch: number,
 		updates: Array<{ event_id: string; status: string }>,
-	) {
-		for (const update of updates) {
-			if (!update.event_id) {
-				continue;
+	): Promise<boolean> {
+		return this.prisma.$transaction(async (tx) => {
+			if (!(await this.claimActiveWorkerEpoch(tx, sessionId, epoch))) {
+				return false;
 			}
-			const updated = await this.prisma.chatClientEvent.updateMany({
-				where: { sessionId, eventId: update.event_id },
-				data: { status: update.status },
-			});
-			// delivery 是 client event 的状态转移；找不到原事件时不写孤儿审计行。
-			if (updated.count === 0) {
-				continue;
+			for (const update of updates) {
+				if (!update.event_id) {
+					continue;
+				}
+				const event = await tx.chatClientEvent.findFirst({
+					where: { sessionId, eventId: update.event_id },
+					select: { status: true },
+				});
+				// delivery 是 client event 的状态转移；找不到原事件时不写孤儿审计行。
+				if (!event) {
+					continue;
+				}
+				const nextStatus = mergeClientEventDeliveryStatus(event.status, update.status);
+				if (!nextStatus) {
+					continue;
+				}
+				if (nextStatus !== event.status) {
+					await tx.chatClientEvent.updateMany({
+						where: { sessionId, eventId: update.event_id },
+						data: { status: nextStatus },
+					});
+				}
+				await tx.chatDeliveryUpdate.create({
+					data: {
+						sessionId,
+						eventId: update.event_id,
+						status: nextStatus,
+						workerEpoch: epoch,
+					},
+				});
 			}
-			await this.prisma.chatDeliveryUpdate.create({
-				data: {
-					sessionId,
-					eventId: update.event_id,
-					status: update.status,
-					workerEpoch: epoch,
-				},
-			});
-		}
+			return true;
+		});
 	}
 
 	/**
 	 * 记录 heartbeat。
 	 * @param sessionId session ID
 	 * @param epoch worker epoch
+	 * @returns 是否接受本次 heartbeat
 	 */
-	async recordHeartbeat(sessionId: string, epoch: number) {
-		await this.prisma.chatSession.updateMany({
-			where: { id: sessionId, workerEpoch: epoch },
+	async recordHeartbeat(sessionId: string, epoch: number): Promise<boolean> {
+		const result = await this.prisma.chatSession.updateMany({
+			where: { id: sessionId, workerEpoch: epoch, deletedAt: null },
 			data: { lastHeartbeatAt: new Date() },
 		});
+		return result.count > 0;
 	}
 
 	/**
-	 * 更新容器状态。
+	 * 仅更新活跃 session 的容器状态。
 	 * @param sessionId session ID
 	 * @param data 状态字段
 	 */
-	async updateContainer(
+	async updateActiveContainer(
 		sessionId: string,
 		data: {
 			workerStatus?: string;
@@ -1081,13 +1365,12 @@ export class CcrStore {
 			runnerProcessId?: string | null;
 		},
 	) {
-		// 状态更新按主键执行，避免 deletedAt 空值过滤导致运行态静默丢失。
 		const result = await this.prisma.chatSession.updateMany({
-			where: { id: sessionId },
+			where: { id: sessionId, deletedAt: null },
 			data,
 		});
 		if (result.count === 0) {
-			throw new Error("Session not found");
+			throw new Error("Session not found or deleting");
 		}
 	}
 
@@ -1102,11 +1385,17 @@ export class CcrStore {
 		sandboxId: string,
 		runnerProcessId: string,
 	) {
-		await this.updateContainer(sessionId, {
-			containerStatus: "running",
-			sandboxId,
-			runnerProcessId,
+		const result = await this.prisma.chatSession.updateMany({
+			where: { id: sessionId, deletedAt: null },
+			data: {
+				containerStatus: "running",
+				sandboxId,
+				runnerProcessId,
+			},
 		});
+		if (result.count === 0) {
+			throw new Error("Session not found or deleting");
+		}
 	}
 
 	/**
@@ -1114,10 +1403,22 @@ export class CcrStore {
 	 * @param sessionId session ID
 	 */
 	async clearSessionRunner(sessionId: string) {
-		await this.updateContainer(sessionId, {
+		await this.updateActiveContainer(sessionId, {
 			workerStatus: "idle",
 			containerStatus: "stopped",
 			runnerProcessId: null,
+		});
+	}
+
+	/**
+	 * 清理已删除 session 的 runner 进程记录。
+	 * @param sessionId session ID
+	 */
+	async clearDeletedSessionRunner(sessionId: string) {
+		await this.prisma.chatSession.updateMany({
+			where: { id: sessionId, deletedAt: { not: null } },
+			// 删除态保持 deleting 语义，只清掉已不存在的进程 ID。
+			data: { runnerProcessId: null },
 		});
 	}
 
@@ -1154,7 +1455,10 @@ export class CcrStore {
 	 * @returns session；不存在时返回 null
 	 */
 	async findSessionSummary(sessionId: string) {
-		return this.prisma.chatSession.findUnique({ where: { id: sessionId } });
+		return this.prisma.chatSession.findUnique({
+			where: { id: sessionId },
+			select: chatSessionSummarySelect,
+		});
 	}
 
 	/**
@@ -1166,11 +1470,18 @@ export class CcrStore {
 	async findUserSessionSummary(userId: string, sessionId: string) {
 		return this.prisma.chatSession.findFirst({
 			where: { id: sessionId, userId, deletedAt: null },
+			select: chatSessionSummarySelect,
 		});
 	}
 
 	/**
 	 * 写入 sessionStore 文件。
+	 * @param sessionId session ID
+	 * @param projectKey sessionStore project key
+	 * @param subpath 文件相对路径
+	 * @param content 文件内容
+	 * @param metadata 附加元数据
+	 * @returns 写入后的文件；session 非活跃时返回 null
 	 */
 	async writeSessionStoreFile(
 		sessionId: string,
@@ -1179,10 +1490,15 @@ export class CcrStore {
 		content: string,
 		metadata?: JsonObject,
 	) {
-		return this.prisma.chatSessionStoreFile.upsert({
-			where: { sessionId_projectKey_subpath: { sessionId, projectKey, subpath } },
-			create: { sessionId, projectKey, subpath, content, metadata },
-			update: { content, metadata },
+		return this.prisma.$transaction(async (tx) => {
+			if (!(await this.claimActiveSession(tx, sessionId))) {
+				return null;
+			}
+			return tx.chatSessionStoreFile.upsert({
+				where: { sessionId_projectKey_subpath: { sessionId, projectKey, subpath } },
+				create: { sessionId, projectKey, subpath, content, metadata },
+				update: { content, metadata },
+			});
 		});
 	}
 
@@ -1222,16 +1538,25 @@ export class CcrStore {
 
 	/**
 	 * 删除 sessionStore 文件。
+	 * @param sessionId session ID
+	 * @param projectKey sessionStore project key
+	 * @param subpath 文件相对路径
+	 * @returns 是否删除了文件；session 非活跃时返回 false
 	 */
 	async deleteSessionStoreFile(
 		sessionId: string,
 		projectKey: string,
 		subpath: string,
 	) {
-		const result = await this.prisma.chatSessionStoreFile.deleteMany({
-			where: { sessionId, projectKey, subpath },
+		return this.prisma.$transaction(async (tx) => {
+			if (!(await this.claimActiveSession(tx, sessionId))) {
+				return false;
+			}
+			const result = await tx.chatSessionStoreFile.deleteMany({
+				where: { sessionId, projectKey, subpath },
+			});
+			return result.count > 0;
 		});
-		return result.count > 0;
 	}
 
 	/**

@@ -59,11 +59,23 @@ export async function readJsonObject(request: Request): Promise<JsonObject> {
 }
 
 /**
- * 单层合并 JSON 对象。
+ * 单层合并 JSON 对象，null 表示清空目标字段。
  * @param base 基础对象
  * @param patch 补丁对象
  * @returns 合并结果
  */
 export function mergeJsonObject(base: JsonObject, patch?: JsonObject): JsonObject {
-	return patch ? { ...base, ...patch } : base;
+	if (!patch) {
+		return base;
+	}
+	const merged = { ...base };
+	for (const [key, value] of Object.entries(patch)) {
+		if (value === null) {
+			// CCR worker metadata 使用 merge patch 语义，null 代表删除/清空旧状态。
+			delete merged[key];
+			continue;
+		}
+		merged[key] = value;
+	}
+	return merged;
 }

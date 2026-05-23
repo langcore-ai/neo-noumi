@@ -1,10 +1,11 @@
 import { Sandbox, getSandbox } from "@cloudflare/sandbox";
 import { CLAUDE_SESSION_STORE_PROJECT_KEY, type CcrStore } from "./ccr-store";
 import { isJsonObject } from "./ccr-json";
+import { CCR_SDK_APPROVED_HOST, normalizeClaudeBaseUrl } from "./ccr-protocol";
 import type { JsonObject } from "./ccr-types";
 
-/** Claude Code 允许的官方域名，用于 outbound HTTPS interception。 */
-const CLAUDE_APPROVED_HOST = "api.anthropic.com";
+/** 默认 Anthropic API host；只允许直连，不能被 CCR outbound handler 接管。 */
+const ANTHROPIC_API_HOST = "api.anthropic.com";
 
 /** 当前验证过的 Anthropic 兼容网关域名；匹配 allowedHosts 后由容器直连公网。 */
 const ANTHROPIC_COMPAT_HOSTS = ["ai-api.mandao.com", "maas.geneasy.ai"];
@@ -58,11 +59,15 @@ export interface NeoNoumiSandboxBindings {
 export class NeoNoumiSandbox extends Sandbox {
 	enableInternet = false;
 	interceptHttps = true;
-	allowedHosts = [CLAUDE_APPROVED_HOST, ...ANTHROPIC_COMPAT_HOSTS];
+	allowedHosts = [
+		CCR_SDK_APPROVED_HOST,
+		ANTHROPIC_API_HOST,
+		...ANTHROPIC_COMPAT_HOSTS,
+	];
 }
 
 NeoNoumiSandbox.outboundByHost = {
-	[CLAUDE_APPROVED_HOST]: async (request: Request, env: Env) => {
+	[CCR_SDK_APPROVED_HOST]: async (request: Request, env: Env) => {
 		// Claude Code 请求 approved host，Worker 内部重写回本服务的 CCR routes
 		const url = new URL(request.url);
 		const neoNoumiEnv = env as Env & {
@@ -91,7 +96,7 @@ set -eu
 SESSION_ID="$1"
 WORKER_ACCESS_TOKEN="$2"
 CLAUDE_SESSION_MODE="\${3:-new}"
-SDK_URL="https://${CLAUDE_APPROVED_HOST}/v1/code/sessions/$SESSION_ID"
+SDK_URL="https://${CCR_SDK_APPROVED_HOST}/v1/code/sessions/$SESSION_ID"
 AUTH_HEADER="Authorization: Bearer $WORKER_ACCESS_TOKEN"
 
 REGISTER_JSON="$(curl -fsS -X POST "$SDK_URL/worker/register" -H "$AUTH_HEADER" -H 'content-type: application/json' --data '{}')"
@@ -112,7 +117,7 @@ if [ "\${NEO_NOUMI_ENABLE_REAL_CLAUDE:-0}" = "1" ] && command -v claude >/dev/nu
     CLAUDE_SESSION_ARG="--resume"
   fi
   exec claude --print \
-    --sdk-url "https://${CLAUDE_APPROVED_HOST}/v1/code/sessions/$SESSION_ID" \
+    --sdk-url "https://${CCR_SDK_APPROVED_HOST}/v1/code/sessions/$SESSION_ID" \
     "$CLAUDE_SESSION_ARG" "$SESSION_ID" \
     --model "\${CLAUDE_MODEL:-${CLAUDE_MODEL}}" \
     --input-format stream-json \
@@ -414,26 +419,6 @@ async function restoreClaudeLocalState(
 }
 
 /**
- * 规范化 Claude Code 使用的 Anthropic base URL。
- * @param value 原始 base URL
- * @returns Claude Code 可接受的 origin；非法或空值保持原样
- */
-function normalizeClaudeBaseUrl(value: string | undefined): string | undefined {
-	if (!value) {
-		return value;
-	}
-	try {
-		const url = new URL(value);
-		// Claude Code 会自行拼接 /v1/messages，传入 /v1 会导致 /v1/v1/messages。
-		return url.pathname === "/v1" || url.pathname === "/v1/"
-			? url.origin
-			: value.replace(/\/+$/, "");
-	} catch {
-		return value;
-	}
-}
-
-/**
  * 生成 sandbox 进程环境变量脚本。
  * @param env Worker 绑定
  * @returns shell export 脚本
@@ -537,7 +522,7 @@ export async function startCcrSandbox(
 		containerStatus: "starting",
 		sandboxId,
 	});
-	await store.updateContainer(sessionId, {
+	await store.updateActiveContainer(sessionId, {
 		containerStatus: "starting",
 		sandboxId,
 	});
@@ -562,7 +547,20 @@ export async function startCcrSandbox(
 			),
 		].join(" "),
 	);
-	await store.setSessionRunner(sessionId, sandboxId, process.id);
+	try {
+		await store.setSessionRunner(sessionId, sandboxId, process.id);
+	} catch (error) {
+		// 如果 project/session 在启动进程期间被删除，必须立刻杀掉刚创建的 runner。
+		await sandbox.killProcess(process.id).catch(() => undefined);
+		const remainingProcesses = await sandbox.listProcesses().catch(() => null);
+		if (Array.isArray(remainingProcesses)) {
+			await store.updateUserContainer(userId, {
+				containerStatus: remainingProcesses.length > 0 ? "running" : "stopped",
+				sandboxId,
+			});
+		}
+		throw error;
+	}
 	await store.updateUserContainer(userId, {
 		containerStatus: "running",
 		sandboxId,
@@ -620,7 +618,20 @@ export async function stopCcrSessionRunner(
 	if (lifecycle?.runnerProcessId) {
 		await sandbox.killProcess(lifecycle.runnerProcessId).catch(() => undefined);
 	}
-	await store.clearSessionRunner(sessionId);
+	if (lifecycle?.deletedAt) {
+		await store.clearDeletedSessionRunner(sessionId);
+	} else {
+		try {
+			await store.clearSessionRunner(sessionId);
+		} catch (error) {
+			const latestLifecycle = await store.getSessionLifecycle(sessionId);
+			if (!latestLifecycle?.deletedAt) {
+				throw error;
+			}
+			// 清理前刚好进入删除态时，只移除 runnerProcessId，不回写 live 状态。
+			await store.clearDeletedSessionRunner(sessionId);
+		}
+	}
 	const remainingProcesses = await sandbox.listProcesses().catch(() => []);
 	if (Array.isArray(remainingProcesses) && remainingProcesses.length === 0) {
 		// 用户级容器没有其它会话 runner 时，才把用户容器标为 stopped。

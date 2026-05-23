@@ -1,0 +1,306 @@
+import { describe, expect, test } from "bun:test";
+import { Prisma } from "../src/generated/prisma/client";
+import {
+	CcrStore,
+	normalizeProjectCreateInput,
+	normalizeProjectUpdateInput,
+} from "../src/worker/lib/ccr-store";
+import { mergeJsonObject } from "../src/worker/lib/ccr-json";
+
+type CcrStorePrisma = ConstructorParameters<typeof CcrStore>[0];
+
+/**
+ * 用最小 fake Prisma client 构造 CcrStore。
+ * @param fake 只包含当前测试会调用的方法
+ * @returns CcrStore 实例
+ */
+function createStoreFromFakePrisma(fake: unknown): CcrStore {
+	return new CcrStore(fake as CcrStorePrisma);
+}
+
+describe("normalizeProjectCreateInput", () => {
+	test("uses the default name when the project name is empty", () => {
+		expect(normalizeProjectCreateInput({ name: "   " })).toEqual({
+			name: "Default Project",
+			description: null,
+		});
+	});
+
+	test("trims project name and description", () => {
+		expect(
+			normalizeProjectCreateInput({
+				name: "  产品研发  ",
+				description: "  需求和代码会话  ",
+			}),
+		).toEqual({
+			name: "产品研发",
+			description: "需求和代码会话",
+		});
+	});
+
+	test("caps project fields to the API limits", () => {
+		const normalized = normalizeProjectCreateInput({
+			name: "a".repeat(100),
+			description: "b".repeat(600),
+		});
+
+		expect(normalized.name).toHaveLength(80);
+		expect(normalized.description).toHaveLength(500);
+	});
+});
+
+describe("normalizeProjectUpdateInput", () => {
+	test("does not update omitted fields", () => {
+		expect(normalizeProjectUpdateInput({ description: "  只更新描述  " })).toEqual({
+			description: "只更新描述",
+		});
+	});
+
+	test("uses the default name only when name is explicitly empty", () => {
+		expect(normalizeProjectUpdateInput({ name: "   " })).toEqual({
+			name: "Default Project",
+		});
+	});
+});
+
+describe("mergeJsonObject", () => {
+	test("treats null patch fields as clearing stale metadata", () => {
+		expect(
+			mergeJsonObject(
+				{
+					model: "sonnet",
+					pending_action: { tool_name: "old-tool" },
+					task_summary: "old summary",
+				},
+				{
+					model: "haiku",
+					pending_action: null,
+				},
+			),
+		).toEqual({
+			model: "haiku",
+			task_summary: "old summary",
+		});
+	});
+});
+
+describe("CcrStore worker lifecycle guards", () => {
+	test("stops queued event polling after the session is deleted", async () => {
+		const whereClauses: unknown[] = [];
+		const store = createStoreFromFakePrisma({
+			chatClientEvent: {
+				findMany: async (args: { where: unknown }) => {
+					whereClauses.push(args.where);
+					return [];
+				},
+			},
+			chatSession: {
+				findFirst: async (args: { where: unknown }) => {
+					whereClauses.push(args.where);
+					return null;
+				},
+			},
+		});
+
+		await expect(store.listQueuedClientEvents("session-1", 0)).resolves.toBeNull();
+		expect(whereClauses).toEqual([
+			{
+				sessionId: "session-1",
+				session: { deletedAt: null },
+				sequenceNum: { gt: 0 },
+				status: "queued",
+			},
+			{ id: "session-1", deletedAt: null },
+		]);
+	});
+
+	test("rejects worker events before writing when the epoch is no longer active", async () => {
+		const calls: string[] = [];
+		const tx = {
+			chatSession: {
+				updateMany: async (args: { where: unknown }) => {
+					calls.push("claim");
+					expect(args.where).toEqual({
+						id: "session-1",
+						workerEpoch: 2,
+						deletedAt: null,
+					});
+					return { count: 0 };
+				},
+			},
+			chatWorkerEvent: {
+				createMany: async () => {
+					calls.push("event");
+					return { count: 1 };
+				},
+			},
+			chatOperationLog: {
+				create: async () => {
+					calls.push("operation");
+					return {};
+				},
+			},
+		};
+		const store = createStoreFromFakePrisma({
+			$transaction: async (fn: (transaction: unknown) => Promise<boolean>) => fn(tx),
+		});
+
+		await expect(
+			store.insertWorkerEvents("session-1", 2, [{ payload: { type: "assistant" } }]),
+		).resolves.toBe(false);
+		expect(calls).toEqual(["claim"]);
+	});
+
+	test("clears stale requires_action details when worker returns to idle", async () => {
+		const updates: Array<{ where: unknown; data: Record<string, unknown> }> = [];
+		const operationPayloads: unknown[] = [];
+		const tx = {
+			chatSession: {
+				updateMany: async (args: { where: unknown; data: Record<string, unknown> }) => {
+					updates.push(args);
+					return { count: 1 };
+				},
+				findFirst: async () => ({
+					externalMetadata: {
+						model: "sonnet",
+						pending_action: { tool_name: "old-tool" },
+						keep: "value",
+					},
+				}),
+			},
+			chatOperationLog: {
+				create: async (args: { data: { payload: unknown } }) => {
+					operationPayloads.push(args.data.payload);
+					return {};
+				},
+			},
+		};
+		const store = createStoreFromFakePrisma({
+			$transaction: async (fn: (transaction: unknown) => Promise<boolean>) => fn(tx),
+		});
+
+		await expect(
+			store.updateWorker("session-1", 2, {
+				worker_epoch: 2,
+				worker_status: "idle",
+				requires_action_details: null,
+				external_metadata: {
+					model: "haiku",
+					pending_action: null,
+				},
+			}),
+		).resolves.toBe(true);
+
+		expect(updates[0]?.where).toEqual({
+			id: "session-1",
+			workerEpoch: 2,
+			deletedAt: null,
+		});
+		expect(updates[1]?.data).toMatchObject({
+			workerStatus: "idle",
+			externalMetadata: {
+				model: "haiku",
+				keep: "value",
+			},
+		});
+		expect(updates[1]?.data.requiresActionDetails).toBe(Prisma.DbNull);
+		expect(operationPayloads).toHaveLength(1);
+	});
+
+	test("guards heartbeat updates by active session and current epoch", async () => {
+		const updates: unknown[] = [];
+		const store = createStoreFromFakePrisma({
+			chatSession: {
+				updateMany: async (args: { where: unknown; data: unknown }) => {
+					updates.push({ where: args.where, data: Object.keys(args.data as object) });
+					return { count: 0 };
+				},
+			},
+		});
+
+		await expect(store.recordHeartbeat("session-1", 3)).resolves.toBe(false);
+		expect(updates).toEqual([
+			{
+				where: { id: "session-1", workerEpoch: 3, deletedAt: null },
+				data: ["lastHeartbeatAt"],
+			},
+		]);
+	});
+
+	test("rejects sessionStore writes when the session is no longer active", async () => {
+		const calls: string[] = [];
+		const tx = {
+			chatSession: {
+				updateMany: async (args: { where: unknown }) => {
+					calls.push("claim");
+					expect(args.where).toEqual({ id: "session-1", deletedAt: null });
+					return { count: 0 };
+				},
+			},
+			chatSessionStoreFile: {
+				upsert: async () => {
+					calls.push("upsert");
+					return {};
+				},
+			},
+		};
+		const store = createStoreFromFakePrisma({
+			$transaction: async (fn: (transaction: unknown) => Promise<unknown>) => fn(tx),
+		});
+
+		await expect(
+			store.writeSessionStoreFile("session-1", "claude-code", "session.jsonl", "{}"),
+		).resolves.toBeNull();
+		expect(calls).toEqual(["claim"]);
+	});
+
+	test("rejects new client events when the session is already deleting", async () => {
+		const calls: string[] = [];
+		const tx = {
+			chatSession: {
+				updateManyAndReturn: async (args: { where: unknown }) => {
+					calls.push("allocate");
+					expect(args.where).toEqual({ id: "session-1", deletedAt: null });
+					return [];
+				},
+			},
+			chatClientEvent: {
+				create: async () => {
+					calls.push("create");
+					return {};
+				},
+			},
+		};
+		const store = createStoreFromFakePrisma({
+			$transaction: async (fn: (transaction: unknown) => Promise<unknown>) => fn(tx),
+		});
+
+		await expect(
+			store.enqueueClientEvent("session-1", {
+				type: "user",
+				message: { role: "user", content: "hello" },
+			}),
+		).rejects.toThrow("Session not found or deleting");
+		expect(calls).toEqual(["allocate"]);
+	});
+
+	test("clears deleted session runner without rewriting live lifecycle fields", async () => {
+		const updates: unknown[] = [];
+		const store = createStoreFromFakePrisma({
+			chatSession: {
+				updateMany: async (args: { where: unknown; data: unknown }) => {
+					updates.push(args);
+					return { count: 1 };
+				},
+			},
+		});
+
+		await store.clearDeletedSessionRunner("session-1");
+		expect(updates).toEqual([
+			{
+				where: { id: "session-1", deletedAt: { not: null } },
+				data: { runnerProcessId: null },
+			},
+		]);
+	});
+});

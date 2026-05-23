@@ -68,7 +68,8 @@
 		"prisma:generate": "prisma generate",
 		"prisma:migrate": "prisma migrate dev",
 		"prisma:db:pull": "prisma db pull",
-		"prisma:studio": "prisma studio"
+		"prisma:studio": "prisma studio",
+		"test": "bun test"
 	},
 	"type": "module"
 }

@@ -12,7 +12,8 @@ import {
 	type NeoNoumiSandboxBindings,
 } from "./ccr-sandbox";
 import { getStringField, isJsonObject, readJsonObject, toJsonValue } from "./ccr-json";
-import type { ChatMessageInput, JsonObject, WorkerInternalEvent, WorkerVisibleEvent } from "./ccr-types";
+import { isTerminalWorkerPayload, readWorkerEpoch } from "./ccr-protocol";
+import type { ChatMessageInput, WorkerInternalEvent, WorkerVisibleEvent } from "./ccr-types";
 import type { AuthBindings } from "./auth";
 
 /** SSE 心跳间隔，单位毫秒 */
@@ -60,17 +61,6 @@ function createStore(env: CcrBindings): CcrStore {
 		throw new Error("DATABASE_URL or HYPERDRIVE.connectionString is required");
 	}
 	return new CcrStore(createPrismaClient(databaseUrl));
-}
-
-/**
- * 读取 worker_epoch。
- * @param body 请求 JSON
- * @returns epoch
- */
-function readWorkerEpoch(body: JsonObject): number {
-	return typeof body.worker_epoch === "number"
-		? body.worker_epoch
-		: Number(body.worker_epoch);
 }
 
 /**
@@ -142,7 +132,7 @@ function isTerminalTimelineEvent(event: Awaited<ReturnType<CcrStore["listChatTim
  */
 function isTerminalWorkerEvent(event: WorkerVisibleEvent): boolean {
 	const payload = isJsonObject(event.payload) ? event.payload : {};
-	return payload.type === "result";
+	return isTerminalWorkerPayload(payload);
 }
 
 /**
@@ -354,8 +344,71 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 	app.post("/api/ccr/projects", async (c) => {
 		const body = await readJsonObject(c.req.raw);
 		const store = createStore(c.env);
-		const project = await store.createProject(c.get("userId"), getStringField(body, "name"));
+		const project = await store.createProject(
+			c.get("userId"),
+			getStringField(body, "name"),
+			getStringField(body, "description"),
+		);
 		return c.json({ project });
+	});
+
+	app.patch("/api/ccr/projects/:projectId", async (c) => {
+		const body = await readJsonObject(c.req.raw);
+		const store = createStore(c.env);
+		const hasName = Object.hasOwn(body, "name");
+		const hasDescription = Object.hasOwn(body, "description");
+		if (!hasName && !hasDescription) {
+			return c.json({ error: "No project fields to update" }, 400);
+		}
+		const input = {
+			// PATCH 必须区分“字段缺失”和“字段为空”，避免局部更新误覆盖名称。
+			name: hasName ? getStringField(body, "name") : undefined,
+			description: hasDescription ? getStringField(body, "description") : undefined,
+		};
+		const project = await store.updateProject(c.get("userId"), c.req.param("projectId"), {
+			name: input.name,
+			description: input.description,
+		});
+		if (!project) {
+			return c.json({ error: "Project not found" }, 404);
+		}
+		return c.json({ project });
+	});
+
+	app.delete("/api/ccr/projects/:projectId", async (c) => {
+		const store = createStore(c.env);
+		const userId = c.get("userId");
+		const projectId = c.req.param("projectId");
+		const result = await store.deleteProject(userId, projectId);
+		const activeSessionIds = result.sessions
+			.filter((lifecycle) => shouldStopSandboxBeforeDelete(lifecycle))
+			.map((lifecycle) => lifecycle.id);
+		if (!result.deleted) {
+			return c.json({ error: "Project not found" }, 404);
+		}
+		if (activeSessionIds.length > 0) {
+			c.executionCtx.waitUntil(
+				Promise.all(
+					activeSessionIds.map((sessionId) =>
+						stopCcrSessionRunner(c.env, store, userId, sessionId).catch((error) =>
+							store.recordOperation(sessionId, {
+								direction: "route_internal",
+								category: "project_delete_runner_cleanup_failed",
+								payload: {
+									project_id: projectId,
+									error: error instanceof Error ? error.message : String(error),
+								},
+							}).catch(() => undefined),
+						),
+					),
+				).then(() => undefined),
+			);
+		}
+		return c.json({
+			ok: true,
+			pendingCleanup: activeSessionIds.length > 0,
+			stoppingSessions: activeSessionIds.length,
+		});
 	});
 
 	app.post("/api/ccr/projects/:projectId/sessions", async (c) => {
@@ -631,6 +684,12 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			try {
 				while (!closed) {
 					const events = await store.listQueuedClientEvents(sessionId, fromSequence);
+					if (!events) {
+						await output.write(
+							formatSseControlFrame("done", { reason: "session_deleted" }),
+						);
+						return;
+					}
 					for (const event of events) {
 						await output.write(
 							formatSseDataFrame(event.sequence_num, "client_event", event),
@@ -654,13 +713,13 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		const sessionId = c.req.param("sessionId");
 		const body = await readJsonObject(c.req.raw);
 		const workerEpoch = readWorkerEpoch(body);
-		if (!(await store.isCurrentEpoch(sessionId, workerEpoch))) {
-			return c.json({ error: "worker_epoch mismatch" }, 409);
-		}
 		const events = Array.isArray(body.events)
 			? (body.events.filter(isJsonObject) as unknown as WorkerVisibleEvent[])
 			: [];
-		await store.insertWorkerEvents(sessionId, workerEpoch, events);
+		const accepted = await store.insertWorkerEvents(sessionId, workerEpoch, events);
+		if (!accepted) {
+			return c.json({ error: "worker_epoch mismatch" }, 409);
+		}
 		if (events.some(isTerminalWorkerEvent)) {
 			// result 是 Claude Code 本轮终止信号；销毁 runner 必须由后端兜底，不能依赖前端 SSE 是否在线。
 			c.executionCtx.waitUntil(
@@ -675,13 +734,12 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		const sessionId = c.req.param("sessionId");
 		const body = await readJsonObject(c.req.raw);
 		const workerEpoch = readWorkerEpoch(body);
-		if (!(await store.isCurrentEpoch(sessionId, workerEpoch))) {
-			return c.json({ error: "worker_epoch mismatch" }, 409);
-		}
 		const events = Array.isArray(body.events)
 			? (body.events.filter(isJsonObject) as unknown as WorkerInternalEvent[])
 			: [];
-		await store.insertInternalEvents(sessionId, workerEpoch, events);
+		if (!(await store.insertInternalEvents(sessionId, workerEpoch, events))) {
+			return c.json({ error: "worker_epoch mismatch" }, 409);
+		}
 		return c.json({ ok: true });
 	});
 
@@ -702,16 +760,15 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		const sessionId = c.req.param("sessionId");
 		const body = await readJsonObject(c.req.raw);
 		const workerEpoch = readWorkerEpoch(body);
-		if (!(await store.isCurrentEpoch(sessionId, workerEpoch))) {
-			return c.json({ error: "worker_epoch mismatch" }, 409);
-		}
 		const updates = Array.isArray(body.updates)
 			? body.updates.filter(isJsonObject).map((update) => ({
 					event_id: getStringField(update, "event_id") ?? "",
 					status: getStringField(update, "status") ?? "unknown",
 				}))
 			: [];
-		await store.insertDeliveryUpdates(sessionId, workerEpoch, updates);
+		if (!(await store.insertDeliveryUpdates(sessionId, workerEpoch, updates))) {
+			return c.json({ error: "worker_epoch mismatch" }, 409);
+		}
 		return c.json({ ok: true });
 	});
 
@@ -720,10 +777,9 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		const sessionId = c.req.param("sessionId");
 		const body = await readJsonObject(c.req.raw);
 		const workerEpoch = readWorkerEpoch(body);
-		if (!(await store.isCurrentEpoch(sessionId, workerEpoch))) {
+		if (!(await store.updateWorker(sessionId, workerEpoch, body))) {
 			return c.json({ error: "worker_epoch mismatch" }, 409);
 		}
-		await store.updateWorker(sessionId, body);
 		return c.json({ ok: true });
 	});
 
@@ -739,10 +795,9 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		const sessionId = c.req.param("sessionId");
 		const body = await readJsonObject(c.req.raw);
 		const workerEpoch = readWorkerEpoch(body);
-		if (!(await store.isCurrentEpoch(sessionId, workerEpoch))) {
+		if (!(await store.recordHeartbeat(sessionId, workerEpoch))) {
 			return c.json({ error: "worker_epoch mismatch" }, 409);
 		}
-		await store.recordHeartbeat(sessionId, workerEpoch);
 		return c.json({ ok: true });
 	});
 
@@ -754,13 +809,16 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		if (!projectKey || !subpath || typeof body.content !== "string") {
 			return c.json({ error: "project_key, subpath and content are required" }, 400);
 		}
-		await store.writeSessionStoreFile(
+		const file = await store.writeSessionStoreFile(
 			c.req.param("sessionId"),
 			projectKey,
 			subpath,
 			body.content,
 			isJsonObject(body.metadata) ? body.metadata : undefined,
 		);
+		if (!file) {
+			return c.json({ error: "session not active" }, 409);
+		}
 		return c.json({ ok: true });
 	});
 

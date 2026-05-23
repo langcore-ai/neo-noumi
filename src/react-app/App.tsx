@@ -4,6 +4,7 @@ import {
 	BoxesIcon,
 	CheckCircle2Icon,
 	CloudIcon,
+	FolderKanbanIcon,
 	MessageSquareIcon,
 	RefreshCwIcon,
 	ShieldIcon,
@@ -51,6 +52,13 @@ const FEATURE_LINKS = [
 		description: "进入容器会话与事件流测试页面。",
 		to: "/chat",
 		icon: MessageSquareIcon,
+		variant: "outline" as const,
+	},
+	{
+		title: "Project 管理",
+		description: "维护聊天工作区和会话分组。",
+		to: "/projects",
+		icon: FolderKanbanIcon,
 		variant: "outline" as const,
 	},
 ];
