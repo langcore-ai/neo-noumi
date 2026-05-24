@@ -107,4 +107,19 @@ describe("createKvSecondaryStorage", () => {
 			},
 		]);
 	});
+
+	test("keeps already-prefixed auth session keys idempotent", async () => {
+		const { kv, puts } = createFakeKv();
+		const storage = createKvSecondaryStorage(kv);
+
+		await storage.set("auth:session:session:abc", "cached-session");
+
+		expect(puts).toEqual([
+			{
+				key: "auth:session:abc",
+				value: JSON.stringify("cached-session"),
+				options: {},
+			},
+		]);
+	});
 });

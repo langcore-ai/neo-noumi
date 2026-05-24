@@ -24,6 +24,12 @@
 			"id": "b09257c62718424b86f04f3f38569b36"
 		}
 	],
+	"r2_buckets": [
+		{
+			"binding": "PROJECT_WORKSPACE_BUCKET",
+			"bucket_name": "neo-noumi-workspaces"
+		}
+	],
 	"containers": [
 		{
 			"name": "neo-noumi-sandbox",

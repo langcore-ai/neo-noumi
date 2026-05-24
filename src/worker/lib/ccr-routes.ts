@@ -13,6 +13,17 @@ import {
 } from "./ccr-sandbox";
 import { getStringField, isJsonObject, readJsonObject, toJsonValue } from "./ccr-json";
 import { isTerminalWorkerPayload, readWorkerEpoch } from "./ccr-protocol";
+import {
+	createWorkspaceDirectory,
+	deleteWorkspacePath,
+	listWorkspaceTree,
+	moveWorkspaceFile,
+	normalizeWorkspacePath,
+	readWorkspaceFile,
+	signWorkspaceOperation,
+	writeWorkspaceFile,
+	type ProjectWorkspaceBindings,
+} from "./project-workspace";
 import type { ChatMessageInput, WorkerInternalEvent, WorkerVisibleEvent } from "./ccr-types";
 import type { AuthBindings } from "./auth";
 
@@ -43,7 +54,7 @@ type HeaderContext = {
 };
 
 /** CCR route 需要的 Worker 绑定 */
-export type CcrBindings = AuthBindings & NeoNoumiSandboxBindings;
+export type CcrBindings = AuthBindings & NeoNoumiSandboxBindings & ProjectWorkspaceBindings;
 
 /** CCR route 上下文变量 */
 type CcrVariables = {
@@ -201,6 +212,17 @@ async function listAllForegroundInternalEvents(store: CcrStore, sessionId: strin
 }
 
 /**
+ * 读取并校验当前用户自己的 project。
+ * @param store CCR store
+ * @param userId 用户 ID
+ * @param projectId project ID
+ * @returns project；不存在时返回 null
+ */
+async function findOwnedProject(store: CcrStore, userId: string, projectId: string) {
+	return store.findUserProject(userId, projectId);
+}
+
+/**
  * 流式输出 chat timeline。
  * @param output SSE 输出流
  * @param store CCR store
@@ -301,22 +323,48 @@ function shouldStopSandboxBeforeDelete(
 }
 
 /**
- * 挂载 CCR route。
+ * 校验登录用户并写入 route 变量。
+ * @param c Hono context
+ * @param next 后续中间件
+ */
+async function authenticateApiUser(
+	c: Context<{ Bindings: Env & CcrBindings; Variables: CcrVariables }>,
+	next: () => Promise<void>,
+) {
+	const session = await createAuth(c.env).api.getSession({
+		headers: c.req.raw.headers,
+		query: { disableRefresh: true },
+	});
+	const userId = session?.user.id;
+	if (!userId) {
+		return c.json({ error: "Unauthorized" }, 401);
+	}
+	c.set("userId", userId);
+	await next();
+}
+
+/**
+ * 将 workspace path 校验错误转换为 route 可控的 400 响应。
+ * @param path 原始 workspace path
+ * @param options path 规范化选项
+ * @returns 规范化后的 path 或错误信息
+ */
+function readWorkspaceRoutePath(path: string | undefined, options: { allowEmpty?: boolean } = {}) {
+	try {
+		return { path: normalizeWorkspacePath(path, options) };
+	} catch (error) {
+		return { error: error instanceof Error ? error.message : "Invalid workspace path" };
+	}
+}
+
+/**
+ * 挂载 CCR route 和一等业务 route。
  * @param app Hono app
  */
 export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variables: CcrVariables }>) {
-	app.use("/api/ccr/*", async (c, next) => {
-		const session = await createAuth(c.env).api.getSession({
-			headers: c.req.raw.headers,
-			query: { disableRefresh: true },
-		});
-		const userId = session?.user.id;
-		if (!userId) {
-			return c.json({ error: "Unauthorized" }, 401);
-		}
-		c.set("userId", userId);
-		await next();
-	});
+	app.use("/api/ccr/*", authenticateApiUser);
+	app.use("/api/projects", authenticateApiUser);
+	app.use("/api/projects/*", authenticateApiUser);
 
 	app.use("/v1/code/*", async (c, next) => {
 		const sessionId = new URL(c.req.url).pathname.match(
@@ -338,7 +386,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		await next();
 	});
 
-	app.get("/api/ccr/projects", async (c) => {
+	app.get("/api/projects", async (c) => {
 		const store = createStore(c.env);
 		return c.json({ projects: await store.listProjects(c.get("userId")) });
 	});
@@ -370,7 +418,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		return c.json({ credential });
 	});
 
-	app.post("/api/ccr/projects", async (c) => {
+	app.post("/api/projects", async (c) => {
 		const body = await readJsonObject(c.req.raw);
 		const store = createStore(c.env);
 		const project = await store.createProject(
@@ -381,7 +429,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		return c.json({ project });
 	});
 
-	app.patch("/api/ccr/projects/:projectId", async (c) => {
+	app.patch("/api/projects/:projectId", async (c) => {
 		const body = await readJsonObject(c.req.raw);
 		const store = createStore(c.env);
 		const hasName = Object.hasOwn(body, "name");
@@ -404,7 +452,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		return c.json({ project });
 	});
 
-	app.delete("/api/ccr/projects/:projectId", async (c) => {
+	app.delete("/api/projects/:projectId", async (c) => {
 		const store = createStore(c.env);
 		const userId = c.get("userId");
 		const projectId = c.req.param("projectId");
@@ -440,7 +488,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		});
 	});
 
-	app.post("/api/ccr/projects/:projectId/sessions", async (c) => {
+	app.post("/api/projects/:projectId/sessions", async (c) => {
 		const body = await readJsonObject(c.req.raw);
 		const store = createStore(c.env);
 		const session = await store.createSession(
@@ -454,10 +502,217 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		return c.json({ session });
 	});
 
-	app.get("/api/ccr/projects/:projectId/sessions", async (c) => {
+	app.get("/api/projects/:projectId/sessions", async (c) => {
 		const store = createStore(c.env);
 		return c.json({
 			sessions: await store.listSessions(c.get("userId"), c.req.param("projectId")),
+		});
+	});
+
+	app.get("/api/projects/:projectId/workspace/tree", async (c) => {
+		const store = createStore(c.env);
+		const userId = c.get("userId");
+		const projectId = c.req.param("projectId");
+		const project = await findOwnedProject(store, userId, projectId);
+		if (!project) {
+			return c.json({ error: "Project not found" }, 404);
+		}
+		const prefixResult = readWorkspaceRoutePath(c.req.query("prefix") ?? "", {
+			allowEmpty: true,
+		});
+		if ("error" in prefixResult) {
+			return c.json({ error: prefixResult.error }, 400);
+		}
+		const workspace = await listWorkspaceTree(
+			c.env.PROJECT_WORKSPACE_BUCKET,
+			projectId,
+			prefixResult.path,
+			c.req.query("cursor"),
+		);
+		return c.json({
+			workspace,
+			signature: await signWorkspaceOperation(c.env, {
+				operation: "list",
+				projectId,
+				path: prefixResult.path,
+			}),
+		});
+	});
+
+	app.get("/api/projects/:projectId/workspace/file", async (c) => {
+		const store = createStore(c.env);
+		const userId = c.get("userId");
+		const projectId = c.req.param("projectId");
+		const project = await findOwnedProject(store, userId, projectId);
+		if (!project) {
+			return c.json({ error: "Project not found" }, 404);
+		}
+		const path = c.req.query("path");
+		if (!path) {
+			return c.json({ error: "path is required" }, 400);
+		}
+		const pathResult = readWorkspaceRoutePath(path);
+		if ("error" in pathResult) {
+			return c.json({ error: pathResult.error }, 400);
+		}
+		const file = await readWorkspaceFile(
+			c.env.PROJECT_WORKSPACE_BUCKET,
+			projectId,
+			pathResult.path,
+		);
+		if (!file) {
+			return c.json({ error: "Workspace file not found" }, 404);
+		}
+		return c.json({
+			file,
+			signature: await signWorkspaceOperation(c.env, {
+				operation: "read",
+				projectId,
+				path: pathResult.path,
+			}),
+		});
+	});
+
+	app.put("/api/projects/:projectId/workspace/file", async (c) => {
+		const body = await readJsonObject(c.req.raw);
+		const store = createStore(c.env);
+		const userId = c.get("userId");
+		const projectId = c.req.param("projectId");
+		const project = await findOwnedProject(store, userId, projectId);
+		if (!project) {
+			return c.json({ error: "Project not found" }, 404);
+		}
+		const path = getStringField(body, "path");
+		const content = getStringField(body, "content");
+		if (!path || content === undefined) {
+			return c.json({ error: "path and content are required" }, 400);
+		}
+		const pathResult = readWorkspaceRoutePath(path);
+		if ("error" in pathResult) {
+			return c.json({ error: pathResult.error }, 400);
+		}
+		const contentType = getStringField(body, "contentType");
+		const signature = await signWorkspaceOperation(c.env, {
+			operation: "write",
+			projectId,
+			path: pathResult.path,
+			body: content,
+		});
+		const file = await writeWorkspaceFile(
+			c.env.PROJECT_WORKSPACE_BUCKET,
+			projectId,
+			pathResult.path,
+			content,
+			contentType,
+		);
+		return c.json({
+			file,
+			signature,
+		});
+	});
+
+	app.delete("/api/projects/:projectId/workspace/file", async (c) => {
+		const body = await readJsonObject(c.req.raw);
+		const store = createStore(c.env);
+		const userId = c.get("userId");
+		const projectId = c.req.param("projectId");
+		const project = await findOwnedProject(store, userId, projectId);
+		if (!project) {
+			return c.json({ error: "Project not found" }, 404);
+		}
+		const path = getStringField(body, "path") ?? c.req.query("path");
+		if (!path) {
+			return c.json({ error: "path is required" }, 400);
+		}
+		const pathResult = readWorkspaceRoutePath(path);
+		if ("error" in pathResult) {
+			return c.json({ error: pathResult.error }, 400);
+		}
+		const signature = await signWorkspaceOperation(c.env, {
+			operation: "delete",
+			projectId,
+			path: pathResult.path,
+		});
+		await deleteWorkspacePath(c.env.PROJECT_WORKSPACE_BUCKET, projectId, pathResult.path);
+		return c.json({
+			ok: true,
+			signature,
+		});
+	});
+
+	app.post("/api/projects/:projectId/workspace/directory", async (c) => {
+		const body = await readJsonObject(c.req.raw);
+		const store = createStore(c.env);
+		const userId = c.get("userId");
+		const projectId = c.req.param("projectId");
+		const project = await findOwnedProject(store, userId, projectId);
+		if (!project) {
+			return c.json({ error: "Project not found" }, 404);
+		}
+		const path = getStringField(body, "path");
+		if (!path) {
+			return c.json({ error: "path is required" }, 400);
+		}
+		const pathResult = readWorkspaceRoutePath(path);
+		if ("error" in pathResult) {
+			return c.json({ error: pathResult.error }, 400);
+		}
+		const signature = await signWorkspaceOperation(c.env, {
+			operation: "mkdir",
+			projectId,
+			path: pathResult.path,
+		});
+		const directory = await createWorkspaceDirectory(
+			c.env.PROJECT_WORKSPACE_BUCKET,
+			projectId,
+			pathResult.path,
+		);
+		return c.json({
+			directory,
+			signature,
+		});
+	});
+
+	app.post("/api/projects/:projectId/workspace/move", async (c) => {
+		const body = await readJsonObject(c.req.raw);
+		const store = createStore(c.env);
+		const userId = c.get("userId");
+		const projectId = c.req.param("projectId");
+		const project = await findOwnedProject(store, userId, projectId);
+		if (!project) {
+			return c.json({ error: "Project not found" }, 404);
+		}
+		const fromPath = getStringField(body, "fromPath");
+		const toPath = getStringField(body, "toPath");
+		if (!fromPath || !toPath) {
+			return c.json({ error: "fromPath and toPath are required" }, 400);
+		}
+		const fromPathResult = readWorkspaceRoutePath(fromPath);
+		if ("error" in fromPathResult) {
+			return c.json({ error: fromPathResult.error }, 400);
+		}
+		const toPathResult = readWorkspaceRoutePath(toPath);
+		if ("error" in toPathResult) {
+			return c.json({ error: toPathResult.error }, 400);
+		}
+		const signature = await signWorkspaceOperation(c.env, {
+			operation: "move",
+			projectId,
+			path: fromPathResult.path,
+			body: JSON.stringify({ toPath: toPathResult.path }),
+		});
+		const file = await moveWorkspaceFile(
+			c.env.PROJECT_WORKSPACE_BUCKET,
+			projectId,
+			fromPathResult.path,
+			toPathResult.path,
+		);
+		if (!file) {
+			return c.json({ error: "Workspace file not found" }, 404);
+		}
+		return c.json({
+			file,
+			signature,
 		});
 	});
 

@@ -13,7 +13,13 @@ const BETTER_AUTH_CACHE_KEY_PREFIX = ["auth", "session"] as const;
  * @returns 去除重复 session 目录后的分层 key
  */
 function buildBetterAuthCacheKey(key: string) {
-	const normalizedKey = key.replace(/^session[:/]+/, "");
+	let normalizedKey = key.trim();
+	while (/^(auth[:/]+session|session)[:/]+/.test(normalizedKey)) {
+		// Better Auth 可能传入裸 session key，也可能传入已带目录的 key；循环剥离避免重复目录。
+		normalizedKey = normalizedKey
+			.replace(/^auth[:/]+session[:/]+/, "")
+			.replace(/^session[:/]+/, "");
+	}
 	return [...BETTER_AUTH_CACHE_KEY_PREFIX, normalizedKey];
 }
 

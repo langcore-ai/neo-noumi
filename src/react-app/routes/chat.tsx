@@ -458,7 +458,7 @@ function ChatPage() {
 	 * 加载项目列表。
 	 */
 	async function loadProjects() {
-		const response = await fetch("/api/ccr/projects");
+		const response = await fetch("/api/projects");
 		if (!response.ok) {
 			throw new Error(await readError(response));
 		}
@@ -474,7 +474,7 @@ function ChatPage() {
 	 */
 	async function loadSessions(projectId?: string) {
 		const url = projectId
-			? `/api/ccr/projects/${projectId}/sessions`
+			? `/api/projects/${projectId}/sessions`
 			: "/api/ccr/sessions";
 		const response = await fetch(url);
 		if (!response.ok) {
@@ -512,7 +512,7 @@ function ChatPage() {
 			return session;
 		}
 		const response = await fetch(
-			project ? `/api/ccr/projects/${project.id}/sessions` : "/api/ccr/sessions",
+			project ? `/api/projects/${project.id}/sessions` : "/api/ccr/sessions",
 			{
 				method: "POST",
 				headers: { "content-type": "application/json" },

@@ -118,7 +118,7 @@ function ProjectsPage() {
 		setIsLoading(true);
 		setError(null);
 		try {
-			const response = await fetch("/api/ccr/projects");
+			const response = await fetch("/api/projects");
 			if (!response.ok) {
 				throw new Error(await readError(response));
 			}
@@ -163,8 +163,8 @@ function ProjectsPage() {
 		setError(null);
 		try {
 			const endpoint = editingProject
-				? `/api/ccr/projects/${editingProject.id}`
-				: "/api/ccr/projects";
+				? `/api/projects/${editingProject.id}`
+				: "/api/projects";
 			const response = await fetch(endpoint, {
 				method: editingProject ? "PATCH" : "POST",
 				headers: { "Content-Type": "application/json" },
@@ -196,7 +196,7 @@ function ProjectsPage() {
 		setIsDeleting(true);
 		setError(null);
 		try {
-			const response = await fetch(`/api/ccr/projects/${deletingProject.id}`, {
+			const response = await fetch(`/api/projects/${deletingProject.id}`, {
 				method: "DELETE",
 			});
 			if (!response.ok) {
