@@ -20,7 +20,7 @@
 
 - 数据模型已拆成 `projects`、`chat_sessions`、`user_containers`：一个用户可以有多个 project，session 必须归属某个用户和某个 project。
 - `chat_sessions.userId` 和 `chat_sessions.projectId` 是非空外键，创建 session 前会校验 project 属于当前登录用户，避免跨用户挂载 session。
-- 同一用户的活跃 project 名称通过 PostgreSQL partial unique index 保持唯一，软删除项目不占用名称；这是 `/home/noumi/workspace/{projectName}` 挂载路径不串用的前置约束。
+- 同一用户的活跃 project 名称通过 PostgreSQL partial unique index 保持唯一，软删除项目不占用名称；这是 `/workspace/{projectName}` 挂载路径不串用的前置约束。
 - Project workspace 已接入 R2 bucket `neo-noumi-workspaces`，对象根目录使用 `{projectId}/...`；文件树支持列表、读写、删除、移动、新建目录以及文件/文件夹直传。所有 `/api/projects/{projectId}/workspace/*` 操作都先校验 project owner，再由后端生成 HMAC 操作签名；上传由后端下发短期 R2 presigned PUT URL，前端直接写入 R2，不经过 Worker 转发文件 body。
 - `/projects` 是 project 管理页面，基于 `/api/projects` 提供列表、创建、编辑和软删除；删除 project 会同步移除其下未删除 session，并对活跃 session 后台停止 runner，聊天页只展示未删除 project/session。
 - Cloudflare 资源使用 `NeoNoumiSandbox` / `NEO_NOUMI_SANDBOX` / `neo-noumi-sandbox` 命名，用户级 sandbox ID 使用 `neo-noumi-user-{userId}`。
@@ -938,7 +938,7 @@ A CCR service
 `--session-id` 只会固定新进程使用的 session ID，不会触发 Claude Code 的 resume 分支；已有会话冷启动恢复必须使用 `--resume {sessionId}`。A 在启动 B runner 前仍会把已持久化的 foreground internal events 写回 Claude Code 期望的本地 transcript：
 
 ```text
-/home/noumi/.claude/projects/-home-noumi-workspace-{projectName}/{sessionId}.jsonl
+/root/.claude/projects/-workspace-{projectName}/{sessionId}.jsonl
 ```
 
 否则 Claude Code 会按新的空本地会话启动，后续 user internal event 的 `parentUuid` 会重新从 `null` 开始，表现为上一轮上下文丢失。
@@ -951,13 +951,13 @@ A CCR service
 3. A 在启动 B runner 前恢复 Claude 本地状态：
    - 先读取 `project_key = "claude-code"` 的 sessionStore 文件。
    - 如果旧会话还没有 sessionStore 镜像，则从 internal events 回填 sessionStore。
-   - 把 sessionStore 文件 materialize 到当前 project cwd 对应的 Claude project state 目录，例如 `/home/noumi/.claude/projects/-home-noumi-workspace-A/`。
+   - 把 sessionStore 文件 materialize 到当前 project cwd 对应的 Claude project state 目录，例如 `/root/.claude/projects/-workspace-A/`。
    - 如果 foreground sessionStore 缺失，则用 foreground internal events 兜底写 `{sessionId}.jsonl`。
    - 从 foreground 与 subagent JSONL 中恢复 Claude memory 文件。
 4. A 根据恢复到的 foreground transcript 事件数决定 runner mode：
    - 0 条：`new`，Claude CLI 使用 `--session-id {sessionId}`。
    - 大于 0 条：`resume`，Claude CLI 使用 `--resume {sessionId}`。
-5. A 写入 sandbox runner/env 脚本并以 `noumi` 用户启动进程。
+5. A 写入 sandbox runner/env 脚本并启动进程。
 6. B runner 调用 A:
    POST /v1/code/sessions/{sessionId}/worker/register
 7. A 递增并返回新的 worker_epoch。
@@ -1043,8 +1043,8 @@ Neo Noumi 当前至少会恢复 Claude Code 自己的运行期状态：
 - 每次 workspace API 操作都会基于 `WORKSPACE_SIGNING_SECRET` 生成后端 HMAC 签名，签名覆盖操作类型、projectId、路径、请求体摘要和过期时间。
 - 文件树读取只使用 POST JSON body 传递 `prefix`，避免深层目录或长中文路径突破 URL 长度限制。
 - 文件/文件夹上传先由后端校验数量、声明大小和路径，再签发短期 R2 S3 presigned PUT URL，由前端直接 PUT 到 R2；部署时 `PROJECT_WORKSPACE_BUCKET_NAME` 必须和 R2 binding bucket 保持一致，bucket 必须允许前端 origin 对 R2 S3 endpoint 发起 `PUT` 的 CORS 请求。
-- 每次 chat 启动 Claude Code runner 前，A 会校验 session 所属 project 的 workspace 是否已经挂载到 sandbox：目标路径是 `/home/noumi/workspace/{projectName}`，R2 prefix 是 `/{projectId}`；已挂载时跳过，未挂载时通过 `PROJECT_WORKSPACE_BUCKET` binding 执行 `mountBucket`，并把挂载文件映射到 `noumi` 用户的 UID/GID。
-- CCR runner、环境变量和日志放在 `/tmp/neo-noumi`，避免写入用户 workspace；Claude Code 进程以 `noumi` 用户启动，cwd 指向 project 挂载路径，Claude 本地 project state 也按该 cwd 恢复，例如 `/home/noumi/workspace/A` 对应 `/home/noumi/.claude/projects/-home-noumi-workspace-A`。
+- 每次 chat 启动 Claude Code runner 前，A 会校验 session 所属 project 的 workspace 是否已经挂载到 sandbox：目标路径是 `/workspace/{projectName}`，R2 prefix 是 `/{projectId}`；已挂载时跳过，未挂载时通过 `PROJECT_WORKSPACE_BUCKET` binding 执行 `mountBucket`。
+- CCR runner、环境变量和日志放在 `/tmp/neo-noumi`，避免写入用户 workspace；Claude Code 进程启动时 cwd 指向 project 挂载路径，Claude 本地 project state 也按该 cwd 恢复，例如 `/workspace/A` 对应 `/root/.claude/projects/-workspace-A`。
 - 如果 workspace 丢失，即使 session 事件恢复成功，模型看到的上下文也会和实际文件状态不一致。
 
 ### 与 sessionStore 的关系
