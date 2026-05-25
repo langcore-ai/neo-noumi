@@ -12,7 +12,6 @@ import {
 	buildClaudeProjectStateDir,
 	buildProjectWorkspaceMountPath,
 	PROJECT_WORKSPACE_BUCKET_BINDING,
-	PROJECT_WORKSPACE_ROOT,
 } from "./ccr-workspace-mount";
 
 /** Sandbox 内 CCR runner 脚本路径 */
@@ -566,8 +565,8 @@ async function ensureProjectWorkspaceMounted(
 		};
 	}
 
-	// 只创建挂载根目录，具体 project 目录交给 mountBucket 绑定到 R2 prefix。
-	await sandbox.exec(`mkdir -p ${shellQuote(PROJECT_WORKSPACE_ROOT)}`, {
+	// 挂载点必须预先存在，且路径段已收敛为 s3fs 友好的 POSIX 名称。
+	await sandbox.exec(`mkdir -p ${shellQuote(mountPath)}`, {
 		origin: "internal",
 	});
 	await sandbox.mountBucket(PROJECT_WORKSPACE_BUCKET_BINDING, mountPath, {

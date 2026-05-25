@@ -15,6 +15,12 @@ describe("buildProjectWorkspaceMountPath", () => {
 		);
 	});
 
+	test("normalizes whitespace for s3fs friendly mount paths", () => {
+		expect(buildProjectWorkspaceMountPath("Default Project", "project-1")).toBe(
+			"/workspace/Default-Project",
+		);
+	});
+
 	test("falls back to project id when project name is not a valid path segment", () => {
 		expect(buildProjectWorkspaceMountPath("..", "project-1")).toBe(
 			"/workspace/project-1",

@@ -16,7 +16,7 @@ export const CLAUDE_PROJECT_STATE_ROOT = "/root/.claude/projects";
 function normalizeProjectMountName(projectName: string, projectId: string): string {
 	const segment = projectName
 		.trim()
-		.replaceAll(/[\/\\\u0000-\u001f\u007f]/g, "-")
+		.replaceAll(/[\/\\\s\u0000-\u001f\u007f]/g, "-")
 		.slice(0, 80);
 	// 空名称和特殊路径段都不能直接作为挂载点。
 	return segment && segment !== "." && segment !== ".." ? segment : projectId;
