@@ -40,8 +40,8 @@ const TRANSCRIPT_RESTORE_PAGE_SIZE = 500;
 /** Claude Code 默认模型；固定到网关可识别的 Sonnet 模型，避免 CLI 选择 Opus 后缀模型。 */
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 
-/** Cloudflare R2 S3 API hostname，用于 Sandbox s3fs 出网挂载。 */
-const R2_S3_API_HOST = "ba736c2dd7270986b9d9d4cbc3e3a2fb.r2.cloudflarestorage.com";
+/** Cloudflare R2 S3 API hostname 通配，用于 Sandbox s3fs 出网挂载。 */
+const R2_S3_API_HOST_PATTERN = "*.r2.cloudflarestorage.com";
 
 /** Project workspace 挂载信息。 */
 type ProjectWorkspaceMount = {
@@ -94,7 +94,7 @@ export class NeoNoumiSandbox extends Sandbox {
 	allowedHosts = [
 		CCR_SDK_APPROVED_HOST,
 		ANTHROPIC_API_HOST,
-		R2_S3_API_HOST,
+		R2_S3_API_HOST_PATTERN,
 	];
 }
 
@@ -541,7 +541,7 @@ function readWorkspaceMountConfig(env: NeoNoumiSandboxBindings) {
 			accessKeyId: env.R2_ACCESS_KEY_ID,
 			secretAccessKey: env.R2_SECRET_ACCESS_KEY,
 		},
-		endpoint: `https://${R2_S3_API_HOST}`,
+		endpoint: `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
 	};
 }
 
