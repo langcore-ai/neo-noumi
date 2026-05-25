@@ -89,6 +89,8 @@ export interface NeoNoumiSandboxBindings extends AiProxyBindings {
 
 /** Cloudflare Sandbox，用于运行 Neo Noumi chat worker。 */
 export class NeoNoumiSandbox extends Sandbox {
+	/** 容器空闲 3 分钟后进入休眠，降低旧 runner 和挂载资源占用。 */
+	sleepAfter = "3m";
 	enableInternet = false;
 	interceptHttps = true;
 	allowedHosts = [
