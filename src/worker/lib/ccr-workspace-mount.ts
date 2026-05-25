@@ -1,9 +1,6 @@
 /** Project workspace 在容器内的挂载根目录。 */
 export const PROJECT_WORKSPACE_ROOT = "/workspace";
 
-/** Project workspace R2 binding 名称，用于 Sandbox bucket mount。 */
-export const PROJECT_WORKSPACE_BUCKET_BINDING = "PROJECT_WORKSPACE_BUCKET";
-
 /** Claude Code 本地 project state 根目录。 */
 export const CLAUDE_PROJECT_STATE_ROOT = "/root/.claude/projects";
 

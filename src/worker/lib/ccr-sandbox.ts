@@ -12,7 +12,6 @@ import {
 	buildClaudeProjectStateDir,
 	buildProjectWorkspaceMountPrefix,
 	buildProjectWorkspaceMountPath,
-	PROJECT_WORKSPACE_BUCKET_BINDING,
 } from "./ccr-workspace-mount";
 
 /** Sandbox 内 CCR runner 脚本路径 */
@@ -75,6 +74,14 @@ export interface NeoNoumiSandboxBindings extends AiProxyBindings {
 	AI_PROXY_AUTH_HEADER?: string;
 	/** 用户级 AI Proxy credential 加密密钥。 */
 	AI_PROXY_CREDENTIAL_SECRET?: string;
+	/** Cloudflare 账号 ID，用于 Sandbox s3fs 挂载 R2。 */
+	R2_ACCOUNT_ID?: string;
+	/** R2 S3 API access key ID，用于 Sandbox s3fs 挂载。 */
+	R2_ACCESS_KEY_ID?: string;
+	/** R2 S3 API secret access key，用于 Sandbox s3fs 挂载。 */
+	R2_SECRET_ACCESS_KEY?: string;
+	/** Project workspace R2 bucket 名称，用于 Sandbox s3fs 挂载。 */
+	PROJECT_WORKSPACE_BUCKET_NAME?: string;
 }
 
 /** Cloudflare Sandbox，用于运行 Neo Noumi chat worker。 */
@@ -510,6 +517,31 @@ function getCcrSandbox(env: NeoNoumiSandboxBindings, userId: string) {
 }
 
 /**
+ * 读取 Sandbox 挂载 R2 所需配置。
+ * @param env Worker 绑定
+ * @returns Sandbox SDK mountBucket 配置
+ */
+function readWorkspaceMountConfig(env: NeoNoumiSandboxBindings) {
+	if (!env.PROJECT_WORKSPACE_BUCKET_NAME) {
+		throw new Error("PROJECT_WORKSPACE_BUCKET_NAME is required");
+	}
+	if (!env.R2_ACCOUNT_ID) {
+		throw new Error("R2_ACCOUNT_ID is required");
+	}
+	if (!env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
+		throw new Error("R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY are required");
+	}
+	return {
+		bucketName: env.PROJECT_WORKSPACE_BUCKET_NAME,
+		credentials: {
+			accessKeyId: env.R2_ACCESS_KEY_ID,
+			secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+		},
+		endpoint: `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+	};
+}
+
+/**
  * 判断容器路径是否已经是挂载点。
  * @param sandbox sandbox client
  * @param mountPath 容器内挂载路径
@@ -534,6 +566,7 @@ async function isMountedPath(
  */
 async function ensureProjectWorkspaceMounted(
 	sandbox: ReturnType<typeof getCcrSandbox>,
+	env: NeoNoumiSandboxBindings,
 	store: CcrStore,
 	sessionId: string,
 ): Promise<ProjectWorkspaceMount> {
@@ -570,7 +603,10 @@ async function ensureProjectWorkspaceMounted(
 	await sandbox.exec(`mkdir -p ${shellQuote(mountPath)}`, {
 		origin: "internal",
 	});
-	await sandbox.mountBucket(PROJECT_WORKSPACE_BUCKET_BINDING, mountPath, {
+	const mountConfig = readWorkspaceMountConfig(env);
+	await sandbox.mountBucket(mountConfig.bucketName, mountPath, {
+		credentials: mountConfig.credentials,
+		endpoint: mountConfig.endpoint,
 		// Sandbox SDK 的 s3fs prefix 必须同时以 `/` 开头和结尾。
 		prefix: buildProjectWorkspaceMountPrefix(context.projectId),
 	});
@@ -647,6 +683,7 @@ export async function startCcrSandbox(
 	});
 	const workspaceMount = await ensureProjectWorkspaceMounted(
 		sandbox,
+		env,
 		store,
 		sessionId,
 	);
