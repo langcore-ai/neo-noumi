@@ -1,14 +1,26 @@
-/** Project workspace 在容器内的挂载根目录。 */
-export const PROJECT_WORKSPACE_ROOT = "/workspace";
+/** Claude Code 在沙盒内使用的非 root 用户名。 */
+export const CLAUDE_RUNTIME_USER = "noumi";
+
+/** Claude Code 运行用户的 UID；需和 Dockerfile 内 useradd 保持一致。 */
+export const CLAUDE_RUNTIME_UID = 10001;
+
+/** Claude Code 运行用户的 GID；需和 Dockerfile 内 groupadd 保持一致。 */
+export const CLAUDE_RUNTIME_GID = 10001;
+
+/** Claude Code 运行用户的 home 目录。 */
+export const CLAUDE_RUNTIME_HOME = `/home/${CLAUDE_RUNTIME_USER}`;
+
+/** Project workspace 在容器内的挂载根目录，必须位于 noumi home 下。 */
+export const PROJECT_WORKSPACE_ROOT = `${CLAUDE_RUNTIME_HOME}/workspace`;
 
 /** Claude Code 本地 project state 根目录。 */
-export const CLAUDE_PROJECT_STATE_ROOT = "/root/.claude/projects";
+export const CLAUDE_PROJECT_STATE_ROOT = `${CLAUDE_RUNTIME_HOME}/.claude/projects`;
 
 /**
  * 将 project 名称收敛为单个 POSIX 路径段。
  * @param projectName 用户可见 project 名称
  * @param projectId project ID，用于名称不可挂载时兜底
- * @returns 可拼接到 /workspace 下的路径段
+ * @returns 可拼接到 noumi workspace 根目录下的路径段
  */
 function normalizeProjectMountName(projectName: string, projectId: string): string {
 	const segment = projectName

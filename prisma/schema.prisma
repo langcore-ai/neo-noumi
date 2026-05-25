@@ -26,9 +26,29 @@ model User {
   aiProxyCredentials AiProxyCredential[]
   aiProxyTokens      AiProxyToken[]
   aiProxyRequestLogs AiProxyRequestLog[]
+  claudeCodeConfig   UserClaudeCodeConfig?
 
   @@unique([email])
   @@map("user")
+}
+
+/// 用户级 Claude Code 配置。
+model UserClaudeCodeConfig {
+  /// 配置记录唯一标识。
+  id               String   @id
+  /// 所属用户 ID；每个用户最多一份配置。
+  userId           String   @unique
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// 对应 ~/.claude/config.json 的 JSON 内容。
+  claudeConfigJson Json     @default("{}")
+  /// 对应 ~/.claude.json 的 JSON 内容。
+  claudeJson       Json     @default("{}")
+  /// 创建时间。
+  createdAt        DateTime @default(now())
+  /// 更新时间。
+  updatedAt        DateTime @updatedAt
+
+  @@map("user_claude_code_configs")
 }
 
 model Project {

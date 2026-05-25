@@ -7,5 +7,12 @@ ARG CLAUDE_CODE_VERSION=2.1.148
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 	&& claude --version
 
+# Claude Code 和用户命令统一以非 root 用户运行，避免把运行期状态写入 /root。
+RUN groupadd --gid 10001 noumi \
+	&& useradd --uid 10001 --gid 10001 --create-home --shell /bin/sh noumi \
+	&& mkdir -p /home/noumi/.claude \
+	&& mkdir -p /home/noumi/workspace \
+	&& chown -R noumi:noumi /home/noumi
+
 # 本地开发需要 EXPOSE，方便沙盒内服务按需暴露端口。
 EXPOSE 8080

@@ -7,24 +7,26 @@ import {
 
 describe("buildProjectWorkspaceMountPath", () => {
 	test("uses the project name as the workspace mount directory", () => {
-		expect(buildProjectWorkspaceMountPath("A", "project-1")).toBe("/workspace/A");
+		expect(buildProjectWorkspaceMountPath("A", "project-1")).toBe(
+			"/home/noumi/workspace/A",
+		);
 	});
 
 	test("normalizes path separators without changing the project prefix", () => {
 		expect(buildProjectWorkspaceMountPath("foo/bar\\baz", "project-1")).toBe(
-			"/workspace/foo-bar-baz",
+			"/home/noumi/workspace/foo-bar-baz",
 		);
 	});
 
 	test("normalizes whitespace for s3fs friendly mount paths", () => {
 		expect(buildProjectWorkspaceMountPath("Default Project", "project-1")).toBe(
-			"/workspace/Default-Project",
+			"/home/noumi/workspace/Default-Project",
 		);
 	});
 
 	test("falls back to project id when project name is not a valid path segment", () => {
 		expect(buildProjectWorkspaceMountPath("..", "project-1")).toBe(
-			"/workspace/project-1",
+			"/home/noumi/workspace/project-1",
 		);
 	});
 });
@@ -37,8 +39,8 @@ describe("buildProjectWorkspaceMountPrefix", () => {
 
 describe("buildClaudeProjectStateDir", () => {
 	test("tracks the mounted workspace cwd", () => {
-		expect(buildClaudeProjectStateDir("/workspace/A")).toBe(
-			"/root/.claude/projects/-workspace-A",
+		expect(buildClaudeProjectStateDir("/home/noumi/workspace/A")).toBe(
+			"/home/noumi/.claude/projects/-home-noumi-workspace-A",
 		);
 	});
 });

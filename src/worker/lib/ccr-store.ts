@@ -863,6 +863,46 @@ export class CcrStore {
 	}
 
 	/**
+	 * 读取用户 Claude Code 配置，不存在时返回空配置。
+	 * @param userId 用户 ID
+	 * @returns 用户级 Claude Code 配置
+	 */
+	async getUserClaudeCodeConfig(userId: string) {
+		const config = await this.prisma.userClaudeCodeConfig.findUnique({
+			where: { userId },
+		});
+		return {
+			claudeConfigJson: config ? asJsonObject(config.claudeConfigJson) : {},
+			claudeJson: config ? asJsonObject(config.claudeJson) : {},
+		};
+	}
+
+	/**
+	 * 写入用户 Claude Code 配置。
+	 * @param userId 用户 ID
+	 * @param input Claude Code 配置内容
+	 * @returns 写入后的配置
+	 */
+	async upsertUserClaudeCodeConfig(
+		userId: string,
+		input: { claudeConfigJson: JsonObject; claudeJson: JsonObject },
+	) {
+		return this.prisma.userClaudeCodeConfig.upsert({
+			where: { userId },
+			create: {
+				id: crypto.randomUUID(),
+				userId,
+				claudeConfigJson: input.claudeConfigJson,
+				claudeJson: input.claudeJson,
+			},
+			update: {
+				claudeConfigJson: input.claudeConfigJson,
+				claudeJson: input.claudeJson,
+			},
+		});
+	}
+
+	/**
 	 * 为 sandbox worker 准备会话级访问 token。
 	 * @param sessionId session ID
 	 * @returns worker 访问 token

@@ -12,6 +12,12 @@ import {
 	buildClaudeProjectStateDir,
 	buildProjectWorkspaceMountPrefix,
 	buildProjectWorkspaceMountPath,
+	CLAUDE_RUNTIME_GID,
+	CLAUDE_RUNTIME_HOME,
+	CLAUDE_RUNTIME_UID,
+	CLAUDE_RUNTIME_USER,
+	CLAUDE_PROJECT_STATE_ROOT,
+	PROJECT_WORKSPACE_ROOT,
 } from "./ccr-workspace-mount";
 
 /** Sandbox 内 CCR runner 脚本路径 */
@@ -132,7 +138,7 @@ SESSION_ID="$1"
 WORKER_ACCESS_TOKEN="$2"
 AI_PROXY_TOKEN="$3"
 CLAUDE_SESSION_MODE="\${4:-new}"
-WORKSPACE_DIR="\${5:-/workspace}"
+WORKSPACE_DIR="\${5:-${PROJECT_WORKSPACE_ROOT}}"
 SDK_URL="https://${CCR_SDK_APPROVED_HOST}/v1/code/sessions/$SESSION_ID"
 AUTH_HEADER="Authorization: Bearer $WORKER_ACCESS_TOKEN"
 
@@ -149,6 +155,8 @@ export CURL_CA_BUNDLE=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 export SSL_CERT_FILE=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 export ANTHROPIC_BASE_URL="https://${ANTHROPIC_API_HOST}"
 export ANTHROPIC_API_KEY="$AI_PROXY_TOKEN"
+export HOME="${CLAUDE_RUNTIME_HOME}"
+export USER="${CLAUDE_RUNTIME_USER}"
 
 cd "$WORKSPACE_DIR"
 
@@ -454,6 +462,12 @@ async function restoreClaudeLocalState(
 		await sandbox.exec(`mkdir -p ${shellQuote(dirname(filePath))}`);
 		await sandbox.writeFile(filePath, content);
 	}
+	await sandbox.exec(
+		`chown -R ${CLAUDE_RUNTIME_USER}:${CLAUDE_RUNTIME_USER} ${shellQuote(
+			CLAUDE_PROJECT_STATE_ROOT,
+		)}`,
+		{ origin: "internal" },
+	);
 	await store.recordOperation(sessionId, {
 		direction: "route_internal",
 		category: "sandbox_state_restored",
@@ -613,6 +627,12 @@ async function ensureProjectWorkspaceMounted(
 		endpoint: mountConfig.endpoint,
 		// Sandbox SDK 的 s3fs prefix 必须同时以 `/` 开头和结尾。
 		prefix: buildProjectWorkspaceMountPrefix(context.projectId),
+		// Claude Code 以 noumi 用户运行，挂载文件必须映射到同一 UID/GID 才能读写。
+		s3fsOptions: [
+			`uid=${CLAUDE_RUNTIME_UID}`,
+			`gid=${CLAUDE_RUNTIME_GID}`,
+			"umask=0022",
+		],
 	});
 	await store.recordOperation(sessionId, {
 		direction: "route_internal",
@@ -704,9 +724,15 @@ export async function startCcrSandbox(
 	await sandbox.writeFile(RUNNER_PATH, buildRunnerScript());
 	await sandbox.exec(`chmod 600 ${ENV_PATH}`);
 	await sandbox.exec(`chmod +x ${RUNNER_PATH}`);
+	await sandbox.exec(
+		`chown -R ${CLAUDE_RUNTIME_USER}:${CLAUDE_RUNTIME_USER} ${shellQuote(
+			dirname(RUNNER_PATH),
+		)}`,
+		{ origin: "internal" },
+	);
 	const process = await sandbox.startProcess(
 		[
-			"sh -lc",
+			`su ${CLAUDE_RUNTIME_USER} -s /bin/sh -c`,
 			shellQuote(
 				[
 					`. ${ENV_PATH};`,

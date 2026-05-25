@@ -157,6 +157,52 @@ describe("CcrStore project name uniqueness", () => {
 });
 
 describe("CcrStore worker lifecycle guards", () => {
+	test("returns empty Claude Code config when the user has no stored config", async () => {
+		const store = createStoreFromFakePrisma({
+			userClaudeCodeConfig: {
+				findUnique: async (args: { where: unknown }) => {
+					expect(args.where).toEqual({ userId: "user-1" });
+					return null;
+				},
+			},
+		});
+
+		await expect(store.getUserClaudeCodeConfig("user-1")).resolves.toEqual({
+			claudeConfigJson: {},
+			claudeJson: {},
+		});
+	});
+
+	test("upserts user Claude Code config into the user-scoped record", async () => {
+		let upsertArgs: unknown;
+		const store = createStoreFromFakePrisma({
+			userClaudeCodeConfig: {
+				upsert: async (args: unknown) => {
+					upsertArgs = args;
+					return {};
+				},
+			},
+		});
+
+		await store.upsertUserClaudeCodeConfig("user-1", {
+			claudeConfigJson: { permissions: { allow: ["Bash(ls)"] } },
+			claudeJson: { hasCompletedOnboarding: true },
+		});
+
+		expect(upsertArgs).toMatchObject({
+			where: { userId: "user-1" },
+			create: {
+				userId: "user-1",
+				claudeConfigJson: { permissions: { allow: ["Bash(ls)"] } },
+				claudeJson: { hasCompletedOnboarding: true },
+			},
+			update: {
+				claudeConfigJson: { permissions: { allow: ["Bash(ls)"] } },
+				claudeJson: { hasCompletedOnboarding: true },
+			},
+		});
+	});
+
 	test("stops queued event polling after the session is deleted", async () => {
 		const whereClauses: unknown[] = [];
 		const store = createStoreFromFakePrisma({
