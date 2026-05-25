@@ -1423,8 +1423,8 @@ function ChatPage() {
 									<ChevronDownIcon data-icon="inline-end" />
 								</DropdownMenuTrigger>
 								<DropdownMenuContent className="w-72">
-									<DropdownMenuLabel>工作区</DropdownMenuLabel>
 									<DropdownMenuGroup>
+										<DropdownMenuLabel>工作区</DropdownMenuLabel>
 										{projects.map((item) => (
 											<DropdownMenuItem
 												key={item.id}
@@ -1720,8 +1720,8 @@ function ChatPage() {
 											<ChevronDownIcon data-icon="inline-end" />
 										</DropdownMenuTrigger>
 										<DropdownMenuContent className="w-80">
-											<DropdownMenuLabel>当前项目会话</DropdownMenuLabel>
 											<DropdownMenuGroup>
+												<DropdownMenuLabel>当前项目会话</DropdownMenuLabel>
 												{sessions.length === 0 ? (
 													<DropdownMenuItem disabled>暂无历史对话</DropdownMenuItem>
 												) : (
