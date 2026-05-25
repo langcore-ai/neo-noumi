@@ -205,6 +205,56 @@ export function normalizeAiProxyCredentialInput(input: {
 	};
 }
 
+/** AI Proxy 请求审计创建输入。 */
+export type AiProxyRequestLogCreateInput = {
+	/** 用户 ID。 */
+	userId: string;
+	/** Chat session ID。 */
+	sessionId: string;
+	/** AI Proxy token 表 ID。 */
+	tokenId: string;
+	/** 使用用户 credential 时记录 credential ID；平台 fallback 为空。 */
+	credentialId?: string | null;
+	/** 上游 provider。 */
+	provider: string;
+	/** 容器原始请求 method。 */
+	requestMethod: string;
+	/** 容器原始请求 URL。 */
+	requestUrl: string;
+	/** 容器原始请求 path。 */
+	requestPath: string;
+	/** 实际转发的上游 URL。 */
+	upstreamUrl: string;
+	/** 实际转发的上游 base URL。 */
+	upstreamBaseUrl: string;
+	/** 请求体 UTF-8 字节数。 */
+	requestBytes: number;
+};
+
+/** AI Proxy 请求审计完成输入。 */
+export type AiProxyRequestLogCompleteInput = {
+	/** 轻表日志 ID。 */
+	logId: string;
+	/** HTTP 响应状态码；网络错误时为空。 */
+	statusCode?: number | null;
+	/** 请求总耗时，单位毫秒。 */
+	durationMs: number;
+	/** 响应体 UTF-8 字节数。 */
+	responseBytes?: number | null;
+	/** 网络或落库前捕获到的错误信息。 */
+	errorMessage?: string | null;
+	/** 容器原始请求头。 */
+	requestHeaders?: Prisma.InputJsonValue;
+	/** 容器原始请求体。 */
+	requestBody?: string | null;
+	/** 实际转发上游请求头。 */
+	upstreamRequestHeaders?: Prisma.InputJsonValue;
+	/** 上游响应头。 */
+	responseHeaders?: Prisma.InputJsonValue | null;
+	/** 上游响应体。 */
+	responseBody?: string | null;
+};
+
 /**
  * 将 Prisma JSON 值收敛为 JSON 对象。
  * @param value Prisma JSON 值
@@ -791,6 +841,7 @@ export class CcrStore {
 	 * @returns token 绑定上下文；无效时返回 null
 	 */
 	async authenticateAiProxyToken(token: string): Promise<{
+		tokenId: string;
 		userId: string;
 		sessionId: string;
 		sandboxId: string;
@@ -802,6 +853,7 @@ export class CcrStore {
 		const row = await this.prisma.aiProxyToken.findUnique({
 			where: { tokenHash },
 			select: {
+				id: true,
 				userId: true,
 				sessionId: true,
 				sandboxId: true,
@@ -825,6 +877,7 @@ export class CcrStore {
 			return null;
 		}
 		return {
+			tokenId: row.id,
 			userId: row.userId,
 			sessionId: row.sessionId,
 			sandboxId: row.sandboxId,
@@ -919,6 +972,62 @@ export class CcrStore {
 					apiKey: await this.decryptAiProxyApiKey(credential.apiKeyCiphertext),
 				}
 			: null;
+	}
+
+	/**
+	 * 创建 AI Proxy 请求审计记录。
+	 * @param input 请求与转发上下文
+	 * @returns 轻表日志 ID
+	 */
+	async createAiProxyRequestLog(input: AiProxyRequestLogCreateInput): Promise<string> {
+		const logId = crypto.randomUUID();
+		await this.prisma.aiProxyRequestLog.create({
+			data: {
+				id: logId,
+				userId: input.userId,
+				sessionId: input.sessionId,
+				tokenId: input.tokenId,
+				credentialId: input.credentialId ?? null,
+				provider: input.provider,
+				requestMethod: input.requestMethod,
+				requestUrl: input.requestUrl,
+				requestPath: input.requestPath,
+				upstreamUrl: input.upstreamUrl,
+				upstreamBaseUrl: input.upstreamBaseUrl,
+				requestBytes: input.requestBytes,
+			},
+		});
+		return logId;
+	}
+
+	/**
+	 * 补全 AI Proxy 请求审计记录的响应信息。
+	 * @param input 响应与错误信息
+	 */
+	async completeAiProxyRequestLog(input: AiProxyRequestLogCompleteInput): Promise<void> {
+		const completedAt = new Date();
+		await this.prisma.aiProxyRequestLog.update({
+			where: { id: input.logId },
+			data: {
+				statusCode: input.statusCode ?? null,
+				durationMs: input.durationMs,
+				responseBytes: input.responseBytes ?? null,
+				errorMessage: input.errorMessage ?? null,
+				completedAt,
+				payload: input.requestHeaders && input.upstreamRequestHeaders
+					? {
+							create: {
+								id: crypto.randomUUID(),
+								requestHeaders: input.requestHeaders,
+								requestBody: input.requestBody ?? null,
+								upstreamRequestHeaders: input.upstreamRequestHeaders,
+								responseHeaders: input.responseHeaders ?? undefined,
+								responseBody: input.responseBody ?? null,
+							},
+						}
+					: undefined,
+			},
+		});
 	}
 
 	/**

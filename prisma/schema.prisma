@@ -25,6 +25,7 @@ model User {
   userContainer      UserContainer?
   aiProxyCredentials AiProxyCredential[]
   aiProxyTokens      AiProxyToken[]
+  aiProxyRequestLogs AiProxyRequestLog[]
 
   @@unique([email])
   @@map("user")
@@ -117,6 +118,7 @@ model ChatSession {
   operationLogs         ChatOperationLog[]
   sessionStoreFiles     ChatSessionStoreFile[]
   aiProxyTokens         AiProxyToken[]
+  aiProxyRequestLogs    AiProxyRequestLog[]
 
   @@index([userId, updatedAt])
   @@index([projectId, updatedAt])
@@ -124,37 +126,86 @@ model ChatSession {
 }
 
 model AiProxyCredential {
-  id               String    @id
+  id               String              @id
   userId           String
-  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user             User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   name             String
-  provider         String    @default("anthropic")
+  provider         String              @default("anthropic")
   baseUrl          String
   apiKeyCiphertext String
-  isDefault        Boolean   @default(false)
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
+  isDefault        Boolean             @default(false)
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
   deletedAt        DateTime?
+  requestLogs      AiProxyRequestLog[]
 
   @@index([userId, isDefault])
   @@map("ai_proxy_credentials")
 }
 
 model AiProxyToken {
-  id        String      @id
-  tokenHash String      @unique
-  userId    String
-  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  sessionId String
-  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  sandboxId String
-  expiresAt DateTime
-  revokedAt DateTime?
-  createdAt DateTime    @default(now())
+  id          String              @id
+  tokenHash   String              @unique
+  userId      String
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionId   String
+  session     ChatSession         @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sandboxId   String
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime            @default(now())
+  requestLogs AiProxyRequestLog[]
 
   @@index([userId, expiresAt])
   @@index([sessionId, revokedAt])
   @@map("ai_proxy_tokens")
+}
+
+model AiProxyRequestLog {
+  id              String                    @id
+  userId          String
+  user            User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionId       String
+  session         ChatSession               @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  tokenId         String
+  token           AiProxyToken              @relation(fields: [tokenId], references: [id], onDelete: Cascade)
+  credentialId    String?
+  credential      AiProxyCredential?        @relation(fields: [credentialId], references: [id], onDelete: SetNull)
+  provider        String
+  requestMethod   String
+  requestUrl      String
+  requestPath     String
+  upstreamUrl     String
+  upstreamBaseUrl String
+  statusCode      Int?
+  durationMs      Int?
+  requestBytes    Int
+  responseBytes   Int?
+  errorMessage    String?
+  startedAt       DateTime                  @default(now())
+  completedAt     DateTime?
+  createdAt       DateTime                  @default(now())
+  payload         AiProxyRequestLogPayload?
+
+  @@index([userId, startedAt])
+  @@index([sessionId, startedAt])
+  @@index([statusCode, startedAt])
+  @@map("ai_proxy_request_logs")
+}
+
+model AiProxyRequestLogPayload {
+  id                     String            @id
+  logId                  String            @unique
+  log                    AiProxyRequestLog @relation(fields: [logId], references: [id], onDelete: Cascade)
+  requestHeaders         Json
+  requestBody            String?
+  upstreamRequestHeaders Json
+  responseHeaders        Json?
+  responseBody           String?
+  createdAt              DateTime          @default(now())
+  updatedAt              DateTime          @updatedAt
+
+  @@map("ai_proxy_request_log_payloads")
 }
 
 model UserContainer {

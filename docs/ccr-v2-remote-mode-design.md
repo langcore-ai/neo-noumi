@@ -281,6 +281,9 @@ Claude Code CLI in Cloudflare Container
 - Worker 转发前必须删除容器请求里的 `authorization` / `x-api-key`，再按渠道配置注入真实 API key，避免 proxy token 透传给上游。
 - 默认只允许 `/v1/messages` 和 `/v1/messages/count_tokens`，其它官方 API 路径先拒绝，避免容器绕过受控推理链路。
 - 用户默认 credential 优先级高于平台 fallback；如果两者都不存在，AI Proxy 返回配置缺失错误，而不是让容器直连官方 API。
+- AI Proxy 已增加两层审计表：`ai_proxy_request_logs` 是轻表，记录 user/session/token/credential、官方 URL、真实上游 URL、状态码、耗时、请求/响应字节数和错误；`ai_proxy_request_log_payloads` 是 payload 表，按 `logId` 1:1 保存容器原始请求头/体、转发上游请求头、上游响应头/体。
+- payload 审计采用 KV 暂存：请求开始时只写轻表，容器请求头/体和上游请求头先写入 `ai-proxy:payload:{logId}`；响应完整读取后再把请求/响应 payload 一次性写入 `ai_proxy_request_log_payloads` 并删除 KV，避免 payload 表高频 update。
+- 响应体审计绑定在返回给容器的 response stream 上，边转发边收集响应体，流结束后补齐轻表和 payload 表；无响应体或上游请求失败时，轻表也会补齐完成状态或错误信息。
 
 ### 本地验证结果
 

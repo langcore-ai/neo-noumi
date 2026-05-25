@@ -227,6 +227,7 @@ describe("CcrStore worker lifecycle guards", () => {
 				findUnique: async (args: { where: { tokenHash: string } }) => {
 					expect(args.where.tokenHash).toBe(expectedTokenHash);
 					return {
+						id: "token-1",
 						userId: "user-1",
 						sessionId: "session-1",
 						sandboxId: "sandbox-old",
@@ -245,9 +246,87 @@ describe("CcrStore worker lifecycle guards", () => {
 
 		currentSessionSandboxId = "sandbox-old";
 		await expect(store.authenticateAiProxyToken(token)).resolves.toEqual({
+			tokenId: "token-1",
 			userId: "user-1",
 			sessionId: "session-1",
 			sandboxId: "sandbox-old",
+		});
+	});
+
+	test("creates and completes AI proxy request logs with light and payload records", async () => {
+		const calls: unknown[] = [];
+		const store = createStoreFromFakePrisma({
+			aiProxyRequestLog: {
+				create: async (args: unknown) => {
+					calls.push({ kind: "create", args });
+					return {};
+				},
+				update: async (args: unknown) => {
+					calls.push({ kind: "update", args });
+					return {};
+				},
+			},
+		});
+
+		const logId = await store.createAiProxyRequestLog({
+			userId: "user-1",
+			sessionId: "session-1",
+			tokenId: "token-1",
+			credentialId: "credential-1",
+			provider: "anthropic",
+			requestMethod: "POST",
+			requestUrl: "https://api.anthropic.com/v1/messages",
+			requestPath: "/v1/messages",
+			upstreamUrl: "https://gateway.example.com/v1/messages",
+			upstreamBaseUrl: "https://gateway.example.com",
+			requestBytes: 13,
+		});
+		await store.completeAiProxyRequestLog({
+			logId,
+			statusCode: 200,
+			durationMs: 123,
+			responseBytes: 15,
+			requestHeaders: [["x-api-key", "nnaip_token"]],
+			requestBody: "{\"ok\":true}",
+			upstreamRequestHeaders: [["x-api-key", "real-key"]],
+			responseHeaders: [["content-type", "application/json"]],
+			responseBody: "{\"done\":true}",
+		});
+
+		expect(calls).toHaveLength(2);
+		expect(calls[0]).toMatchObject({
+			kind: "create",
+			args: {
+				data: {
+					userId: "user-1",
+					sessionId: "session-1",
+					tokenId: "token-1",
+					credentialId: "credential-1",
+					provider: "anthropic",
+					requestBytes: 13,
+				},
+			},
+		});
+		expect(calls[1]).toMatchObject({
+			kind: "update",
+			args: {
+				where: { id: logId },
+				data: {
+					statusCode: 200,
+					durationMs: 123,
+					responseBytes: 15,
+					errorMessage: null,
+					payload: {
+						create: {
+							requestBody: "{\"ok\":true}",
+							requestHeaders: [["x-api-key", "nnaip_token"]],
+							upstreamRequestHeaders: [["x-api-key", "real-key"]],
+							responseHeaders: [["content-type", "application/json"]],
+							responseBody: "{\"done\":true}",
+						},
+					},
+				},
+			},
 		});
 	});
 
