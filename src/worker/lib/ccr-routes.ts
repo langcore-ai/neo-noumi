@@ -633,9 +633,14 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			projectId,
 			path: pathResult.path,
 		});
-		await deleteWorkspacePath(c.env.PROJECT_WORKSPACE_BUCKET, projectId, pathResult.path);
+		const deleted = await deleteWorkspacePath(
+			c.env.PROJECT_WORKSPACE_BUCKET,
+			projectId,
+			pathResult.path,
+		);
 		return c.json({
 			ok: true,
+			deleted,
 			signature,
 		});
 	});

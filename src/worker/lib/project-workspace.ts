@@ -4,6 +4,9 @@ const WORKSPACE_DIRECTORY_MARKER = ".keep";
 /** 单次 workspace 列表最大返回对象数。 */
 const WORKSPACE_LIST_LIMIT = 1_000;
 
+/** R2 批量删除的单批 key 数量，和列表分页保持同一量级。 */
+const WORKSPACE_DELETE_BATCH_SIZE = 1_000;
+
 /** workspace 操作签名默认有效期，单位秒。 */
 const WORKSPACE_SIGNATURE_TTL_SECONDS = 5 * 60;
 
@@ -36,6 +39,14 @@ export type WorkspaceTreeNode = {
 	size?: number;
 	/** R2 对象上传时间；目录没有该字段。 */
 	uploaded?: string;
+};
+
+/** workspace 删除结果。 */
+export type WorkspaceDeleteResult = {
+	/** 被请求删除的 workspace 路径。 */
+	path: string;
+	/** 提交给 R2 删除的对象数量。 */
+	deletedObjectCount: number;
 };
 
 /** 已签名 workspace 操作上下文。 */
@@ -326,17 +337,44 @@ export async function writeWorkspaceFile(
 }
 
 /**
- * 删除 workspace 文件或目录 marker。
+ * 删除 workspace 文件或目录。
  * @param bucket R2 bucket
  * @param projectId Project ID
  * @param path workspace 相对路径
+ * @returns 删除结果摘要
  */
 export async function deleteWorkspacePath(
 	bucket: R2Bucket,
 	projectId: string,
 	path: string,
-): Promise<void> {
-	await bucket.delete(buildWorkspaceObjectKey(projectId, normalizeWorkspacePath(path)));
+): Promise<WorkspaceDeleteResult> {
+	const normalizedPath = normalizeWorkspacePath(path);
+	const exactKey = buildWorkspaceObjectKey(projectId, normalizedPath);
+	const directoryPrefix = `${exactKey}/`;
+	const keysToDelete = new Set<string>([exactKey]);
+	let cursor: string | undefined;
+	do {
+		// R2 没有目录实体，目录删除需要按 prefix 找到 marker 和所有子对象。
+		const listed = await bucket.list({
+			prefix: directoryPrefix,
+			limit: WORKSPACE_LIST_LIMIT,
+			cursor,
+		});
+		for (const object of listed.objects) {
+			keysToDelete.add(object.key);
+		}
+		cursor = listed.truncated ? listed.cursor : undefined;
+	} while (cursor);
+
+	const keys = [...keysToDelete];
+	for (let index = 0; index < keys.length; index += WORKSPACE_DELETE_BATCH_SIZE) {
+		// Cloudflare R2 支持批量删除；分批避免单次提交过大。
+		await bucket.delete(keys.slice(index, index + WORKSPACE_DELETE_BATCH_SIZE));
+	}
+	return {
+		path: normalizedPath,
+		deletedObjectCount: keys.length,
+	};
 }
 
 /**
