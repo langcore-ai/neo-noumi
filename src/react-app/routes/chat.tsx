@@ -1,9 +1,19 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import {
+	hotkeysCoreFeature,
+	selectionFeature,
+	syncDataLoaderFeature,
+} from "@headless-tree/core";
+import { AssistiveTreeDescription, useTree } from "@headless-tree/react";
+import {
 	BotIcon,
 	CheckCircle2Icon,
+	ChevronDownIcon,
 	ChevronRightIcon,
 	ClockIcon,
+	Edit3Icon,
+	FileIcon,
+	FolderIcon,
 	Loader2Icon,
 	MessageSquarePlusIcon,
 	MoreHorizontalIcon,
@@ -13,8 +23,10 @@ import {
 	Trash2Icon,
 	UserIcon,
 	WrenchIcon,
+	XIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Tree, TreeItem, TreeItemLabel } from "@/components/tree";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
 	Avatar,
@@ -30,6 +42,37 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import {
+	ContextMenu,
+	ContextMenuContent,
+	ContextMenuGroup,
+	ContextMenuItem,
+	ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuGroup,
+	DropdownMenuItem,
+	DropdownMenuLabel,
+	DropdownMenuSeparator,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import {
+	ResizableHandle,
+	ResizablePanel,
+	ResizablePanelGroup,
+} from "@/components/ui/resizable";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { authClient } from "@/lib/auth-client";
@@ -97,11 +140,60 @@ interface SessionDetailResponse {
 	timeline: TimelineEvent[];
 }
 
+/** Project workspace 文件树节点。 */
+interface WorkspaceTreeNode {
+	path: string;
+	name: string;
+	type: "directory" | "file";
+	size?: number;
+	uploaded?: string;
+}
+
+/** workspace tree API 响应。 */
+interface WorkspaceTreeResponse {
+	workspace: {
+		nodes: WorkspaceTreeNode[];
+		truncated: boolean;
+		cursor?: string;
+	};
+}
+
+/** 前端文件树组件使用的数据项。 */
+interface WorkspaceTreeItem {
+	name: string;
+	path: string;
+	type: "directory" | "file";
+	children?: string[];
+	fileExtension?: string;
+	size?: number;
+	uploaded?: string;
+	isLoaded?: boolean;
+}
+
+/** 预览区打开的文件标签。 */
+interface OpenFileTab {
+	path: string;
+	name: string;
+}
+
+/** 文件重命名弹窗状态。 */
+interface RenameTarget {
+	path: string;
+	name: string;
+	type: "directory" | "file";
+}
+
 /** 默认会话标题，用户直接发送第一条消息时使用。 */
 const DEFAULT_SESSION_TITLE = "新的对话";
 
 /** 空输入占位文案。 */
 const MESSAGE_PLACEHOLDER = "描述你想完成的任务，或者粘贴错误、需求、代码片段。";
+
+/** 文件树根节点 ID。 */
+const WORKSPACE_ROOT_ID = "root";
+
+/** 文件树缩进宽度。 */
+const WORKSPACE_TREE_INDENT = 18;
 
 /**
  * 从 API 响应中读取错误消息。
@@ -111,6 +203,81 @@ const MESSAGE_PLACEHOLDER = "描述你想完成的任务，或者粘贴错误、
 async function readError(response: Response): Promise<string> {
 	const body = await response.json().catch(() => ({}));
 	return typeof body.error === "string" ? body.error : response.statusText;
+}
+
+/**
+ * 读取文件扩展名。
+ * @param name 文件名
+ * @returns 小写扩展名
+ */
+function getFileExtension(name: string): string | undefined {
+	const parts = name.split(".");
+	return parts.length > 1 ? parts[parts.length - 1]?.toLowerCase() : undefined;
+}
+
+/**
+ * 计算文件父目录路径。
+ * @param path workspace 相对路径
+ * @returns 父目录路径；根目录返回空字符串
+ */
+function getParentPath(path: string): string {
+	const index = path.lastIndexOf("/");
+	return index === -1 ? "" : path.slice(0, index);
+}
+
+/**
+ * 计算重命名后的 workspace 路径。
+ * @param path 原始路径
+ * @param nextName 新名称
+ * @returns 新路径
+ */
+function buildRenamedPath(path: string, nextName: string): string {
+	const parentPath = getParentPath(path);
+	return parentPath ? `${parentPath}/${nextName}` : nextName;
+}
+
+/**
+ * 判断一个路径是否命中目标路径或其子路径。
+ * @param path 待判断路径
+ * @param target 目标路径
+ * @returns 是否属于同一节点或子节点
+ */
+function isPathOrChild(path: string, target: string): boolean {
+	return path === target || path.startsWith(`${target}/`);
+}
+
+/**
+ * 将 workspace API 节点转换成文件树数据项。
+ * @param node workspace 节点
+ * @returns 文件树数据项
+ */
+function workspaceNodeToTreeItem(node: WorkspaceTreeNode): WorkspaceTreeItem {
+	return {
+		name: node.name,
+		path: node.path,
+		type: node.type,
+		children: node.type === "directory" ? [] : undefined,
+		fileExtension: node.type === "file" ? getFileExtension(node.name) : undefined,
+		size: node.size,
+		uploaded: node.uploaded,
+		isLoaded: node.type === "file",
+	};
+}
+
+/**
+ * 构造初始 workspace 文件树。
+ * @returns 文件树数据
+ */
+function createEmptyWorkspaceTree(): Record<string, WorkspaceTreeItem> {
+	return {
+		[WORKSPACE_ROOT_ID]: {
+			name: "workspace",
+			path: "",
+			type: "directory",
+			children: [],
+			isLoaded: false,
+		},
+	};
 }
 
 /**
@@ -412,12 +579,40 @@ function ChatPage() {
 	const [timelineStreamStatus, setTimelineStreamStatus] = useState<
 		"idle" | "connecting" | "open"
 	>("idle");
+	const [workspaceItems, setWorkspaceItems] = useState<Record<string, WorkspaceTreeItem>>(
+		createEmptyWorkspaceTree,
+	);
+	const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+	const [isWorkspaceLoading, setIsWorkspaceLoading] = useState(false);
+	const [isWorkspaceMutating, setIsWorkspaceMutating] = useState(false);
+	const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
+	const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
+	const [renamingTarget, setRenamingTarget] = useState<RenameTarget | null>(null);
+	const [renameValue, setRenameValue] = useState("");
+
+	const workspaceTree = useTree<WorkspaceTreeItem>({
+		dataLoader: {
+			getChildren: (itemId) => workspaceItems[itemId]?.children ?? [],
+			getItem: (itemId) => workspaceItems[itemId],
+		},
+		features: [syncDataLoaderFeature, selectionFeature, hotkeysCoreFeature],
+		getItemName: (item) => item.getItemData()?.name ?? "Unknown",
+		indent: WORKSPACE_TREE_INDENT,
+		initialState: {
+			expandedItems: [WORKSPACE_ROOT_ID],
+			selectedItems: activeFilePath ? [activeFilePath] : [],
+		},
+		isItemFolder: (item) => item.getItemData()?.type === "directory",
+		rootItemId: WORKSPACE_ROOT_ID,
+	});
 
 	const messages = useMemo(() => {
 		return buildMessages(clientEvents, timeline);
 	}, [clientEvents, timeline]);
 
 	const latestSessionTitle = session?.title || DEFAULT_SESSION_TITLE;
+	const activeFileTab = openFileTabs.find((tab) => tab.path === activeFilePath) ?? null;
+	const hasPreviewPanel = Boolean(activeFileTab);
 
 	/**
 	 * 关闭当前 chat stream。
@@ -483,6 +678,201 @@ function ChatPage() {
 		const body = (await response.json()) as { sessions: ChatSession[] };
 		setSessions(body.sessions);
 		return body.sessions;
+	}
+
+	/**
+	 * 加载指定目录下的 workspace 文件树节点。
+	 * @param projectId 项目 ID
+	 * @param prefix workspace 目录路径
+	 */
+	async function loadWorkspaceTree(projectId: string, prefix = "") {
+		setWorkspaceError(null);
+		setIsWorkspaceLoading(true);
+		try {
+			const query = prefix ? `?prefix=${encodeURIComponent(prefix)}` : "";
+			const response = await fetch(`/api/projects/${projectId}/workspace/tree${query}`);
+			if (!response.ok) {
+				throw new Error(await readError(response));
+			}
+			const body = (await response.json()) as WorkspaceTreeResponse;
+			setWorkspaceItems((current) => {
+				const parentId = prefix || WORKSPACE_ROOT_ID;
+				const nextItems = prefix ? { ...current } : createEmptyWorkspaceTree();
+				const childIds = body.workspace.nodes.map((node) => node.path);
+				for (const node of body.workspace.nodes) {
+					const previous = nextItems[node.path];
+					nextItems[node.path] = {
+						...workspaceNodeToTreeItem(node),
+						children: node.type === "directory" ? (previous?.children ?? []) : undefined,
+						isLoaded: node.type === "file" ? true : (previous?.isLoaded ?? false),
+					};
+				}
+					nextItems[parentId] = {
+						...(nextItems[parentId] ?? {
+							name: prefix ? prefix.split("/").pop() ?? prefix : "workspace",
+							path: prefix,
+							type: "directory",
+						}),
+					children: childIds,
+					isLoaded: true,
+				};
+				return nextItems;
+			});
+		} catch (err) {
+			setWorkspaceError(err instanceof Error ? err.message : "加载文件树失败");
+		} finally {
+			setIsWorkspaceLoading(false);
+		}
+	}
+
+	/**
+	 * 刷新当前 project 的 workspace 文件树。
+	 */
+	async function refreshWorkspaceTree() {
+		if (!project) {
+			return;
+		}
+		await loadWorkspaceTree(project.id);
+	}
+
+	/**
+	 * 切换当前 project，并同步重置文件与会话上下文。
+	 * @param nextProject 目标 project
+	 */
+	function selectProject(nextProject: Project) {
+		setProject(nextProject);
+		resetConversation();
+		setWorkspaceItems(createEmptyWorkspaceTree());
+		setOpenFileTabs([]);
+		setActiveFilePath(null);
+		setWorkspaceError(null);
+		void loadWorkspaceTree(nextProject.id);
+	}
+
+	/**
+	 * 选择文件树节点；目录会按需加载，文件会加入预览标签页。
+	 * @param item 文件树数据项
+	 */
+	async function selectWorkspaceItem(item: WorkspaceTreeItem) {
+		if (item.type === "directory") {
+			if (project && !item.isLoaded) {
+				await loadWorkspaceTree(project.id, item.path);
+			}
+			return;
+		}
+		setOpenFileTabs((current) => {
+			return current.some((tab) => tab.path === item.path)
+				? current
+				: [...current, { path: item.path, name: item.name }];
+		});
+		setActiveFilePath(item.path);
+	}
+
+	/**
+	 * 关闭文件预览标签。
+	 * @param path 文件路径
+	 */
+	function closeFileTab(path: string) {
+		setOpenFileTabs((current) => {
+			const nextTabs = current.filter((tab) => tab.path !== path);
+			if (activeFilePath === path) {
+				setActiveFilePath(nextTabs[nextTabs.length - 1]?.path ?? null);
+			}
+			return nextTabs;
+		});
+	}
+
+	/**
+	 * 删除 workspace 文件或目录。
+	 * @param item 文件树数据项
+	 */
+	async function deleteWorkspaceItem(item: WorkspaceTreeItem) {
+		if (!project || item.path === "") {
+			return;
+		}
+		setIsWorkspaceMutating(true);
+		setWorkspaceError(null);
+		try {
+			const response = await fetch(`/api/projects/${project.id}/workspace/file`, {
+				method: "DELETE",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ path: item.path }),
+			});
+			if (!response.ok) {
+				throw new Error(await readError(response));
+			}
+			setOpenFileTabs((current) =>
+				current.filter((tab) => !isPathOrChild(tab.path, item.path)),
+			);
+			if (activeFilePath && isPathOrChild(activeFilePath, item.path)) {
+				setActiveFilePath(null);
+			}
+			await refreshWorkspaceTree();
+		} catch (err) {
+			setWorkspaceError(err instanceof Error ? err.message : "删除失败");
+		} finally {
+			setIsWorkspaceMutating(false);
+		}
+	}
+
+	/**
+	 * 打开重命名弹窗。
+	 * @param item 文件树数据项
+	 */
+	function openRenameDialog(item: WorkspaceTreeItem) {
+		setRenamingTarget({ path: item.path, name: item.name, type: item.type });
+		setRenameValue(item.name);
+	}
+
+	/**
+	 * 提交 workspace 重命名。
+	 */
+	async function renameWorkspaceItem() {
+		if (!project || !renamingTarget) {
+			return;
+		}
+		const nextName = renameValue.trim();
+		if (!nextName || nextName === renamingTarget.name || nextName.includes("/")) {
+			return;
+		}
+		const nextPath = buildRenamedPath(renamingTarget.path, nextName);
+		setIsWorkspaceMutating(true);
+		setWorkspaceError(null);
+		try {
+			const response = await fetch(`/api/projects/${project.id}/workspace/move`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					fromPath: renamingTarget.path,
+					toPath: nextPath,
+				}),
+			});
+			if (!response.ok) {
+				throw new Error(await readError(response));
+			}
+			setOpenFileTabs((current) =>
+				current.map((tab) => {
+					if (!isPathOrChild(tab.path, renamingTarget.path)) {
+						return tab;
+					}
+					const suffix = tab.path.slice(renamingTarget.path.length);
+					return {
+						path: `${nextPath}${suffix}`,
+						name: tab.path === renamingTarget.path ? nextName : tab.name,
+					};
+				}),
+			);
+			if (activeFilePath && isPathOrChild(activeFilePath, renamingTarget.path)) {
+				const suffix = activeFilePath.slice(renamingTarget.path.length);
+				setActiveFilePath(`${nextPath}${suffix}`);
+			}
+			setRenamingTarget(null);
+			await refreshWorkspaceTree();
+		} catch (err) {
+			setWorkspaceError(err instanceof Error ? err.message : "重命名失败");
+		} finally {
+			setIsWorkspaceMutating(false);
+		}
 	}
 
 	/**
@@ -759,6 +1149,7 @@ function ChatPage() {
 				const loadedSessions = await loadSessions(firstProject?.id);
 				if (firstProject) {
 					setProject(firstProject);
+					await loadWorkspaceTree(firstProject.id);
 				}
 				if (loadedSessions[0]) {
 					await loadSession(loadedSessions[0].id);
@@ -832,283 +1223,485 @@ function ChatPage() {
 	}
 
 	return (
-		<main className="flex h-dvh overflow-hidden bg-background text-foreground">
-			<aside className="hidden min-h-0 w-80 shrink-0 border-r bg-muted/25 lg:flex lg:flex-col">
-				<div className="flex shrink-0 items-center justify-between gap-3 border-b p-4">
-					<div>
-						<h1 className="text-base font-semibold">Neo Noumi Chat</h1>
-						<p className="text-sm text-muted-foreground">
-							{project?.name ?? "默认工作区"}
-						</p>
-					</div>
-					<Link to="/" className={buttonVariants({ variant: "outline", size: "sm" })}>
-						首页
-					</Link>
-				</div>
-
-				<div className="flex shrink-0 flex-col gap-3 p-4">
-					<Button onClick={startNewConversation}>
-						<MessageSquarePlusIcon data-icon="inline-start" />
-						新对话
-					</Button>
-					{projects.length > 1 ? (
-						<div className="flex flex-col gap-2">
-							<p className="text-xs font-medium text-muted-foreground">工作区</p>
-							{projects.map((item) => (
-								<Button
-									key={item.id}
-									variant={project?.id === item.id ? "secondary" : "ghost"}
-									className="justify-start"
-									onClick={() => {
-										setProject(item);
-										resetConversation();
-									}}
-								>
-									{item.name}
-								</Button>
-							))}
-						</div>
-					) : null}
-				</div>
-
-				<div className="flex min-h-0 flex-1 flex-col gap-2 overflow-auto px-3 pb-4">
-					<p className="px-1 text-xs font-medium text-muted-foreground">历史对话</p>
-					{isBootstrapping ? (
-						<div className="flex flex-col gap-2">
-							<Skeleton className="h-14" />
-							<Skeleton className="h-14" />
-							<Skeleton className="h-14" />
-						</div>
-					) : sessions.length === 0 ? (
-						<div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-							还没有会话，发送第一条消息即可开始。
-						</div>
-					) : (
-						sessions.map((item) => (
-							<div
-								key={item.id}
-								className={cn(
-									"grid grid-cols-[minmax(0,1fr)_auto] gap-1 rounded-lg p-1",
-									session?.id === item.id ? "bg-background shadow-sm" : "hover:bg-muted",
-								)}
-							>
-								<button
-									type="button"
-									className="min-w-0 rounded-md px-2 py-2 text-left"
-									onClick={() => void loadSession(item.id)}
-								>
-									<span className="block truncate text-sm font-medium">
-										{item.title || DEFAULT_SESSION_TITLE}
-									</span>
-									<span className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
-										<ClockIcon />
-										{new Date(item.updatedAt).toLocaleDateString()}
-									</span>
-								</button>
-								<Button
-									variant="ghost"
-									size="icon-sm"
-									aria-label={`删除 ${item.title || DEFAULT_SESSION_TITLE}`}
-									onClick={() => void deleteSession(item.id)}
-								>
-									<Trash2Icon />
-								</Button>
-							</div>
-						))
-					)}
-				</div>
-			</aside>
-
-			<section className="flex min-h-0 min-w-0 flex-1 flex-col">
-				<header className="flex shrink-0 items-center justify-between gap-3 border-b px-4 py-3">
-					<div className="min-w-0">
-						<div className="flex items-center gap-2">
-							<h2 className="truncate text-base font-semibold">{latestSessionTitle}</h2>
-							{timelineStreamStatus === "open" || isSending ? (
-								<Badge variant="secondary">
-									<Loader2Icon data-icon="inline-start" />
-									运行中
-								</Badge>
-							) : (
-								<Badge variant="outline">
-									<CheckCircle2Icon data-icon="inline-start" />
-									就绪
-								</Badge>
-							)}
-						</div>
-						<p className="truncate text-sm text-muted-foreground">
-							{session?.id ?? "发送消息后会自动创建会话"}
-						</p>
-					</div>
-					<div className="flex items-center gap-2">
-						<Link
-							to="/"
-							className={buttonVariants({
-								variant: "outline",
-								size: "sm",
-								className: "hidden sm:inline-flex",
-							})}
-						>
-							首页
-						</Link>
-						<Button variant="outline" size="sm" onClick={startNewConversation}>
-							<MessageSquarePlusIcon data-icon="inline-start" />
-							新对话
-						</Button>
-						<Button
-							variant="outline"
-							size="sm"
-							disabled={!session}
-							onClick={() => void callContainer("status")}
-						>
-							<RefreshCwIcon data-icon="inline-start" />
-							状态
-						</Button>
-						<Button
-							variant="outline"
-							size="sm"
-							disabled={!session}
-							onClick={() => void callContainer("stop")}
-						>
-							<SquareIcon data-icon="inline-start" />
-							停止容器
-						</Button>
-					</div>
-				</header>
-
-				<div className="shrink-0 border-b bg-muted/20 px-4 py-3 lg:hidden">
-					<div className="flex gap-2 overflow-x-auto">
-						{sessions.length === 0 ? (
-							<span className="text-sm text-muted-foreground">
-								暂无历史对话
-							</span>
-						) : (
-							sessions.map((item) => (
-								<Button
-									key={item.id}
-									variant={session?.id === item.id ? "secondary" : "outline"}
-									size="sm"
-									className="max-w-56 shrink-0"
-									onClick={() => void loadSession(item.id)}
-								>
-									<span className="truncate">
-										{item.title || DEFAULT_SESSION_TITLE}
-									</span>
-								</Button>
-							))
-						)}
-					</div>
-				</div>
-
-				<div className="min-h-0 flex-1 overflow-auto px-4 py-6">
-					<div className="mx-auto flex max-w-4xl flex-col gap-4">
-						{error ? (
-							<Alert variant="destructive">
-								<AlertTitle>操作失败</AlertTitle>
-								<AlertDescription>{error}</AlertDescription>
-							</Alert>
-						) : null}
-
-						{containerStatus ? (
-							<Card size="sm">
-								<CardHeader>
-									<CardTitle className="flex items-center gap-2">
-										<WrenchIcon />
-										运行状态
-									</CardTitle>
-									<CardDescription>容器状态的原始摘要。</CardDescription>
-								</CardHeader>
-								<CardContent>
-									<pre className="max-h-44 overflow-auto rounded-lg bg-muted p-3 text-xs">
-										{JSON.stringify(containerStatus, null, 2)}
-									</pre>
-								</CardContent>
-							</Card>
-						) : null}
-
-						{isBootstrapping ? (
-							<div className="flex flex-col gap-4">
-								<Skeleton className="h-24" />
-								<Skeleton className="h-24" />
-								<Skeleton className="h-24" />
-							</div>
-						) : messages.length === 0 ? (
-							<div className="mx-auto flex min-h-[420px] max-w-2xl flex-col items-center justify-center gap-4 text-center">
-								<div className="flex size-12 items-center justify-center rounded-full bg-primary text-primary-foreground">
-									<BotIcon />
-								</div>
-								<div className="flex flex-col gap-2">
-									<h3 className="text-2xl font-semibold">开始一次真实对话</h3>
-									<p className="text-muted-foreground">
-										直接描述要完成的任务。系统会自动创建会话、启动 Sandbox，并把
-										Claude Code 的回复持续写回这里。
+		<main className="h-dvh overflow-hidden bg-background text-foreground">
+			<ResizablePanelGroup orientation="horizontal" className="h-full">
+				<ResizablePanel
+					defaultSize={hasPreviewPanel ? 33 : 50}
+					minSize={22}
+					maxSize={45}
+					className="min-w-72"
+				>
+					<section className="flex h-full min-h-0 flex-col border-r bg-muted/20">
+						<header className="flex shrink-0 flex-col gap-3 border-b p-4">
+							<div className="flex items-center justify-between gap-3">
+								<div className="min-w-0">
+									<h1 className="truncate text-base font-semibold">Neo Noumi Chat</h1>
+									<p className="truncate text-sm text-muted-foreground">
+										{project?.name ?? "默认工作区"}
 									</p>
 								</div>
-								<div className="grid w-full gap-2 text-left sm:grid-cols-3">
-									{[
-										"帮我定位一个前端报错",
-										"根据需求实现一个页面",
-										"解释这段代码的风险",
-									].map((suggestion) => (
-										<Button
-											key={suggestion}
-											variant="outline"
-											className="h-auto justify-between whitespace-normal py-3 text-left"
-											onClick={() => setDraft(suggestion)}
+								<Link to="/" className={buttonVariants({ variant: "outline", size: "sm" })}>
+									首页
+								</Link>
+							</div>
+							<DropdownMenu>
+								<DropdownMenuTrigger
+									render={
+										<Button variant="outline" className="w-full justify-between" />
+									}
+								>
+									<span className="truncate">{project?.name ?? "选择工作区"}</span>
+									<ChevronDownIcon data-icon="inline-end" />
+								</DropdownMenuTrigger>
+								<DropdownMenuContent className="w-72">
+									<DropdownMenuLabel>工作区</DropdownMenuLabel>
+									<DropdownMenuGroup>
+										{projects.map((item) => (
+											<DropdownMenuItem
+												key={item.id}
+												onClick={() => selectProject(item)}
+											>
+												<span className="truncate">{item.name}</span>
+											</DropdownMenuItem>
+										))}
+									</DropdownMenuGroup>
+								</DropdownMenuContent>
+							</DropdownMenu>
+						</header>
+
+						<div className="flex shrink-0 items-center justify-between gap-2 border-b px-4 py-3">
+							<p className="text-sm font-medium">工作区文件</p>
+							<Button
+								variant="outline"
+								size="sm"
+								disabled={!project || isWorkspaceLoading}
+								onClick={() => void refreshWorkspaceTree()}
+							>
+								<RefreshCwIcon
+									data-icon="inline-start"
+									className={cn(isWorkspaceLoading && "animate-spin")}
+								/>
+								刷新
+							</Button>
+						</div>
+
+						<ScrollArea className="min-h-0 flex-1">
+							<div className="flex min-h-full flex-col gap-3 p-3">
+								{workspaceError ? (
+									<Alert variant="destructive">
+										<AlertTitle>文件树加载失败</AlertTitle>
+										<AlertDescription>{workspaceError}</AlertDescription>
+									</Alert>
+								) : null}
+								{isWorkspaceLoading && workspaceItems[WORKSPACE_ROOT_ID]?.children?.length === 0 ? (
+									<div className="flex flex-col gap-2">
+										<Skeleton className="h-8" />
+										<Skeleton className="h-8" />
+										<Skeleton className="h-8" />
+									</div>
+								) : null}
+								<Tree tree={workspaceTree} indent={WORKSPACE_TREE_INDENT} className="gap-0.5">
+									<AssistiveTreeDescription tree={workspaceTree} />
+									{workspaceTree
+										.getItems()
+										.filter((item) => item.getId() !== WORKSPACE_ROOT_ID)
+										.map((item) => {
+											const data = item.getItemData();
+											if (!data) {
+												return null;
+											}
+											const isActive = activeFilePath === data.path;
+											return (
+												<ContextMenu key={item.getId()}>
+													<ContextMenuTrigger className="block">
+														<TreeItem item={item} className="w-full">
+															<TreeItemLabel
+																className={cn(
+																	"w-full justify-start rounded-md bg-transparent",
+																	isActive && "bg-accent text-accent-foreground",
+																)}
+																onClick={(event) => {
+																	event.preventDefault();
+																	event.stopPropagation();
+																	if (data.type === "directory") {
+																		if (item.isExpanded()) {
+																			item.collapse();
+																		} else {
+																			item.expand();
+																		}
+																	}
+																	void selectWorkspaceItem(data);
+																}}
+															>
+																{data.type === "directory" ? (
+																	<FolderIcon className="text-muted-foreground" />
+																) : (
+																	<FileIcon className="text-muted-foreground" />
+																)}
+																<span className="truncate">{data.name}</span>
+															</TreeItemLabel>
+														</TreeItem>
+													</ContextMenuTrigger>
+													<ContextMenuContent>
+														<ContextMenuGroup>
+															<ContextMenuItem onClick={() => openRenameDialog(data)}>
+																<Edit3Icon />
+																重命名
+															</ContextMenuItem>
+															<ContextMenuItem
+																variant="destructive"
+																disabled={isWorkspaceMutating}
+																onClick={() => void deleteWorkspaceItem(data)}
+															>
+																<Trash2Icon />
+																删除
+															</ContextMenuItem>
+														</ContextMenuGroup>
+													</ContextMenuContent>
+												</ContextMenu>
+											);
+										})}
+								</Tree>
+								{!isWorkspaceLoading &&
+								!workspaceError &&
+								workspaceItems[WORKSPACE_ROOT_ID]?.children?.length === 0 ? (
+									<div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+										当前工作区还没有文件。
+									</div>
+								) : null}
+							</div>
+						</ScrollArea>
+					</section>
+				</ResizablePanel>
+
+				<ResizableHandle withHandle />
+
+				{hasPreviewPanel ? (
+					<>
+						<ResizablePanel
+							defaultSize={34}
+							minSize={24}
+							maxSize={50}
+							className="min-w-80"
+						>
+							<section className="flex h-full min-h-0 flex-col border-r bg-background">
+								<div className="flex shrink-0 items-end gap-1 overflow-x-auto border-b bg-muted/20 px-3 pt-3">
+									{openFileTabs.map((tab) => (
+										<button
+											key={tab.path}
+											type="button"
+											className={cn(
+												"flex h-9 max-w-56 min-w-32 items-center gap-2 rounded-t-md border px-3 text-sm",
+												activeFilePath === tab.path
+													? "border-b-background bg-background"
+													: "bg-muted text-muted-foreground hover:bg-background",
+											)}
+											onClick={() => setActiveFilePath(tab.path)}
 										>
-											{suggestion}
-											<ChevronRightIcon data-icon="inline-end" />
-										</Button>
+											<span className="truncate">{tab.name}</span>
+											<XIcon
+												className="shrink-0"
+												onClick={(event) => {
+													event.stopPropagation();
+													closeFileTab(tab.path);
+												}}
+											/>
+										</button>
 									))}
 								</div>
-							</div>
-						) : (
-							messages.map((message) => (
-								<MessageBubble key={message.id} message={message} />
-							))
-						)}
+								<div className="flex min-h-0 flex-1 items-center justify-center p-6">
+									<div className="flex max-w-sm flex-col items-center gap-3 text-center">
+										<div className="flex size-12 items-center justify-center rounded-full bg-muted">
+											<FileIcon className="text-muted-foreground" />
+										</div>
+										<div className="flex flex-col gap-1">
+											<h2 className="break-all text-base font-semibold">
+												{activeFileTab?.name}
+											</h2>
+											<p className="break-all text-xs text-muted-foreground">
+												{activeFileTab?.path}
+											</p>
+										</div>
+										<p className="text-sm text-muted-foreground">
+											文件预览能力待接入，当前仅保留选中文件占位。
+										</p>
+									</div>
+								</div>
+							</section>
+						</ResizablePanel>
+						<ResizableHandle withHandle />
+					</>
+				) : null}
 
-						{isSending ? (
-							<div className="flex items-center gap-3 text-sm text-muted-foreground">
-								<Loader2Icon className="animate-spin" />
-								正在等待回复...
-							</div>
-						) : null}
-						<div ref={messagesEndRef} />
-					</div>
-				</div>
-
-				<footer className="shrink-0 border-t bg-background px-4 py-4">
-					<div className="mx-auto flex max-w-4xl flex-col gap-3">
-						<div className="rounded-xl border bg-card p-2 shadow-sm">
-							<Textarea
-								value={draft}
-								disabled={isSending}
-								className="min-h-24 resize-none border-0 bg-transparent shadow-none focus-visible:ring-0"
-								placeholder={MESSAGE_PLACEHOLDER}
-								onChange={(event) => setDraft(event.target.value)}
-								onKeyDown={(event) => {
-									if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-										event.preventDefault();
-										void sendMessage();
-									}
-								}}
-							/>
-							<div className="flex items-center justify-between gap-3 px-1 pb-1">
-								<p className="text-xs text-muted-foreground">按 Cmd/Ctrl + Enter 发送</p>
-								<Button disabled={!draft.trim() || isSending} onClick={sendMessage}>
-									{isSending ? (
-										<Loader2Icon data-icon="inline-start" className="animate-spin" />
+				<ResizablePanel
+					defaultSize={hasPreviewPanel ? 33 : 50}
+					minSize={30}
+					maxSize={60}
+					className="min-w-96"
+				>
+					<section className="flex h-full min-h-0 min-w-0 flex-col">
+						<header className="flex shrink-0 items-center justify-between gap-3 border-b px-4 py-3">
+							<div className="min-w-0 flex-1">
+								<div className="flex items-center gap-2">
+									<DropdownMenu>
+										<DropdownMenuTrigger
+											render={
+												<Button
+													variant="ghost"
+													className="min-w-0 max-w-full justify-start px-1"
+												/>
+											}
+										>
+											<span className="truncate text-base font-semibold">
+												{latestSessionTitle}
+											</span>
+											<ChevronDownIcon data-icon="inline-end" />
+										</DropdownMenuTrigger>
+										<DropdownMenuContent className="w-80">
+											<DropdownMenuLabel>当前项目会话</DropdownMenuLabel>
+											<DropdownMenuGroup>
+												{sessions.length === 0 ? (
+													<DropdownMenuItem disabled>暂无历史对话</DropdownMenuItem>
+												) : (
+													sessions.map((item) => (
+														<DropdownMenuItem
+															key={item.id}
+															onClick={() => void loadSession(item.id)}
+														>
+															<div className="flex min-w-0 flex-col">
+																<span className="truncate">
+																	{item.title || DEFAULT_SESSION_TITLE}
+																</span>
+																<span className="flex items-center gap-1 text-xs text-muted-foreground">
+																	<ClockIcon />
+																	{new Date(item.updatedAt).toLocaleDateString()}
+																</span>
+															</div>
+														</DropdownMenuItem>
+													))
+												)}
+											</DropdownMenuGroup>
+											<DropdownMenuSeparator />
+											<DropdownMenuItem onClick={startNewConversation}>
+												<MessageSquarePlusIcon />
+												新对话
+											</DropdownMenuItem>
+											{session ? (
+												<DropdownMenuItem
+													variant="destructive"
+													onClick={() => void deleteSession(session.id)}
+												>
+													<Trash2Icon />
+													删除当前会话
+												</DropdownMenuItem>
+											) : null}
+										</DropdownMenuContent>
+									</DropdownMenu>
+									{timelineStreamStatus === "open" || isSending ? (
+										<Badge variant="secondary">
+											<Loader2Icon data-icon="inline-start" />
+											运行中
+										</Badge>
 									) : (
-										<SendIcon data-icon="inline-start" />
+										<Badge variant="outline">
+											<CheckCircle2Icon data-icon="inline-start" />
+											就绪
+										</Badge>
 									)}
-									发送
+								</div>
+								<p className="truncate text-sm text-muted-foreground">
+									{session?.id ?? "发送消息后会自动创建会话"}
+								</p>
+							</div>
+							<div className="flex shrink-0 items-center gap-2">
+								<Button variant="outline" size="sm" onClick={startNewConversation}>
+									<MessageSquarePlusIcon data-icon="inline-start" />
+									新对话
+								</Button>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={!session}
+									onClick={() => void callContainer("status")}
+								>
+									<RefreshCwIcon data-icon="inline-start" />
+									状态
+								</Button>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={!session}
+									onClick={() => void callContainer("stop")}
+								>
+									<SquareIcon data-icon="inline-start" />
+									停止容器
 								</Button>
 							</div>
-						</div>
-					</div>
-				</footer>
-			</section>
+						</header>
+
+						<ScrollArea className="min-h-0 flex-1">
+							<div className="mx-auto flex max-w-4xl flex-col gap-4 px-4 py-6">
+								{error ? (
+									<Alert variant="destructive">
+										<AlertTitle>操作失败</AlertTitle>
+										<AlertDescription>{error}</AlertDescription>
+									</Alert>
+								) : null}
+
+								{containerStatus ? (
+									<Card size="sm">
+										<CardHeader>
+											<CardTitle className="flex items-center gap-2">
+												<WrenchIcon />
+												运行状态
+											</CardTitle>
+											<CardDescription>容器状态的原始摘要。</CardDescription>
+										</CardHeader>
+										<CardContent>
+											<pre className="max-h-44 overflow-auto rounded-lg bg-muted p-3 text-xs">
+												{JSON.stringify(containerStatus, null, 2)}
+											</pre>
+										</CardContent>
+									</Card>
+								) : null}
+
+								{isBootstrapping ? (
+									<div className="flex flex-col gap-4">
+										<Skeleton className="h-24" />
+										<Skeleton className="h-24" />
+										<Skeleton className="h-24" />
+									</div>
+								) : messages.length === 0 ? (
+									<div className="mx-auto flex min-h-[420px] max-w-2xl flex-col items-center justify-center gap-4 text-center">
+										<div className="flex size-12 items-center justify-center rounded-full bg-primary text-primary-foreground">
+											<BotIcon />
+										</div>
+										<div className="flex flex-col gap-2">
+											<h3 className="text-2xl font-semibold">开始一次真实对话</h3>
+											<p className="text-muted-foreground">
+												直接描述要完成的任务。系统会自动创建会话、启动 Sandbox，并把
+												Claude Code 的回复持续写回这里。
+											</p>
+										</div>
+										<div className="grid w-full gap-2 text-left sm:grid-cols-3">
+											{[
+												"帮我定位一个前端报错",
+												"根据需求实现一个页面",
+												"解释这段代码的风险",
+											].map((suggestion) => (
+												<Button
+													key={suggestion}
+													variant="outline"
+													className="h-auto justify-between whitespace-normal py-3 text-left"
+													onClick={() => setDraft(suggestion)}
+												>
+													{suggestion}
+													<ChevronRightIcon data-icon="inline-end" />
+												</Button>
+											))}
+										</div>
+									</div>
+								) : (
+									messages.map((message) => (
+										<MessageBubble key={message.id} message={message} />
+									))
+								)}
+
+								{isSending ? (
+									<div className="flex items-center gap-3 text-sm text-muted-foreground">
+										<Loader2Icon className="animate-spin" />
+										正在等待回复...
+									</div>
+								) : null}
+								<div ref={messagesEndRef} />
+							</div>
+						</ScrollArea>
+
+						<footer className="shrink-0 border-t bg-background px-4 py-4">
+							<div className="mx-auto flex max-w-4xl flex-col gap-3">
+								<div className="rounded-xl border bg-card p-2 shadow-sm">
+									<Textarea
+										value={draft}
+										disabled={isSending}
+										className="min-h-24 resize-none border-0 bg-transparent shadow-none focus-visible:ring-0"
+										placeholder={MESSAGE_PLACEHOLDER}
+										onChange={(event) => setDraft(event.target.value)}
+										onKeyDown={(event) => {
+											if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+												event.preventDefault();
+												void sendMessage();
+											}
+										}}
+									/>
+									<div className="flex items-center justify-between gap-3 px-1 pb-1">
+										<p className="text-xs text-muted-foreground">按 Cmd/Ctrl + Enter 发送</p>
+										<Button disabled={!draft.trim() || isSending} onClick={sendMessage}>
+											{isSending ? (
+												<Loader2Icon data-icon="inline-start" className="animate-spin" />
+											) : (
+												<SendIcon data-icon="inline-start" />
+											)}
+											发送
+										</Button>
+									</div>
+								</div>
+							</div>
+						</footer>
+					</section>
+				</ResizablePanel>
+			</ResizablePanelGroup>
+
+			<Dialog
+				open={Boolean(renamingTarget)}
+				onOpenChange={(open) => {
+					if (!open) {
+						setRenamingTarget(null);
+					}
+				}}
+			>
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle>重命名</DialogTitle>
+						<DialogDescription>
+							请输入新的{renamingTarget?.type === "directory" ? "目录" : "文件"}名称。
+						</DialogDescription>
+					</DialogHeader>
+					<Input
+						value={renameValue}
+						disabled={isWorkspaceMutating}
+						onChange={(event) => setRenameValue(event.target.value)}
+						onKeyDown={(event) => {
+							if (event.key === "Enter") {
+								event.preventDefault();
+								void renameWorkspaceItem();
+							}
+						}}
+					/>
+					<DialogFooter>
+						<Button
+							variant="outline"
+							disabled={isWorkspaceMutating}
+							onClick={() => setRenamingTarget(null)}
+						>
+							取消
+						</Button>
+						<Button
+							disabled={
+								isWorkspaceMutating ||
+								!renameValue.trim() ||
+								renameValue.trim() === renamingTarget?.name ||
+								renameValue.includes("/")
+							}
+							onClick={() => void renameWorkspaceItem()}
+						>
+							{isWorkspaceMutating ? (
+								<Loader2Icon data-icon="inline-start" className="animate-spin" />
+							) : null}
+							保存
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 		</main>
 	);
 }
