@@ -1,3 +1,5 @@
+import { AwsClient } from "aws4fetch";
+
 /** R2 中标记空目录的占位文件名。 */
 const WORKSPACE_DIRECTORY_MARKER = ".keep";
 
@@ -10,11 +12,21 @@ const WORKSPACE_DELETE_BATCH_SIZE = 1_000;
 /** workspace 操作签名默认有效期，单位秒。 */
 const WORKSPACE_SIGNATURE_TTL_SECONDS = 5 * 60;
 
+/** R2 直传 URL 默认有效期，单位秒。 */
+export const WORKSPACE_UPLOAD_URL_TTL_SECONDS = 15 * 60;
+
+/** 单次直传签名最大文件数量。 */
+export const WORKSPACE_UPLOAD_MAX_FILES = 500;
+
+/** 单个直传文件最大大小，单位字节。 */
+export const WORKSPACE_UPLOAD_MAX_FILE_SIZE = 100 * 1024 * 1024;
+
 /** workspace 支持的操作类型。 */
 type WorkspaceOperation =
 	| "list"
 	| "read"
 	| "write"
+	| "upload"
 	| "delete"
 	| "move"
 	| "mkdir";
@@ -25,6 +37,14 @@ export interface ProjectWorkspaceBindings {
 	PROJECT_WORKSPACE_BUCKET: R2Bucket;
 	/** workspace 操作签名密钥。 */
 	WORKSPACE_SIGNING_SECRET?: string;
+	/** Cloudflare 账号 ID，用于构造 R2 S3 API endpoint。 */
+	R2_ACCOUNT_ID?: string;
+	/** R2 S3 API access key ID，用于生成前端直传 URL。 */
+	R2_ACCESS_KEY_ID?: string;
+	/** R2 S3 API secret access key，用于生成前端直传 URL。 */
+	R2_SECRET_ACCESS_KEY?: string;
+	/** Project workspace R2 bucket 名称，用于生成前端直传 URL。 */
+	PROJECT_WORKSPACE_BUCKET_NAME?: string;
 }
 
 /** workspace 文件树节点。 */
@@ -47,6 +67,30 @@ export type WorkspaceDeleteResult = {
 	path: string;
 	/** 提交给 R2 删除的对象数量。 */
 	deletedObjectCount: number;
+};
+
+/** workspace 上传 URL 输入。 */
+export type WorkspaceUploadUrlInput = {
+	/** 相对目标目录的文件路径，文件夹上传时包含子目录。 */
+	relativePath: string;
+	/** 文件大小，单位字节。 */
+	size: number;
+	/** 文件 MIME 类型。 */
+	contentType?: string;
+};
+
+/** workspace 直传 URL。 */
+export type WorkspaceUploadUrl = {
+	/** 文件 workspace 相对路径。 */
+	path: string;
+	/** 前端直接 PUT 到 R2 的短期签名 URL。 */
+	uploadUrl: string;
+	/** 上传方法。 */
+	method: "PUT";
+	/** 前端上传时必须携带的请求头。 */
+	headers: Record<string, string>;
+	/** 签名过期 Unix 秒时间戳。 */
+	expiresAt: number;
 };
 
 /** 已签名 workspace 操作上下文。 */
@@ -111,6 +155,63 @@ export function buildWorkspaceObjectKey(projectId: string, path = ""): string {
 function directoryMarkerPath(directoryPath: string): string {
 	const normalizedPath = normalizeWorkspacePath(directoryPath);
 	return `${normalizedPath}/${WORKSPACE_DIRECTORY_MARKER}`;
+}
+
+/**
+ * 拼接上传目标路径。
+ * @param basePath 目标父目录路径
+ * @param relativePath 上传文件相对路径
+ * @returns workspace 相对路径
+ */
+function buildWorkspaceUploadPath(basePath: string, relativePath: string): string {
+	const normalizedBasePath = normalizeWorkspacePath(basePath, { allowEmpty: true });
+	const normalizedRelativePath = normalizeWorkspacePath(relativePath);
+	return normalizedBasePath
+		? `${normalizedBasePath}/${normalizedRelativePath}`
+		: normalizedRelativePath;
+}
+
+/**
+ * 编码 R2 S3 API 路径，保留 workspace 目录分隔符。
+ * @param path R2 key 或 bucket/key 路径
+ * @returns URL path 安全字符串
+ */
+function encodeR2Path(path: string): string {
+	return path.split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * 创建 R2 S3 API 签名客户端。
+ * @param env Worker 绑定
+ * @returns AWS V4 签名客户端
+ */
+function createR2SigningClient(
+	env: Pick<
+		ProjectWorkspaceBindings,
+		"R2_ACCESS_KEY_ID" | "R2_SECRET_ACCESS_KEY"
+	>,
+): AwsClient {
+	if (!env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
+		throw new Error("R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY are required");
+	}
+	return new AwsClient({
+		accessKeyId: env.R2_ACCESS_KEY_ID,
+		secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+		region: "auto",
+		service: "s3",
+	});
+}
+
+/**
+ * 构造 R2 S3 API 对象 URL。
+ * @param accountId Cloudflare 账号 ID
+ * @param bucketName R2 bucket 名称
+ * @param key R2 object key
+ * @returns R2 S3 API URL
+ */
+function buildR2ObjectUrl(accountId: string, bucketName: string, key: string): string {
+	const encodedPath = encodeR2Path(`${bucketName}/${key}`);
+	return `https://${accountId}.r2.cloudflarestorage.com/${encodedPath}`;
 }
 
 /**
@@ -333,6 +434,85 @@ export async function writeWorkspaceFile(
 		size: object.size,
 		etag: object.etag,
 		uploaded: object.uploaded.toISOString(),
+	};
+}
+
+/**
+ * 批量生成 workspace 文件直传 URL。
+ * @param env R2 签名所需 Worker 绑定
+ * @param projectId Project ID
+ * @param basePath 目标父目录路径
+ * @param files 上传文件列表
+ * @returns 直传 URL 列表
+ */
+export async function createWorkspaceUploadUrls(
+	env: Pick<
+		ProjectWorkspaceBindings,
+		| "R2_ACCOUNT_ID"
+		| "R2_ACCESS_KEY_ID"
+		| "R2_SECRET_ACCESS_KEY"
+		| "PROJECT_WORKSPACE_BUCKET_NAME"
+	>,
+	projectId: string,
+	basePath: string,
+	files: WorkspaceUploadUrlInput[],
+): Promise<{ basePath: string; files: WorkspaceUploadUrl[] }> {
+	if (!env.R2_ACCOUNT_ID) {
+		throw new Error("R2_ACCOUNT_ID is required");
+	}
+	if (!env.PROJECT_WORKSPACE_BUCKET_NAME) {
+		throw new Error("PROJECT_WORKSPACE_BUCKET_NAME is required");
+	}
+	if (files.length > WORKSPACE_UPLOAD_MAX_FILES) {
+		throw new Error(`Workspace upload cannot exceed ${WORKSPACE_UPLOAD_MAX_FILES} files`);
+	}
+	const normalizedBasePath = normalizeWorkspacePath(basePath, { allowEmpty: true });
+	const signer = createR2SigningClient(env);
+	const expiresAt = Math.floor(Date.now() / 1000) + WORKSPACE_UPLOAD_URL_TTL_SECONDS;
+	const uploadUrls: WorkspaceUploadUrl[] = [];
+	for (const input of files) {
+		const targetPath = buildWorkspaceUploadPath(
+			normalizedBasePath,
+			input.relativePath,
+		);
+		if (!Number.isSafeInteger(input.size) || input.size < 0) {
+			throw new Error("Workspace upload file size is invalid");
+		}
+		if (input.size > WORKSPACE_UPLOAD_MAX_FILE_SIZE) {
+			throw new Error("Workspace upload file exceeds the maximum size");
+		}
+		const contentType = input.contentType || "application/octet-stream";
+		const uploadUrl = new URL(
+			buildR2ObjectUrl(
+				env.R2_ACCOUNT_ID,
+				env.PROJECT_WORKSPACE_BUCKET_NAME,
+				buildWorkspaceObjectKey(projectId, targetPath),
+			),
+		);
+		uploadUrl.searchParams.set(
+			"X-Amz-Expires",
+			String(WORKSPACE_UPLOAD_URL_TTL_SECONDS),
+		);
+		const signed = await signer.sign(
+			uploadUrl,
+			{
+				headers: { "content-type": contentType },
+				method: "PUT",
+				// R2 S3 presigned URL 通过 query 参数授权，浏览器无需持有密钥。
+				aws: { signQuery: true },
+			},
+		);
+		uploadUrls.push({
+			path: targetPath,
+			uploadUrl: signed.url,
+			method: "PUT",
+			headers: { "content-type": contentType },
+			expiresAt,
+		});
+	}
+	return {
+		basePath: normalizedBasePath,
+		files: uploadUrls,
 	};
 }
 

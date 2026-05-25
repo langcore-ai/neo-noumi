@@ -2,7 +2,11 @@ import { stream } from "hono/streaming";
 import type { Context, Hono } from "hono";
 import { createPrismaClient } from "./prisma";
 import { createAuth } from "./auth";
-import { CLAUDE_SESSION_STORE_PROJECT_KEY, CcrStore } from "./ccr-store";
+import {
+	CLAUDE_SESSION_STORE_PROJECT_KEY,
+	CcrStore,
+	ProjectNameConflictError,
+} from "./ccr-store";
 import {
 	destroyCcrSandbox,
 	getCcrSandboxStatus,
@@ -21,8 +25,12 @@ import {
 	normalizeWorkspacePath,
 	readWorkspaceFile,
 	signWorkspaceOperation,
+	createWorkspaceUploadUrls,
+	WORKSPACE_UPLOAD_MAX_FILE_SIZE,
+	WORKSPACE_UPLOAD_MAX_FILES,
 	writeWorkspaceFile,
 	type ProjectWorkspaceBindings,
+	type WorkspaceUploadUrlInput,
 } from "./project-workspace";
 import type { ChatMessageInput, WorkerInternalEvent, WorkerVisibleEvent } from "./ccr-types";
 import type { AuthBindings } from "./auth";
@@ -421,11 +429,19 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 	app.post("/api/projects", async (c) => {
 		const body = await readJsonObject(c.req.raw);
 		const store = createStore(c.env);
-		const project = await store.createProject(
-			c.get("userId"),
-			getStringField(body, "name"),
-			getStringField(body, "description"),
-		);
+		let project;
+		try {
+			project = await store.createProject(
+				c.get("userId"),
+				getStringField(body, "name"),
+				getStringField(body, "description"),
+			);
+		} catch (error) {
+			if (error instanceof ProjectNameConflictError) {
+				return c.json({ error: "Project name already exists" }, 409);
+			}
+			throw error;
+		}
 		return c.json({ project });
 	});
 
@@ -442,10 +458,18 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			name: hasName ? getStringField(body, "name") : undefined,
 			description: hasDescription ? getStringField(body, "description") : undefined,
 		};
-		const project = await store.updateProject(c.get("userId"), c.req.param("projectId"), {
-			name: input.name,
-			description: input.description,
-		});
+		let project;
+		try {
+			project = await store.updateProject(c.get("userId"), c.req.param("projectId"), {
+				name: input.name,
+				description: input.description,
+			});
+		} catch (error) {
+			if (error instanceof ProjectNameConflictError) {
+				return c.json({ error: "Project name already exists" }, 409);
+			}
+			throw error;
+		}
 		if (!project) {
 			return c.json({ error: "Project not found" }, 404);
 		}
@@ -607,6 +631,76 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		);
 		return c.json({
 			file,
+			signature,
+		});
+	});
+
+	app.post("/api/projects/:projectId/workspace/upload-urls", async (c) => {
+		const body = await readJsonObject(c.req.raw);
+		const store = createStore(c.env);
+		const userId = c.get("userId");
+		const projectId = c.req.param("projectId");
+		const project = await findOwnedProject(store, userId, projectId);
+		if (!project) {
+			return c.json({ error: "Project not found" }, 404);
+		}
+		const basePathResult = readWorkspaceRoutePath(getStringField(body, "basePath") ?? "", {
+			allowEmpty: true,
+		});
+		if ("error" in basePathResult) {
+			return c.json({ error: basePathResult.error }, 400);
+		}
+		const rawFiles = body.files;
+		if (!Array.isArray(rawFiles) || rawFiles.length === 0) {
+			return c.json({ error: "files are required" }, 400);
+		}
+		if (rawFiles.length > WORKSPACE_UPLOAD_MAX_FILES) {
+			return c.json({ error: `files cannot exceed ${WORKSPACE_UPLOAD_MAX_FILES}` }, 400);
+		}
+		const files: WorkspaceUploadUrlInput[] = [];
+		for (const rawFile of rawFiles) {
+			if (!isJsonObject(rawFile) || typeof rawFile.relativePath !== "string") {
+				return c.json({ error: "files[].relativePath is required" }, 400);
+			}
+			const pathResult = readWorkspaceRoutePath(rawFile.relativePath);
+			if ("error" in pathResult) {
+				return c.json({ error: pathResult.error }, 400);
+			}
+			if (
+				typeof rawFile.size !== "number" ||
+				!Number.isSafeInteger(rawFile.size) ||
+				rawFile.size < 0
+			) {
+				return c.json({ error: "files[].size is required" }, 400);
+			}
+			if (rawFile.size > WORKSPACE_UPLOAD_MAX_FILE_SIZE) {
+				return c.json({ error: "Workspace upload file exceeds the maximum size" }, 400);
+			}
+			const contentType =
+				typeof rawFile.contentType === "string" ? rawFile.contentType : undefined;
+			if (contentType && /[\r\n]/.test(contentType)) {
+				return c.json({ error: "files[].contentType is invalid" }, 400);
+			}
+			files.push({
+				relativePath: pathResult.path,
+				size: rawFile.size,
+				contentType,
+			});
+		}
+		const signature = await signWorkspaceOperation(c.env, {
+			operation: "upload",
+			projectId,
+			path: basePathResult.path,
+			body: JSON.stringify(files.map((file) => file.relativePath)),
+		});
+		const upload = await createWorkspaceUploadUrls(
+			c.env,
+			projectId,
+			basePathResult.path,
+			files,
+		);
+		return c.json({
+			upload,
 			signature,
 		});
 	});

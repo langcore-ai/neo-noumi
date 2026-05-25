@@ -13,8 +13,10 @@ import {
 	ClockIcon,
 	Edit3Icon,
 	FileIcon,
+	FileUpIcon,
 	FolderIcon,
 	FolderPlusIcon,
+	FolderUpIcon,
 	Loader2Icon,
 	MessageSquarePlusIcon,
 	MoreHorizontalIcon,
@@ -27,6 +29,9 @@ import {
 	XIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import WorkspaceUploadPanel, {
+	type WorkspaceUploadFile,
+} from "@/components/comp-549";
 import { Tree, TreeItem, TreeItemLabel } from "@/components/tree";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
@@ -159,6 +164,20 @@ interface WorkspaceTreeResponse {
 	};
 }
 
+/** workspace 直传 URL 响应。 */
+interface WorkspaceUploadUrlResponse {
+	upload: {
+		basePath: string;
+		files: Array<{
+			path: string;
+			uploadUrl: string;
+			method: "PUT";
+			headers: Record<string, string>;
+			expiresAt: number;
+		}>;
+	};
+}
+
 /** 前端文件树组件使用的数据项。 */
 interface WorkspaceTreeItem {
 	name: string;
@@ -189,6 +208,13 @@ interface RenameTarget {
 interface CreateDirectoryTarget {
 	parentPath: string;
 	parentName: string;
+}
+
+/** 上传弹窗状态。 */
+interface UploadTarget {
+	parentPath: string;
+	parentName: string;
+	mode: "files" | "directory";
 }
 
 /** 默认会话标题，用户直接发送第一条消息时使用。 */
@@ -610,6 +636,7 @@ function ChatPage() {
 	const [createDirectoryTarget, setCreateDirectoryTarget] =
 		useState<CreateDirectoryTarget | null>(null);
 	const [createDirectoryValue, setCreateDirectoryValue] = useState("新建文件夹");
+	const [uploadTarget, setUploadTarget] = useState<UploadTarget | null>(null);
 
 	const workspaceTree = useTree<WorkspaceTreeItem>({
 		dataLoader: {
@@ -859,6 +886,71 @@ function ChatPage() {
 			parentName: parent?.name ?? "根目录",
 		});
 		setCreateDirectoryValue("新建文件夹");
+	}
+
+	/**
+	 * 打开 workspace 上传弹窗。
+	 * @param mode 上传模式
+	 * @param parent 目标父目录；未传时上传到 workspace 根目录
+	 */
+	function openUploadDialog(mode: UploadTarget["mode"], parent?: WorkspaceTreeItem) {
+		setUploadTarget({
+			parentPath: parent?.path ?? "",
+			parentName: parent?.name ?? "根目录",
+			mode,
+		});
+	}
+
+	/**
+	 * 上传文件到当前 workspace。
+	 * @param files 需要上传的文件列表
+	 */
+	async function uploadWorkspaceFiles(files: WorkspaceUploadFile[]) {
+		if (!project || !uploadTarget || files.length === 0) {
+			return;
+		}
+		setIsWorkspaceMutating(true);
+		setWorkspaceError(null);
+		try {
+			const response = await fetch(`/api/projects/${project.id}/workspace/upload-urls`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					basePath: uploadTarget.parentPath,
+					files: files.map((item) => ({
+						relativePath: item.relativePath,
+						size: item.file.size,
+						contentType: item.file.type,
+					})),
+				}),
+			});
+			if (!response.ok) {
+				throw new Error(await readError(response));
+			}
+			const body = (await response.json()) as WorkspaceUploadUrlResponse;
+			for (const [index, uploadFile] of files.entries()) {
+				const signedFile = body.upload.files[index];
+				if (!signedFile) {
+					throw new Error("上传签名数量与文件数量不一致");
+				}
+				const uploadResponse = await fetch(signedFile.uploadUrl, {
+					method: signedFile.method,
+					headers: signedFile.headers,
+					// 文件内容直接写入 R2，避免 Worker 接管上传 body。
+					body: uploadFile.file,
+				});
+				if (!uploadResponse.ok) {
+					throw new Error(`上传 ${uploadFile.relativePath} 失败`);
+				}
+			}
+			setUploadTarget(null);
+			await loadWorkspaceTree(project.id, uploadTarget.parentPath);
+		} catch (err) {
+			setWorkspaceError(err instanceof Error ? err.message : "上传失败");
+			throw err;
+		} finally {
+			setIsWorkspaceMutating(false);
+		}
 	}
 
 	/**
@@ -1340,18 +1432,50 @@ function ChatPage() {
 
 						<div className="flex shrink-0 items-center justify-between gap-2 border-b px-4 py-3">
 							<p className="text-sm font-medium">工作区文件</p>
-							<Button
-								variant="outline"
-								size="sm"
-								disabled={!project || isWorkspaceLoading}
-								onClick={() => void refreshWorkspaceTree()}
-							>
-								<RefreshCwIcon
-									data-icon="inline-start"
-									className={cn(isWorkspaceLoading && "animate-spin")}
-								/>
-								刷新
-							</Button>
+							<div className="flex items-center gap-2">
+								<DropdownMenu>
+									<DropdownMenuTrigger
+										render={
+											<Button
+												variant="outline"
+												size="sm"
+												disabled={!project || isWorkspaceMutating}
+											/>
+										}
+									>
+										<FileUpIcon data-icon="inline-start" />
+										上传
+									</DropdownMenuTrigger>
+									<DropdownMenuContent align="end">
+										<DropdownMenuItem
+											disabled={!project || isWorkspaceMutating}
+											onClick={() => openUploadDialog("files")}
+										>
+											<FileUpIcon />
+											上传文件
+										</DropdownMenuItem>
+										<DropdownMenuItem
+											disabled={!project || isWorkspaceMutating}
+											onClick={() => openUploadDialog("directory")}
+										>
+											<FolderUpIcon />
+											上传文件夹
+										</DropdownMenuItem>
+									</DropdownMenuContent>
+								</DropdownMenu>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={!project || isWorkspaceLoading}
+									onClick={() => void refreshWorkspaceTree()}
+								>
+									<RefreshCwIcon
+										data-icon="inline-start"
+										className={cn(isWorkspaceLoading && "animate-spin")}
+									/>
+									刷新
+								</Button>
+							</div>
 						</div>
 
 							<ContextMenu>
@@ -1428,12 +1552,28 @@ function ChatPage() {
 																重命名
 															</ContextMenuItem>
 															{data.type === "directory" ? (
-																<ContextMenuItem
-																	onClick={() => openCreateDirectoryDialog(data)}
-																>
-																	<FolderPlusIcon />
-																	新建文件夹
-																</ContextMenuItem>
+																<>
+																	<ContextMenuItem
+																		onClick={() => openCreateDirectoryDialog(data)}
+																	>
+																		<FolderPlusIcon />
+																		新建文件夹
+																	</ContextMenuItem>
+																	<ContextMenuItem
+																		disabled={!project || isWorkspaceMutating}
+																		onClick={() => openUploadDialog("files", data)}
+																	>
+																		<FileUpIcon />
+																		上传文件
+																	</ContextMenuItem>
+																	<ContextMenuItem
+																		disabled={!project || isWorkspaceMutating}
+																		onClick={() => openUploadDialog("directory", data)}
+																	>
+																		<FolderUpIcon />
+																		上传文件夹
+																	</ContextMenuItem>
+																</>
 															) : null}
 															<ContextMenuItem
 																variant="destructive"
@@ -1467,6 +1607,20 @@ function ChatPage() {
 										>
 											<FolderPlusIcon />
 											新建文件夹
+										</ContextMenuItem>
+										<ContextMenuItem
+											disabled={!project || isWorkspaceMutating}
+											onClick={() => openUploadDialog("files")}
+										>
+											<FileUpIcon />
+											上传文件
+										</ContextMenuItem>
+										<ContextMenuItem
+											disabled={!project || isWorkspaceMutating}
+											onClick={() => openUploadDialog("directory")}
+										>
+											<FolderUpIcon />
+											上传文件夹
 										</ContextMenuItem>
 									</ContextMenuGroup>
 								</ContextMenuContent>
@@ -1851,6 +2005,34 @@ function ChatPage() {
 							创建
 						</Button>
 					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
+			<Dialog
+				open={Boolean(uploadTarget)}
+				onOpenChange={(open) => {
+					if (!open) {
+						setUploadTarget(null);
+					}
+				}}
+			>
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle>
+							{uploadTarget?.mode === "directory" ? "上传文件夹" : "上传文件"}
+						</DialogTitle>
+						<DialogDescription>
+							将内容上传到 {uploadTarget?.parentName ?? "根目录"}；同名文件会被新上传内容覆盖。
+						</DialogDescription>
+					</DialogHeader>
+					{uploadTarget ? (
+						<WorkspaceUploadPanel
+							mode={uploadTarget.mode}
+							targetName={uploadTarget.parentName}
+							disabled={isWorkspaceMutating}
+							onUpload={uploadWorkspaceFiles}
+						/>
+					) : null}
 				</DialogContent>
 			</Dialog>
 		</main>

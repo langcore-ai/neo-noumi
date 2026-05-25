@@ -8,29 +8,50 @@ import {
 	type AiProxyBindings,
 } from "./ccr-ai-proxy";
 import type { JsonObject } from "./ccr-types";
+import {
+	buildClaudeProjectStateDir,
+	buildProjectWorkspaceMountPath,
+	PROJECT_WORKSPACE_BUCKET_BINDING,
+	PROJECT_WORKSPACE_ROOT,
+} from "./ccr-workspace-mount";
 
 /** Sandbox 内 CCR runner 脚本路径 */
-const RUNNER_PATH = "/workspace/ccr-runner.sh";
+const RUNNER_PATH = "/tmp/neo-noumi/ccr-runner.sh";
 
 /** Sandbox 内敏感环境变量文件路径 */
-const ENV_PATH = "/workspace/ccr-env.sh";
+const ENV_PATH = "/tmp/neo-noumi/ccr-env.sh";
 
-/** Claude Code 在容器内使用的项目状态目录。 */
-const CLAUDE_PROJECT_STATE_DIR = "/root/.claude/projects/-workspace";
+/** Sandbox 内 CCR runner 日志路径，避免写入用户 workspace。 */
+const RUNNER_LOG_PATH = "/tmp/neo-noumi/ccr-runner.log";
+
+/** 旧版 /workspace cwd 对应的 Claude Code 项目状态目录。 */
+const CLAUDE_LEGACY_PROJECT_STATE_DIR = "/root/.claude/projects/-workspace";
 
 /** Claude Code 本地 transcript 文件路径。 */
-const claudeTranscriptPath = (sessionId: string) =>
-	`${CLAUDE_PROJECT_STATE_DIR}/${sessionId}.jsonl`;
+const claudeTranscriptPath = (projectStateDir: string, sessionId: string) =>
+	`${projectStateDir}/${sessionId}.jsonl`;
 
 /** Claude Code sessionStore 文件在容器内的恢复路径。 */
-const claudeSessionStorePath = (subpath: string) =>
-	`${CLAUDE_PROJECT_STATE_DIR}/${subpath}`;
+const claudeSessionStorePath = (projectStateDir: string, subpath: string) =>
+	`${projectStateDir}/${subpath}`;
 
 /** 启动前恢复 internal events 的分页大小。 */
 const TRANSCRIPT_RESTORE_PAGE_SIZE = 500;
 
 /** Claude Code 默认模型；固定到网关可识别的 Sonnet 模型，避免 CLI 选择 Opus 后缀模型。 */
 const CLAUDE_MODEL = "claude-sonnet-4-6";
+
+/** Project workspace 挂载信息。 */
+type ProjectWorkspaceMount = {
+	/** 容器内挂载路径 */
+	mountPath: string;
+	/** 当前启动是否执行了新的挂载 */
+	mounted: boolean;
+	/** Project ID，也是 R2 prefix 的第一段 */
+	projectId: string;
+	/** 用户可见 project 名称 */
+	projectName: string;
+};
 
 /** Neo Noumi sandbox Worker 绑定 */
 export interface NeoNoumiSandboxBindings extends AiProxyBindings {
@@ -100,6 +121,7 @@ SESSION_ID="$1"
 WORKER_ACCESS_TOKEN="$2"
 AI_PROXY_TOKEN="$3"
 CLAUDE_SESSION_MODE="\${4:-new}"
+WORKSPACE_DIR="\${5:-/workspace}"
 SDK_URL="https://${CCR_SDK_APPROVED_HOST}/v1/code/sessions/$SESSION_ID"
 AUTH_HEADER="Authorization: Bearer $WORKER_ACCESS_TOKEN"
 
@@ -116,6 +138,8 @@ export CURL_CA_BUNDLE=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 export SSL_CERT_FILE=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 export ANTHROPIC_BASE_URL="https://${ANTHROPIC_API_HOST}"
 export ANTHROPIC_API_KEY="$AI_PROXY_TOKEN"
+
+cd "$WORKSPACE_DIR"
 
 if [ "\${NEO_NOUMI_ENABLE_REAL_CLAUDE:-0}" = "1" ] && command -v claude >/dev/null 2>&1; then
   CLAUDE_SESSION_ARG="--session-id"
@@ -246,7 +270,10 @@ type ClaudeLocalStateRestoreResult = {
  * @param payload internal event payload
  * @returns 待 tool_result 确认的 memory 写入
  */
-function extractMemoryWriteIntents(payload: JsonObject): MemoryWriteIntent[] {
+function extractMemoryWriteIntents(
+	payload: JsonObject,
+	projectStateDir: string,
+): MemoryWriteIntent[] {
 	const message = isJsonObject(payload.message) ? payload.message : {};
 	const content = Array.isArray(message.content) ? message.content : [];
 	const writes: MemoryWriteIntent[] = [];
@@ -261,9 +288,15 @@ function extractMemoryWriteIntents(payload: JsonObject): MemoryWriteIntent[] {
 		if (
 			toolUseId &&
 			fileContent !== undefined &&
-			filePath.startsWith(`${CLAUDE_PROJECT_STATE_DIR}/memory/`)
+			(filePath.startsWith(`${projectStateDir}/memory/`) ||
+				filePath.startsWith(`${CLAUDE_LEGACY_PROJECT_STATE_DIR}/memory/`))
 		) {
-			writes.push({ toolUseId, filePath, content: fileContent });
+			const normalizedPath = filePath.startsWith(
+				`${CLAUDE_LEGACY_PROJECT_STATE_DIR}/memory/`,
+			)
+				? `${projectStateDir}${filePath.slice(CLAUDE_LEGACY_PROJECT_STATE_DIR.length)}`
+				: filePath;
+			writes.push({ toolUseId, filePath: normalizedPath, content: fileContent });
 		}
 	}
 	return writes;
@@ -326,7 +359,9 @@ async function restoreClaudeLocalState(
 	sandbox: ReturnType<typeof getCcrSandbox>,
 	store: CcrStore,
 	sessionId: string,
+	workspacePath: string,
 ): Promise<ClaudeLocalStateRestoreResult> {
+	const projectStateDir = buildClaudeProjectStateDir(workspacePath);
 	let sessionStoreFiles = await store.listSessionStoreFiles(
 		sessionId,
 		CLAUDE_SESSION_STORE_PROJECT_KEY,
@@ -359,7 +394,7 @@ async function restoreClaudeLocalState(
 		if (!storedFile) {
 			continue;
 		}
-		const targetPath = claudeSessionStorePath(file.subpath);
+		const targetPath = claudeSessionStorePath(projectStateDir, file.subpath);
 		// sessionStore 中保存的是 Claude Code 原生 JSONL，启动前要恢复为本地副本。
 		await sandbox.exec(`mkdir -p ${shellQuote(dirname(targetPath))}`);
 		await sandbox.writeFile(targetPath, storedFile.content);
@@ -378,7 +413,7 @@ async function restoreClaudeLocalState(
 		memoryPayloads.push(...transcriptPayloads);
 	}
 	for (const payload of memoryPayloads) {
-		for (const memoryWrite of extractMemoryWriteIntents(payload)) {
+		for (const memoryWrite of extractMemoryWriteIntents(payload, projectStateDir)) {
 			pendingMemoryWrites.set(memoryWrite.toolUseId, memoryWrite);
 		}
 		for (const toolUseId of extractSuccessfulToolResultIds(payload)) {
@@ -393,14 +428,14 @@ async function restoreClaudeLocalState(
 	}
 
 	await sandbox.exec(
-		`mkdir -p ${shellQuote(CLAUDE_PROJECT_STATE_DIR)} ${shellQuote(
-			`${CLAUDE_PROJECT_STATE_DIR}/memory`,
+		`mkdir -p ${shellQuote(projectStateDir)} ${shellQuote(
+			`${projectStateDir}/memory`,
 		)}`,
 	);
 	if (!hasForegroundSessionStore && transcriptPayloads.length > 0) {
 		// 只有没有 foreground sessionStore 时，才用 internal events 兜底生成本地 transcript。
 		await sandbox.writeFile(
-			claudeTranscriptPath(sessionId),
+			claudeTranscriptPath(projectStateDir, sessionId),
 			`${transcriptPayloads.map((payload) => JSON.stringify(payload)).join("\n")}\n`,
 		);
 	}
@@ -415,6 +450,7 @@ async function restoreClaudeLocalState(
 			transcript_events: transcriptPayloads.length,
 			session_store_files: restoredSessionStoreFiles,
 			memory_files: memoryFiles.size,
+			project_state_dir: projectStateDir,
 		},
 	});
 	return {
@@ -474,6 +510,88 @@ function getCcrSandbox(env: NeoNoumiSandboxBindings, userId: string) {
 }
 
 /**
+ * 判断容器路径是否已经是挂载点。
+ * @param sandbox sandbox client
+ * @param mountPath 容器内挂载路径
+ * @returns 是否已经挂载
+ */
+async function isMountedPath(
+	sandbox: ReturnType<typeof getCcrSandbox>,
+	mountPath: string,
+): Promise<boolean> {
+	const result = await sandbox.exec(`mountpoint -q ${shellQuote(mountPath)}`, {
+		origin: "internal",
+	});
+	return result.success;
+}
+
+/**
+ * 确保当前 session 所属 project workspace 已挂载到容器。
+ * @param sandbox sandbox client
+ * @param store CCR store
+ * @param sessionId session ID
+ * @returns workspace 挂载信息
+ */
+async function ensureProjectWorkspaceMounted(
+	sandbox: ReturnType<typeof getCcrSandbox>,
+	store: CcrStore,
+	sessionId: string,
+): Promise<ProjectWorkspaceMount> {
+	const context = await store.getSessionWorkspaceContext(sessionId);
+	if (!context || context.deletedAt || context.project.deletedAt) {
+		throw new Error("Session workspace not found");
+	}
+
+	const mountPath = buildProjectWorkspaceMountPath(
+		context.project.name,
+		context.projectId,
+	);
+	if (await isMountedPath(sandbox, mountPath)) {
+		await store.recordOperation(sessionId, {
+			direction: "route_internal",
+			category: "sandbox_workspace_mount_checked",
+			payload: {
+				mount_path: mountPath,
+				project_id: context.projectId,
+				project_name: context.project.name,
+				mounted: false,
+				reason: "already_mounted",
+			},
+		});
+		return {
+			mountPath,
+			mounted: false,
+			projectId: context.projectId,
+			projectName: context.project.name,
+		};
+	}
+
+	// 只创建挂载根目录，具体 project 目录交给 mountBucket 绑定到 R2 prefix。
+	await sandbox.exec(`mkdir -p ${shellQuote(PROJECT_WORKSPACE_ROOT)}`, {
+		origin: "internal",
+	});
+	await sandbox.mountBucket(PROJECT_WORKSPACE_BUCKET_BINDING, mountPath, {
+		prefix: `/${context.projectId}`,
+	});
+	await store.recordOperation(sessionId, {
+		direction: "route_internal",
+		category: "sandbox_workspace_mount_checked",
+		payload: {
+			mount_path: mountPath,
+			project_id: context.projectId,
+			project_name: context.project.name,
+			mounted: true,
+		},
+	});
+	return {
+		mountPath,
+		mounted: true,
+		projectId: context.projectId,
+		projectName: context.project.name,
+	};
+}
+
+/**
  * 从 sandbox process 列表中提取进程 ID。
  * @param process sandbox process
  * @returns 进程 ID
@@ -526,7 +644,20 @@ export async function startCcrSandbox(
 		containerStatus: "starting",
 		sandboxId,
 	});
-	const restoredState = await restoreClaudeLocalState(sandbox, store, sessionId);
+	const workspaceMount = await ensureProjectWorkspaceMounted(
+		sandbox,
+		store,
+		sessionId,
+	);
+	const restoredState = await restoreClaudeLocalState(
+		sandbox,
+		store,
+		sessionId,
+		workspaceMount.mountPath,
+	);
+	await sandbox.exec(`mkdir -p ${shellQuote(dirname(RUNNER_PATH))}`, {
+		origin: "internal",
+	});
 	await sandbox.writeFile(ENV_PATH, buildEnvScript(env));
 	await sandbox.writeFile(RUNNER_PATH, buildRunnerScript());
 	await sandbox.exec(`chmod 600 ${ENV_PATH}`);
@@ -543,10 +674,12 @@ export async function startCcrSandbox(
 					shellQuote(workerAccessToken),
 					shellQuote(aiProxyToken),
 					shellQuote(restoredState.sessionMode),
-					"> /workspace/ccr-runner.log 2>&1",
+					shellQuote(workspaceMount.mountPath),
+					`> ${shellQuote(RUNNER_LOG_PATH)} 2>&1`,
 				].join(" "),
 			),
 		].join(" "),
+		{ cwd: workspaceMount.mountPath },
 	);
 	try {
 		await store.setSessionRunner(sessionId, sandboxId, process.id);
@@ -574,6 +707,10 @@ export async function startCcrSandbox(
 			process_id: process.id,
 			claude_session_mode: restoredState.sessionMode,
 			transcript_events: restoredState.transcriptEvents,
+			workspace_mount_path: workspaceMount.mountPath,
+			workspace_project_id: workspaceMount.projectId,
+			workspace_project_name: workspaceMount.projectName,
+			workspace_mounted: workspaceMount.mounted,
 		},
 	});
 	return {
@@ -595,7 +732,7 @@ export async function getCcrSandboxStatus(
 		error: error instanceof Error ? error.message : String(error),
 	}));
 	const runnerLog = await sandbox
-		.readFile("/workspace/ccr-runner.log")
+		.readFile(RUNNER_LOG_PATH)
 		.then((file) => file.content.slice(-8_000))
 		.catch(() => "");
 	return {

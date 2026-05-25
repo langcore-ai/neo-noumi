@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	buildWorkspaceObjectKey,
 	createWorkspaceDirectory,
+	createWorkspaceUploadUrls,
 	deleteWorkspacePath,
 	listWorkspaceTree,
 	moveWorkspaceFile,
@@ -239,5 +240,52 @@ describe("workspace R2 operations", () => {
 		});
 		expect(signed.signature).toMatch(/^[a-f0-9]{64}$/);
 		expect(signed.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000));
+	});
+
+	test("creates R2 presigned upload urls under project root", async () => {
+		const upload = await createWorkspaceUploadUrls(
+			{
+				PROJECT_WORKSPACE_BUCKET_NAME: "test-workspaces",
+				R2_ACCOUNT_ID: "account-id",
+				R2_ACCESS_KEY_ID: "access-key",
+				R2_SECRET_ACCESS_KEY: "secret-key",
+			},
+			"project-1",
+			"src",
+			[{ relativePath: "nested/a b.txt", size: 5, contentType: "text/plain" }],
+		);
+
+		const file = upload.files[0];
+		const url = new URL(file.uploadUrl);
+		expect(upload.basePath).toBe("src");
+		expect(file.path).toBe("src/nested/a b.txt");
+		expect(file.method).toBe("PUT");
+		expect(file.headers).toEqual({ "content-type": "text/plain" });
+		expect(url.hostname).toBe("account-id.r2.cloudflarestorage.com");
+		expect(url.pathname).toBe("/test-workspaces/project-1/src/nested/a%20b.txt");
+		expect(url.searchParams.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
+		expect(url.searchParams.get("X-Amz-Expires")).toBe("900");
+	});
+
+	test("rejects presigned upload urls above the file size limit", async () => {
+		await expect(
+			createWorkspaceUploadUrls(
+				{
+					PROJECT_WORKSPACE_BUCKET_NAME: "test-workspaces",
+					R2_ACCOUNT_ID: "account-id",
+					R2_ACCESS_KEY_ID: "access-key",
+					R2_SECRET_ACCESS_KEY: "secret-key",
+				},
+				"project-1",
+				"src",
+				[
+					{
+						relativePath: "large.bin",
+						size: 100 * 1024 * 1024 + 1,
+						contentType: "application/octet-stream",
+					},
+				],
+			),
+		).rejects.toThrow("Workspace upload file exceeds the maximum size");
 	});
 });

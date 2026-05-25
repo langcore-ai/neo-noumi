@@ -5,6 +5,7 @@ import {
 	normalizeAiProxyCredentialInput,
 	normalizeProjectCreateInput,
 	normalizeProjectUpdateInput,
+	ProjectNameConflictError,
 } from "../src/worker/lib/ccr-store";
 import { mergeJsonObject } from "../src/worker/lib/ccr-json";
 
@@ -114,6 +115,44 @@ describe("normalizeAiProxyCredentialInput", () => {
 			baseUrl: "https://ai-api.example.com",
 			apiKey: "sk-test",
 		});
+	});
+});
+
+describe("CcrStore project name uniqueness", () => {
+	test("rejects creating a duplicate active project name for the same user", async () => {
+		let createCalled = false;
+		const store = createStoreFromFakePrisma({
+			project: {
+				findFirst: async () => ({ id: "existing-project" }),
+				create: async () => {
+					createCalled = true;
+					return {};
+				},
+			},
+		});
+
+		await expect(store.createProject("user-1", "A")).rejects.toBeInstanceOf(
+			ProjectNameConflictError,
+		);
+		expect(createCalled).toBe(false);
+	});
+
+	test("rejects renaming a project to another active project name", async () => {
+		let updateCalled = false;
+		const store = createStoreFromFakePrisma({
+			project: {
+				findFirst: async () => ({ id: "other-project" }),
+				updateMany: async () => {
+					updateCalled = true;
+					return { count: 1 };
+				},
+			},
+		});
+
+		await expect(
+			store.updateProject("user-1", "project-1", { name: "A" }),
+		).rejects.toBeInstanceOf(ProjectNameConflictError);
+		expect(updateCalled).toBe(false);
 	});
 });
 

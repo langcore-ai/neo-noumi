@@ -10,6 +10,9 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
+	"vars": {
+		"PROJECT_WORKSPACE_BUCKET_NAME": "neo-noumi-workspaces"
+	},
 	"assets": {
 		"directory": "./dist/client",
 		"not_found_handling": "single-page-application",

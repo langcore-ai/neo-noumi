@@ -20,7 +20,8 @@
 
 - 数据模型已拆成 `projects`、`chat_sessions`、`user_containers`：一个用户可以有多个 project，session 必须归属某个用户和某个 project。
 - `chat_sessions.userId` 和 `chat_sessions.projectId` 是非空外键，创建 session 前会校验 project 属于当前登录用户，避免跨用户挂载 session。
-- Project workspace 已接入 R2 bucket `neo-noumi-workspaces`，对象根目录使用 `{projectId}/...`；所有 `/api/projects/{projectId}/workspace/*` 操作都先校验 project owner，再由后端生成 HMAC 操作签名，客户端不会接触 R2 凭证。
+- 同一用户的活跃 project 名称通过 PostgreSQL partial unique index 保持唯一，软删除项目不占用名称；这是 `/workspace/{projectName}` 挂载路径不串用的前置约束。
+- Project workspace 已接入 R2 bucket `neo-noumi-workspaces`，对象根目录使用 `{projectId}/...`；文件树支持列表、读写、删除、移动、新建目录以及文件/文件夹直传。所有 `/api/projects/{projectId}/workspace/*` 操作都先校验 project owner，再由后端生成 HMAC 操作签名；上传由后端下发短期 R2 presigned PUT URL，前端直接写入 R2，不经过 Worker 转发文件 body。
 - `/projects` 是 project 管理页面，基于 `/api/projects` 提供列表、创建、编辑和软删除；删除 project 会同步移除其下未删除 session，并对活跃 session 后台停止 runner，聊天页只展示未删除 project/session。
 - Cloudflare 资源使用 `NeoNoumiSandbox` / `NEO_NOUMI_SANDBOX` / `neo-noumi-sandbox` 命名，用户级 sandbox ID 使用 `neo-noumi-user-{userId}`。
 - Cloudflare outbound interception 的 CCR `--sdk-url` host 使用 `beacon.claude-ai.staging.ant.dev`；`api.anthropic.com` 作为 AI Proxy 劫持入口，由 Worker 校验短期 proxy token 后再转发到用户默认渠道或平台 fallback 渠道，真实上游 API key 不再注入 sandbox。
@@ -1040,7 +1041,9 @@ Neo Noumi 当前至少会恢复 Claude Code 自己的运行期状态：
 - 现在采用 R2 作为 project workspace 事实源，R2 key 形如 `{projectId}/src/index.ts`。
 - 后端 API 负责校验 project ownership、规范化相对路径并拒绝 `..` 越权路径。
 - 每次 workspace API 操作都会基于 `WORKSPACE_SIGNING_SECRET` 生成后端 HMAC 签名，签名覆盖操作类型、projectId、路径、请求体摘要和过期时间。
-- 容器启动时后续应由 A 从 R2 materialize workspace。
+- 文件/文件夹上传先由后端校验数量、声明大小和路径，再签发短期 R2 S3 presigned PUT URL，由前端直接 PUT 到 R2；部署时 `PROJECT_WORKSPACE_BUCKET_NAME` 必须和 R2 binding bucket 保持一致，bucket 必须允许前端 origin 对 R2 S3 endpoint 发起 `PUT` 的 CORS 请求。
+- 每次 chat 启动 Claude Code runner 前，A 会校验 session 所属 project 的 workspace 是否已经挂载到 sandbox：目标路径是 `/workspace/{projectName}`，R2 prefix 是 `/{projectId}`；已挂载时跳过，未挂载时通过 `PROJECT_WORKSPACE_BUCKET` binding 执行 `mountBucket`。
+- CCR runner、环境变量和日志放在 `/tmp/neo-noumi`，避免写入用户 workspace；Claude Code 进程启动时 cwd 指向 project 挂载路径，Claude 本地 project state 也按该 cwd 恢复，例如 `/workspace/A` 对应 `/root/.claude/projects/-workspace-A`。
 - 如果 workspace 丢失，即使 session 事件恢复成功，模型看到的上下文也会和实际文件状态不一致。
 
 ### 与 sessionStore 的关系

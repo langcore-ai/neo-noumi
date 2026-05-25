@@ -72,6 +72,18 @@ const subagentTranscriptSubpath = (sessionId: string, agentId: string) =>
 /** sessionStore 中 subagent transcript 的路径前缀。 */
 const subagentTranscriptPrefix = (sessionId: string) => `${sessionId}/subagents/`;
 
+/** Project 名称冲突错误。 */
+export class ProjectNameConflictError extends Error {
+	/**
+	 * 创建 project 名称冲突错误。
+	 * @param projectName 冲突的 project 名称
+	 */
+	constructor(projectName: string) {
+		super(`Project name already exists: ${projectName}`);
+		this.name = "ProjectNameConflictError";
+	}
+}
+
 /**
  * 计算恢复窗口查询游标，保留最新 compact boundary 本身。
  * @param cursor 客户端分页游标
@@ -121,6 +133,18 @@ function newEventId(): string {
  */
 function newAiProxyToken(): string {
 	return `${AI_PROXY_TOKEN_PREFIX}${crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+/**
+ * 判断数据库错误是否来自唯一约束冲突。
+ * @param error 捕获到的错误
+ * @returns 是否为唯一约束冲突
+ */
+function isUniqueConstraintError(error: unknown): boolean {
+	return (
+		error instanceof Prisma.PrismaClientKnownRequestError &&
+		error.code === "P2002"
+	);
 }
 
 /**
@@ -503,7 +527,22 @@ export class CcrStore {
 		if (existing) {
 			return existing;
 		}
-		return this.createProject(userId, DEFAULT_PROJECT_NAME);
+		try {
+			return await this.createProject(userId, DEFAULT_PROJECT_NAME);
+		} catch (error) {
+			if (!(error instanceof ProjectNameConflictError)) {
+				throw error;
+			}
+			// 并发初始化默认项目时，另一个请求可能已完成创建，回读即可。
+			const latest = await this.prisma.project.findFirst({
+				where: { userId, name: DEFAULT_PROJECT_NAME, deletedAt: null },
+				orderBy: { createdAt: "asc" },
+			});
+			if (!latest) {
+				throw error;
+			}
+			return latest;
+		}
 	}
 
 	/**
@@ -515,15 +554,29 @@ export class CcrStore {
 	 */
 	async createProject(userId: string, name?: string, description?: string) {
 		const input = normalizeProjectCreateInput({ name, description });
-
-		return this.prisma.project.create({
-			data: {
-				id: crypto.randomUUID(),
-				userId,
-				name: input.name,
-				description: input.description,
-			},
+		const existing = await this.prisma.project.findFirst({
+			where: { userId, name: input.name, deletedAt: null },
+			select: { id: true },
 		});
+		if (existing) {
+			throw new ProjectNameConflictError(input.name);
+		}
+
+		try {
+			return await this.prisma.project.create({
+				data: {
+					id: crypto.randomUUID(),
+					userId,
+					name: input.name,
+					description: input.description,
+				},
+			});
+		} catch (error) {
+			if (isUniqueConstraintError(error)) {
+				throw new ProjectNameConflictError(input.name);
+			}
+			throw error;
+		}
 	}
 
 	/**
@@ -575,10 +628,32 @@ export class CcrStore {
 		if (Object.keys(normalized).length === 0) {
 			return this.findUserProject(userId, projectId);
 		}
-		const result = await this.prisma.project.updateMany({
-			where: { id: projectId, userId, deletedAt: null },
-			data: normalized,
-		});
+		if (normalized.name) {
+			const existing = await this.prisma.project.findFirst({
+				where: {
+					id: { not: projectId },
+					userId,
+					name: normalized.name,
+					deletedAt: null,
+				},
+				select: { id: true },
+			});
+			if (existing) {
+				throw new ProjectNameConflictError(normalized.name);
+			}
+		}
+		let result;
+		try {
+			result = await this.prisma.project.updateMany({
+				where: { id: projectId, userId, deletedAt: null },
+				data: normalized,
+			});
+		} catch (error) {
+			if (normalized.name && isUniqueConstraintError(error)) {
+				throw new ProjectNameConflictError(normalized.name);
+			}
+			throw error;
+		}
 		if (result.count === 0) {
 			return null;
 		}
@@ -723,6 +798,28 @@ export class CcrStore {
 				deletedAt: true,
 				userId: true,
 				projectId: true,
+			},
+		});
+	}
+
+	/**
+	 * 查询 session 启动 Claude Code 前所需的 workspace 上下文。
+	 * @param sessionId session ID
+	 * @returns workspace 所属 project；不存在时返回 null
+	 */
+	async getSessionWorkspaceContext(sessionId: string) {
+		return this.prisma.chatSession.findUnique({
+			where: { id: sessionId },
+			select: {
+				deletedAt: true,
+				projectId: true,
+				project: {
+					select: {
+						id: true,
+						name: true,
+						deletedAt: true,
+					},
+				},
 			},
 		});
 	}
