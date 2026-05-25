@@ -36,6 +36,15 @@ export function buildProjectWorkspaceMountPath(
 }
 
 /**
+ * 生成 Sandbox SDK 挂载 R2 prefix。
+ * @param projectId Project ID
+ * @returns s3fs 需要的前后 `/` 包裹 prefix
+ */
+export function buildProjectWorkspaceMountPrefix(projectId: string): string {
+	return `/${projectId}/`;
+}
+
+/**
  * 生成 Claude Code 针对 cwd 使用的本地 project state 目录。
  * @param workspacePath Claude Code 进程 cwd
  * @returns Claude Code project state 目录

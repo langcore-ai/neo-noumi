@@ -10,6 +10,7 @@ import {
 import type { JsonObject } from "./ccr-types";
 import {
 	buildClaudeProjectStateDir,
+	buildProjectWorkspaceMountPrefix,
 	buildProjectWorkspaceMountPath,
 	PROJECT_WORKSPACE_BUCKET_BINDING,
 } from "./ccr-workspace-mount";
@@ -570,7 +571,8 @@ async function ensureProjectWorkspaceMounted(
 		origin: "internal",
 	});
 	await sandbox.mountBucket(PROJECT_WORKSPACE_BUCKET_BINDING, mountPath, {
-		prefix: `/${context.projectId}`,
+		// Sandbox SDK 的 s3fs prefix 必须同时以 `/` 开头和结尾。
+		prefix: buildProjectWorkspaceMountPrefix(context.projectId),
 	});
 	await store.recordOperation(sessionId, {
 		direction: "route_internal",

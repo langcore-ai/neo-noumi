@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	buildClaudeProjectStateDir,
+	buildProjectWorkspaceMountPrefix,
 	buildProjectWorkspaceMountPath,
 } from "../src/worker/lib/ccr-workspace-mount";
 
@@ -25,6 +26,12 @@ describe("buildProjectWorkspaceMountPath", () => {
 		expect(buildProjectWorkspaceMountPath("..", "project-1")).toBe(
 			"/workspace/project-1",
 		);
+	});
+});
+
+describe("buildProjectWorkspaceMountPrefix", () => {
+	test("wraps project prefix for s3fs mountBucket", () => {
+		expect(buildProjectWorkspaceMountPrefix("project-1")).toBe("/project-1/");
 	});
 });
 
