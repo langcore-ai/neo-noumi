@@ -654,6 +654,11 @@ function ChatPage() {
 		rootItemId: WORKSPACE_ROOT_ID,
 	});
 
+	useEffect(() => {
+		// Headless Tree 会缓存可见节点，workspace 数据更新后需要显式重建。
+		workspaceTree.rebuildTree();
+	}, [workspaceItems, workspaceTree]);
+
 	const messages = useMemo(() => {
 		return buildMessages(clientEvents, timeline);
 	}, [clientEvents, timeline]);
@@ -740,8 +745,11 @@ function ChatPage() {
 		setWorkspaceError(null);
 		setIsWorkspaceLoading(true);
 		try {
-			const query = prefix ? `?prefix=${encodeURIComponent(prefix)}` : "";
-			const response = await fetch(`/api/projects/${projectId}/workspace/tree${query}`);
+			const response = await fetch(`/api/projects/${projectId}/workspace/tree`, {
+				body: JSON.stringify({ prefix }),
+				headers: { "content-type": "application/json" },
+				method: "POST",
+			});
 			if (!response.ok) {
 				throw new Error(await readError(response));
 			}

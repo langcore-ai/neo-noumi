@@ -366,6 +366,62 @@ function readWorkspaceRoutePath(path: string | undefined, options: { allowEmpty?
 }
 
 /**
+ * 读取 workspace tree 请求参数。
+ * @param body 可选 JSON body，POST 用于承载较长路径
+ * @returns 文件树查询参数
+ */
+async function readWorkspaceTreeRequest(
+	body?: Record<string, unknown>,
+) {
+	const prefix = getStringField(body ?? {}, "prefix") ?? "";
+	const cursor = getStringField(body ?? {}, "cursor");
+	return {
+		prefix,
+		cursor,
+	};
+}
+
+/**
+ * 返回指定 project 的 workspace 文件树。
+ * @param c Hono context
+ * @param body 可选 JSON body，避免长 prefix 突破 URL 长度限制
+ * @returns 文件树响应
+ */
+async function handleWorkspaceTreeRequest(
+	c: Context<{ Bindings: Env & CcrBindings; Variables: CcrVariables }>,
+	body?: Record<string, unknown>,
+) {
+	const store = createStore(c.env);
+	const userId = c.get("userId");
+	const projectId = c.req.param("projectId");
+	const project = await findOwnedProject(store, userId, projectId);
+	if (!project) {
+		return c.json({ error: "Project not found" }, 404);
+	}
+	const { prefix, cursor } = await readWorkspaceTreeRequest(body);
+	const prefixResult = readWorkspaceRoutePath(prefix, {
+		allowEmpty: true,
+	});
+	if ("error" in prefixResult) {
+		return c.json({ error: prefixResult.error }, 400);
+	}
+	const workspace = await listWorkspaceTree(
+		c.env.PROJECT_WORKSPACE_BUCKET,
+		projectId,
+		prefixResult.path,
+		cursor,
+	);
+	return c.json({
+		workspace,
+		signature: await signWorkspaceOperation(c.env, {
+			operation: "list",
+			projectId,
+			path: prefixResult.path,
+		}),
+	});
+}
+
+/**
  * 挂载 CCR route 和一等业务 route。
  * @param app Hono app
  */
@@ -533,34 +589,9 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		});
 	});
 
-	app.get("/api/projects/:projectId/workspace/tree", async (c) => {
-		const store = createStore(c.env);
-		const userId = c.get("userId");
-		const projectId = c.req.param("projectId");
-		const project = await findOwnedProject(store, userId, projectId);
-		if (!project) {
-			return c.json({ error: "Project not found" }, 404);
-		}
-		const prefixResult = readWorkspaceRoutePath(c.req.query("prefix") ?? "", {
-			allowEmpty: true,
-		});
-		if ("error" in prefixResult) {
-			return c.json({ error: prefixResult.error }, 400);
-		}
-		const workspace = await listWorkspaceTree(
-			c.env.PROJECT_WORKSPACE_BUCKET,
-			projectId,
-			prefixResult.path,
-			c.req.query("cursor"),
-		);
-		return c.json({
-			workspace,
-			signature: await signWorkspaceOperation(c.env, {
-				operation: "list",
-				projectId,
-				path: prefixResult.path,
-			}),
-		});
+	app.post("/api/projects/:projectId/workspace/tree", async (c) => {
+		const body = await readJsonObject(c.req.raw);
+		return handleWorkspaceTreeRequest(c, body);
 	});
 
 	app.get("/api/projects/:projectId/workspace/file", async (c) => {

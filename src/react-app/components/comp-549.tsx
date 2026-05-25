@@ -188,7 +188,7 @@ export default function WorkspaceUploadPanel({
 	}
 
 	return (
-		<div className="flex flex-col gap-3">
+		<div className="flex min-w-0 flex-col gap-3">
 			<div
 				className="flex min-h-40 flex-col items-center justify-center rounded-lg border border-input border-dashed p-4 transition-colors hover:bg-accent/50 has-disabled:pointer-events-none has-[input:focus]:border-ring has-disabled:opacity-50 has-[input:focus]:ring-[3px] has-[input:focus]:ring-ring/50 data-[dragging=true]:bg-accent/50"
 				data-dragging={isDragging || undefined}
@@ -237,17 +237,17 @@ export default function WorkspaceUploadPanel({
 			) : null}
 
 			{files.length > 0 ? (
-				<div className="max-h-56 space-y-2 overflow-auto pr-1">
+				<div className="max-h-56 min-w-0 space-y-2 overflow-auto pr-1">
 					{files.map((file) => (
 						<div
-							className="flex items-center justify-between gap-2 rounded-lg border bg-background p-2 pe-3"
+							className="flex min-w-0 items-center justify-between gap-2 rounded-lg border bg-background p-2 pe-3"
 							key={file.id}
 						>
-							<div className="flex min-w-0 items-center gap-3">
+							<div className="flex min-w-0 flex-1 items-center gap-3">
 								<div className="flex aspect-square size-10 shrink-0 items-center justify-center rounded border">
 									{getFileIcon(file)}
 								</div>
-								<div className="flex min-w-0 flex-col gap-0.5">
+								<div className="min-w-0 flex-1">
 									<p className="truncate font-medium text-[13px]">
 										{file.file instanceof File
 											? getUploadRelativePath(file.file)

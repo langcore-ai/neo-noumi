@@ -1041,6 +1041,7 @@ Neo Noumi 当前至少会恢复 Claude Code 自己的运行期状态：
 - 现在采用 R2 作为 project workspace 事实源，R2 key 形如 `{projectId}/src/index.ts`。
 - 后端 API 负责校验 project ownership、规范化相对路径并拒绝 `..` 越权路径。
 - 每次 workspace API 操作都会基于 `WORKSPACE_SIGNING_SECRET` 生成后端 HMAC 签名，签名覆盖操作类型、projectId、路径、请求体摘要和过期时间。
+- 文件树读取只使用 POST JSON body 传递 `prefix`，避免深层目录或长中文路径突破 URL 长度限制。
 - 文件/文件夹上传先由后端校验数量、声明大小和路径，再签发短期 R2 S3 presigned PUT URL，由前端直接 PUT 到 R2；部署时 `PROJECT_WORKSPACE_BUCKET_NAME` 必须和 R2 binding bucket 保持一致，bucket 必须允许前端 origin 对 R2 S3 endpoint 发起 `PUT` 的 CORS 请求。
 - 每次 chat 启动 Claude Code runner 前，A 会校验 session 所属 project 的 workspace 是否已经挂载到 sandbox：目标路径是 `/workspace/{projectName}`，R2 prefix 是 `/{projectId}`；已挂载时跳过，未挂载时通过 `PROJECT_WORKSPACE_BUCKET` binding 执行 `mountBucket`。
 - CCR runner、环境变量和日志放在 `/tmp/neo-noumi`，避免写入用户 workspace；Claude Code 进程启动时 cwd 指向 project 挂载路径，Claude 本地 project state 也按该 cwd 恢复，例如 `/workspace/A` 对应 `/root/.claude/projects/-workspace-A`。
