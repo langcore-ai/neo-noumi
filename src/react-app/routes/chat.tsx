@@ -14,6 +14,7 @@ import {
 	Edit3Icon,
 	FileIcon,
 	FolderIcon,
+	FolderPlusIcon,
 	Loader2Icon,
 	MessageSquarePlusIcon,
 	MoreHorizontalIcon,
@@ -184,6 +185,12 @@ interface RenameTarget {
 	type: "directory" | "file";
 }
 
+/** 新建文件夹弹窗状态。 */
+interface CreateDirectoryTarget {
+	parentPath: string;
+	parentName: string;
+}
+
 /** 默认会话标题，用户直接发送第一条消息时使用。 */
 const DEFAULT_SESSION_TITLE = "新的对话";
 
@@ -235,6 +242,16 @@ function getParentPath(path: string): string {
 function buildRenamedPath(path: string, nextName: string): string {
 	const parentPath = getParentPath(path);
 	return parentPath ? `${parentPath}/${nextName}` : nextName;
+}
+
+/**
+ * 计算新建子目录路径。
+ * @param parentPath 父目录路径
+ * @param name 子目录名称
+ * @returns 新目录路径
+ */
+function buildChildDirectoryPath(parentPath: string, name: string): string {
+	return parentPath ? `${parentPath}/${name}` : name;
 }
 
 /**
@@ -590,6 +607,9 @@ function ChatPage() {
 	const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
 	const [renamingTarget, setRenamingTarget] = useState<RenameTarget | null>(null);
 	const [renameValue, setRenameValue] = useState("");
+	const [createDirectoryTarget, setCreateDirectoryTarget] =
+		useState<CreateDirectoryTarget | null>(null);
+	const [createDirectoryValue, setCreateDirectoryValue] = useState("新建文件夹");
 
 	const workspaceTree = useTree<WorkspaceTreeItem>({
 		dataLoader: {
@@ -827,6 +847,50 @@ function ChatPage() {
 	function openRenameDialog(item: WorkspaceTreeItem) {
 		setRenamingTarget({ path: item.path, name: item.name, type: item.type });
 		setRenameValue(item.name);
+	}
+
+	/**
+	 * 打开新建文件夹弹窗。
+	 * @param parent 父目录；未传时创建到 workspace 根目录
+	 */
+	function openCreateDirectoryDialog(parent?: WorkspaceTreeItem) {
+		setCreateDirectoryTarget({
+			parentPath: parent?.path ?? "",
+			parentName: parent?.name ?? "根目录",
+		});
+		setCreateDirectoryValue("新建文件夹");
+	}
+
+	/**
+	 * 提交新建文件夹。
+	 */
+	async function createWorkspaceDirectory() {
+		if (!project || !createDirectoryTarget) {
+			return;
+		}
+		const nextName = createDirectoryValue.trim();
+		if (!nextName || nextName.includes("/")) {
+			return;
+		}
+		const path = buildChildDirectoryPath(createDirectoryTarget.parentPath, nextName);
+		setIsWorkspaceMutating(true);
+		setWorkspaceError(null);
+		try {
+			const response = await fetch(`/api/projects/${project.id}/workspace/directory`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ path }),
+			});
+			if (!response.ok) {
+				throw new Error(await readError(response));
+			}
+			setCreateDirectoryTarget(null);
+			await loadWorkspaceTree(project.id, createDirectoryTarget.parentPath);
+		} catch (err) {
+			setWorkspaceError(err instanceof Error ? err.message : "新建文件夹失败");
+		} finally {
+			setIsWorkspaceMutating(false);
+		}
 	}
 
 	/**
@@ -1290,8 +1354,10 @@ function ChatPage() {
 							</Button>
 						</div>
 
-						<ScrollArea className="min-h-0 flex-1">
-							<div className="flex min-h-full flex-col gap-3 p-3">
+							<ContextMenu>
+								<ContextMenuTrigger className="min-h-0 flex-1">
+									<ScrollArea className="h-full">
+										<div className="flex min-h-full flex-col gap-3 p-3">
 								{workspaceError ? (
 									<Alert variant="destructive">
 										<AlertTitle>文件树加载失败</AlertTitle>
@@ -1361,6 +1427,14 @@ function ChatPage() {
 																<Edit3Icon />
 																重命名
 															</ContextMenuItem>
+															{data.type === "directory" ? (
+																<ContextMenuItem
+																	onClick={() => openCreateDirectoryDialog(data)}
+																>
+																	<FolderPlusIcon />
+																	新建文件夹
+																</ContextMenuItem>
+															) : null}
 															<ContextMenuItem
 																variant="destructive"
 																disabled={isWorkspaceMutating}
@@ -1382,8 +1456,21 @@ function ChatPage() {
 										当前工作区还没有文件。
 									</div>
 								) : null}
-							</div>
-						</ScrollArea>
+										</div>
+									</ScrollArea>
+								</ContextMenuTrigger>
+								<ContextMenuContent>
+									<ContextMenuGroup>
+										<ContextMenuItem
+											disabled={!project || isWorkspaceMutating}
+											onClick={() => openCreateDirectoryDialog()}
+										>
+											<FolderPlusIcon />
+											新建文件夹
+										</ContextMenuItem>
+									</ContextMenuGroup>
+								</ContextMenuContent>
+							</ContextMenu>
 					</section>
 				</ResizablePanel>
 
@@ -1711,6 +1798,57 @@ function ChatPage() {
 								<Loader2Icon data-icon="inline-start" className="animate-spin" />
 							) : null}
 							保存
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
+			<Dialog
+				open={Boolean(createDirectoryTarget)}
+				onOpenChange={(open) => {
+					if (!open) {
+						setCreateDirectoryTarget(null);
+					}
+				}}
+			>
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle>新建文件夹</DialogTitle>
+						<DialogDescription>
+							将在 {createDirectoryTarget?.parentName ?? "根目录"} 下创建新文件夹。
+						</DialogDescription>
+					</DialogHeader>
+					<Input
+						value={createDirectoryValue}
+						disabled={isWorkspaceMutating}
+						onChange={(event) => setCreateDirectoryValue(event.target.value)}
+						onKeyDown={(event) => {
+							if (event.key === "Enter") {
+								event.preventDefault();
+								void createWorkspaceDirectory();
+							}
+						}}
+					/>
+					<DialogFooter>
+						<Button
+							variant="outline"
+							disabled={isWorkspaceMutating}
+							onClick={() => setCreateDirectoryTarget(null)}
+						>
+							取消
+						</Button>
+						<Button
+							disabled={
+								isWorkspaceMutating ||
+								!createDirectoryValue.trim() ||
+								createDirectoryValue.includes("/")
+							}
+							onClick={() => void createWorkspaceDirectory()}
+						>
+							{isWorkspaceMutating ? (
+								<Loader2Icon data-icon="inline-start" className="animate-spin" />
+							) : null}
+							创建
 						</Button>
 					</DialogFooter>
 				</DialogContent>
