@@ -351,7 +351,11 @@ export async function deleteWorkspacePath(
 	const normalizedPath = normalizeWorkspacePath(path);
 	const exactKey = buildWorkspaceObjectKey(projectId, normalizedPath);
 	const directoryPrefix = `${exactKey}/`;
-	const keysToDelete = new Set<string>([exactKey]);
+	const keysToDelete = new Set<string>();
+	if (await bucket.head(exactKey)) {
+		// 文件和目录 marker 都可能是精确 key，存在时才纳入删除结果。
+		keysToDelete.add(exactKey);
+	}
 	let cursor: string | undefined;
 	do {
 		// R2 没有目录实体，目录删除需要按 prefix 找到 marker 和所有子对象。

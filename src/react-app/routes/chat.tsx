@@ -168,6 +168,7 @@ interface WorkspaceTreeItem {
 	size?: number;
 	uploaded?: string;
 	isLoaded?: boolean;
+	isTruncated?: boolean;
 }
 
 /** 预览区打开的文件标签。 */
@@ -613,6 +614,9 @@ function ChatPage() {
 	const latestSessionTitle = session?.title || DEFAULT_SESSION_TITLE;
 	const activeFileTab = openFileTabs.find((tab) => tab.path === activeFilePath) ?? null;
 	const hasPreviewPanel = Boolean(activeFileTab);
+	const truncatedWorkspaceItems = Object.values(workspaceItems).filter(
+		(item) => item.type === "directory" && item.isTruncated,
+	);
 
 	/**
 	 * 关闭当前 chat stream。
@@ -713,11 +717,12 @@ function ChatPage() {
 							path: prefix,
 							type: "directory",
 						}),
-					children: childIds,
-					isLoaded: true,
-				};
-				return nextItems;
-			});
+						children: childIds,
+						isLoaded: true,
+						isTruncated: body.workspace.truncated,
+					};
+					return nextItems;
+				});
 		} catch (err) {
 			setWorkspaceError(err instanceof Error ? err.message : "加载文件树失败");
 		} finally {
@@ -1291,6 +1296,14 @@ function ChatPage() {
 									<Alert variant="destructive">
 										<AlertTitle>文件树加载失败</AlertTitle>
 										<AlertDescription>{workspaceError}</AlertDescription>
+									</Alert>
+								) : null}
+								{truncatedWorkspaceItems.length > 0 ? (
+									<Alert>
+										<AlertTitle>当前目录只显示第一批结果</AlertTitle>
+										<AlertDescription>
+											文件树按所选目录读取一层文件和文件夹，不递归拉取完整子树；如文件较多，请展开更具体的目录。
+										</AlertDescription>
 									</Alert>
 								) : null}
 								{isWorkspaceLoading && workspaceItems[WORKSPACE_ROOT_ID]?.children?.length === 0 ? (

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	buildWorkspaceObjectKey,
 	createWorkspaceDirectory,
+	deleteWorkspacePath,
 	listWorkspaceTree,
 	moveWorkspaceFile,
 	normalizeWorkspacePath,
@@ -63,10 +64,14 @@ function createFakeR2Bucket(initial: Record<string, string> = {}) {
 		Object.entries(initial).map(([key, content]) => [
 			key,
 			{ content, uploaded },
-			]),
+		]),
 	);
 	const listOptions: R2ListOptions[] = [];
 	const bucket = {
+		head: async (key: string) => {
+			const entry = objects.get(key);
+			return entry ? createFakeR2Object(key, entry) : null;
+		},
 		get: async (key: string) => {
 			const entry = objects.get(key);
 			return entry ? createFakeR2Object(key, entry) : null;
@@ -88,13 +93,16 @@ function createFakeR2Bucket(initial: Record<string, string> = {}) {
 			objects.set(key, entry);
 			return createFakeR2Object(key, entry);
 		},
-		delete: async (key: string) => {
-			objects.delete(key);
+		delete: async (key: string | string[]) => {
+			// R2 支持单 key 和批量 key 删除，测试桶需要覆盖目录删除路径。
+			for (const item of Array.isArray(key) ? key : [key]) {
+				objects.delete(item);
+			}
 		},
-			list: async (options?: R2ListOptions) => {
-				listOptions.push(options ?? {});
-				const prefix = options?.prefix ?? "";
-				const listedObjects = [...objects.entries()]
+		list: async (options?: R2ListOptions) => {
+			listOptions.push(options ?? {});
+			const prefix = options?.prefix ?? "";
+			const listedObjects = [...objects.entries()]
 				.filter(([key]) => key.startsWith(prefix))
 				.map(([key, entry]) => createFakeR2Object(key, entry));
 			return {
@@ -104,12 +112,12 @@ function createFakeR2Bucket(initial: Record<string, string> = {}) {
 			};
 		},
 	};
-		return {
-			bucket: bucket as unknown as R2Bucket,
-			objects,
-			listOptions,
-		};
-	}
+	return {
+		bucket: bucket as unknown as R2Bucket,
+		objects,
+		listOptions,
+	};
+}
 
 describe("workspace path helpers", () => {
 	test("uses project id as the R2 workspace root", () => {
@@ -142,6 +150,42 @@ describe("workspace R2 operations", () => {
 		).resolves.toMatchObject({ path: "src/b.txt", size: 5 });
 		expect(objects.has("project-1/src/a.txt")).toBe(false);
 		expect(objects.has("project-1/src/b.txt")).toBe(true);
+	});
+
+	test("deletes a single file without touching sibling paths", async () => {
+		const { bucket, objects } = createFakeR2Bucket({
+			"project-1/src/a.txt": "a",
+			"project-1/src/a.txt.bak": "bak",
+			"project-1/src/nested/b.txt": "b",
+		});
+
+		await expect(deleteWorkspacePath(bucket, "project-1", "src/a.txt")).resolves.toEqual({
+			path: "src/a.txt",
+			deletedObjectCount: 1,
+		});
+
+		expect(objects.has("project-1/src/a.txt")).toBe(false);
+		expect(objects.has("project-1/src/a.txt.bak")).toBe(true);
+		expect(objects.has("project-1/src/nested/b.txt")).toBe(true);
+	});
+
+	test("deletes directory marker and all objects under the directory prefix", async () => {
+		const { bucket, objects } = createFakeR2Bucket({
+			"project-1/src/.keep": "",
+			"project-1/src/index.ts": "code",
+			"project-1/src/nested/a.ts": "nested",
+			"project-1/src-other/file.ts": "sibling",
+		});
+
+		await expect(deleteWorkspacePath(bucket, "project-1", "src")).resolves.toEqual({
+			path: "src",
+			deletedObjectCount: 3,
+		});
+
+		expect(objects.has("project-1/src/.keep")).toBe(false);
+		expect(objects.has("project-1/src/index.ts")).toBe(false);
+		expect(objects.has("project-1/src/nested/a.ts")).toBe(false);
+		expect(objects.has("project-1/src-other/file.ts")).toBe(true);
 	});
 
 	test("lists direct children and empty directory markers", async () => {
