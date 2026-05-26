@@ -25,6 +25,7 @@
 - `/projects` 是 project 管理页面，基于 `/api/projects` 提供列表、创建、编辑和软删除；删除 project 会同步移除其下未删除 session，并对活跃 session 后台停止 runner，聊天页只展示未删除 project/session。
 - Cloudflare 资源使用 `NeoNoumiSandbox` / `NEO_NOUMI_SANDBOX` / `neo-noumi-sandbox` 命名，用户级 sandbox ID 使用 `neo-noumi-user-{userId}`。
 - Cloudflare outbound interception 的 CCR `--sdk-url` host 使用 `beacon.claude-ai.staging.ant.dev`；`api.anthropic.com` 作为 AI Proxy 劫持入口，由 Worker 校验短期 proxy token 后再转发到用户默认渠道或平台 fallback 渠道，真实上游 API key 不再注入 sandbox。
+- Sandbox 镜像通过 `CMD` 启动编译后的 `code-sandbox/main.ts` 观测服务，保留 Cloudflare Sandbox SDK 基础镜像的 `/container-server/sandbox` `ENTRYPOINT`；观测服务向 `neo-noumi-observability.internal` 上报 startup、heartbeat、resource、signal、shutdown、error 事件，由 Worker outbound handler 写入 `sandbox_observation_events`，不把数据库连接串注入 sandbox。
 - 容器粒度是“一个用户一个 sandbox/container”，而不是“一个 session 一个容器”。
 - runner 粒度仍是“一个活跃 session 一个 Claude Code CLI 进程”；`chat_sessions.runnerProcessId` 记录 session 对应的容器内进程，防止同一用户多个 session 互相复用错 runner。
 - 启动 runner 前，A 会从 `claude-code` sessionStore 或 internal events 恢复容器内 Claude 本地状态，并据此决定 Claude CLI 参数：没有历史 foreground transcript 时使用 `--session-id`，已有历史 transcript 时使用 `--resume`。

@@ -240,6 +240,30 @@ model UserContainer {
   @@map("user_containers")
 }
 
+/// Sandbox 容器内观测进程上报的运行事件。
+model SandboxObservationEvent {
+  /// 事件自增 ID，按写入顺序用于排查容器生命周期。
+  id         Int      @id @default(autoincrement())
+  /// 用户级 sandbox ID，例如 neo-noumi-user-{userId}。
+  sandboxId  String
+  /// Cloudflare Containers 运行时分配的 Durable Object 容器 ID。
+  containerId String?
+  /// 事件类型：startup、heartbeat、resource、signal、shutdown、error。
+  eventType  String
+  /// 容器内进程递增序号，用于判断心跳是否丢失。
+  sequence   Int?
+  /// 容器内观测到事件的时间。
+  observedAt DateTime @default(now())
+  /// 资源用量、信号名、运行时位置等事件详情。
+  payload    Json     @default("{}")
+  /// Worker 成功写入数据库的时间。
+  createdAt  DateTime @default(now())
+
+  @@index([sandboxId, observedAt])
+  @@index([eventType, observedAt])
+  @@map("sandbox_observation_events")
+}
+
 model ChatClientEvent {
   id          Int         @id @default(autoincrement())
   sessionId   String

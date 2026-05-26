@@ -148,7 +148,19 @@ interface ChatMessage {
 	createdAt: string;
 	status?: "pending" | "streaming" | "done" | "error";
 	meta?: string;
+	payloadDataType?: string;
+	chunk: ClientEvent | TimelineEvent;
 	raw?: unknown;
+}
+
+/** payload.data.type 专用气泡组件属性。 */
+interface PayloadDataBubbleRendererProps {
+	/** 页面消息模型。 */
+	message: ChatMessage;
+	/** 完整 timeline 消息 chunk，用于专用渲染器读取上下文。 */
+	chunk: TimelineEvent;
+	/** payload.data.type 业务类型。 */
+	payloadDataType: string;
 }
 
 /** Claude Code 工具权限申请。 */
@@ -491,6 +503,16 @@ function getAssistantContentType(payload: Record<string, unknown>): string | nul
 }
 
 /**
+ * 读取 payload.data.type 业务类型。
+ * @param payload worker payload
+ * @returns payload data 类型；没有时返回 null
+ */
+function getPayloadDataType(payload: Record<string, unknown>): string | null {
+	const data = isRecord(payload.data) ? payload.data : null;
+	return typeof data?.type === "string" ? data.type : null;
+}
+
+/**
  * 计算 timeline 的展示语义类型。
  * @param event timeline event
  * @returns 用于 UI 归类和折叠的类型
@@ -500,6 +522,11 @@ function getTimelineDisplayType(event: TimelineEvent): string {
 	// Claude Code 会把 thinking/tool_use 包在 assistant message 里，UI 应按内层 block 类型展示。
 	if (contentType === "thinking" || contentType === "tool_use") {
 		return contentType;
+	}
+	// progress frame 的细分类型放在 data.type，气泡折叠规则需要使用这个业务类型。
+	const payloadDataType = getPayloadDataType(event.payload);
+	if (payloadDataType) {
+		return payloadDataType;
 	}
 	return event.event_type;
 }
@@ -563,6 +590,7 @@ function clientEventToMessage(event: ClientEvent): ChatMessage | null {
 		content: stringifyContent(message.content),
 		createdAt: event.created_at,
 		status: "done",
+		chunk: event,
 	};
 }
 
@@ -579,6 +607,7 @@ function isSupportTimelineEvent(event: TimelineEvent): boolean {
 		"tool_use",
 		"tool_result",
 		"thinking",
+		"bash_progress",
 		"result",
 		"unknown",
 	].includes(event.event_type);
@@ -591,6 +620,7 @@ function isSupportTimelineEvent(event: TimelineEvent): boolean {
  */
 function timelineEventToMessage(event: TimelineEvent): ChatMessage {
 	const displayType = getTimelineDisplayType(event);
+	const payloadDataType = getPayloadDataType(event.payload) ?? undefined;
 	const isAssistant = displayType === "assistant";
 	const isResult = event.event_type === "result" || event.payload.type === "result";
 	return {
@@ -600,6 +630,8 @@ function timelineEventToMessage(event: TimelineEvent): ChatMessage {
 		createdAt: event.created_at,
 		status: isResult ? "done" : event.ephemeral ? "streaming" : "done",
 		meta: displayType,
+		payloadDataType,
+		chunk: event,
 		raw: event.payload,
 	};
 }
@@ -651,6 +683,15 @@ function getToolUseSummary(raw: unknown): string {
 }
 
 /**
+ * 判断消息 chunk 是否来自 timeline。
+ * @param chunk 页面消息 chunk
+ * @returns 是否为完整 timeline chunk
+ */
+function isTimelineMessageChunk(chunk: ChatMessage["chunk"]): chunk is TimelineEvent {
+	return "id" in chunk && typeof chunk.id === "number" && "payload" in chunk;
+}
+
+/**
  * 合并并排序历史消息。
  * @param clientEvents 用户事件
  * @param timeline worker timeline
@@ -674,15 +715,24 @@ function buildMessages(
 }
 
 /**
- * 格式化相对简短的时间。
+ * 格式化消息气泡时间。
  * @param value ISO 时间
- * @returns 本地时间文本
+ * @returns 精确到毫秒的本地时间文本
  */
 function formatTime(value: string): string {
-	return new Date(value).toLocaleTimeString([], {
+	const date = new Date(value);
+	if (Number.isNaN(date.getTime())) {
+		return value;
+	}
+	const baseTime = date.toLocaleTimeString([], {
 		hour: "2-digit",
 		minute: "2-digit",
+		second: "2-digit",
+		hour12: false,
 	});
+	// Intl 当前没有稳定的毫秒展示选项，手动补齐三位毫秒。
+	const milliseconds = date.getMilliseconds().toString().padStart(3, "0");
+	return `${baseTime}.${milliseconds}`;
 }
 
 /**
@@ -2375,13 +2425,59 @@ function ChatPage() {
 	);
 }
 
+/** 默认折叠展示的运行事件类型。 */
+const DEFAULT_COLLAPSED_TOOL_META_TYPES = [
+	"system",
+	"result",
+	"thinking",
+	"tool_use",
+	"bash_progress",
+	"control_request",
+	"control_response",
+];
+
 /**
- * 单条聊天消息。
+ * payload.data.type 默认气泡组件。
+ * @param props 组件属性
+ * @param props.message 页面消息
+ * @returns 消息气泡
+ */
+function GenericPayloadDataMessageBubble({ message }: PayloadDataBubbleRendererProps) {
+	return <DefaultMessageBubble message={message} />;
+}
+
+/**
+ * 单条聊天消息分发器。
  * @param props 组件属性
  * @param props.message 页面消息
  * @returns 消息气泡
  */
 function MessageBubble({ message }: { message: ChatMessage }) {
+	if (message.payloadDataType && isTimelineMessageChunk(message.chunk)) {
+		const payloadDataBubbleProps = {
+			message,
+			chunk: message.chunk,
+			payloadDataType: message.payloadDataType,
+		};
+		switch (message.payloadDataType) {
+			case "bash_progress":
+				// 先显式保留分支；后续 bash_progress 可替换成独立组件。
+				return <GenericPayloadDataMessageBubble {...payloadDataBubbleProps} />;
+			default:
+				// 未单独适配的 payload.data.type 暂时复用通用气泡。
+				return <GenericPayloadDataMessageBubble {...payloadDataBubbleProps} />;
+		}
+	}
+	return <DefaultMessageBubble message={message} />;
+}
+
+/**
+ * 默认聊天消息气泡。
+ * @param props 组件属性
+ * @param props.message 页面消息
+ * @returns 消息气泡
+ */
+function DefaultMessageBubble({ message }: { message: ChatMessage }) {
 	const isUser = message.role === "user";
 	const isTool = message.role === "tool";
 	const isThinking = message.meta === "thinking";
@@ -2390,9 +2486,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 		message.meta === "control_request" || message.meta === "control_response";
 	const isCollapsedRawEvent =
 		isTool &&
-		["system", "result", "thinking", "tool_use", "control_request", "control_response"].includes(
-			message.meta ?? "",
-		);
+		DEFAULT_COLLAPSED_TOOL_META_TYPES.includes(message.meta ?? "");
 	return (
 		<article
 			className={cn(

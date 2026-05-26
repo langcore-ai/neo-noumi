@@ -1,0 +1,14 @@
+*
+
+!Dockerfile
+!.dockerignore
+
+!code-sandbox/
+!code-sandbox/main.ts
+!code-sandbox/package.json
+!code-sandbox/bun.lock
+
+!prompt/
+!prompt/CLAUDE.md
+!prompt/inner-skill/
+!prompt/inner-skill/**

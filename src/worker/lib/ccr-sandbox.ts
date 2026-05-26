@@ -1,12 +1,14 @@
 import { Sandbox, getSandbox } from "@cloudflare/sandbox";
+import type { OutboundHandlerContext } from "@cloudflare/containers";
 import { CLAUDE_SESSION_STORE_PROJECT_KEY, type CcrStore } from "./ccr-store";
-import { isJsonObject } from "./ccr-json";
+import { isJsonObject, toJsonValue } from "./ccr-json";
 import { CCR_SDK_APPROVED_HOST } from "./ccr-protocol";
 import {
 	ANTHROPIC_API_HOST,
 	proxyAnthropicApiRequest,
 	type AiProxyBindings,
 } from "./ccr-ai-proxy";
+import { createPrismaClient } from "./prisma";
 import type { JsonObject } from "./ccr-types";
 import {
 	buildClaudeProjectStateDir,
@@ -24,6 +26,9 @@ const ENV_PATH = "/tmp/neo-noumi/ccr-env.sh";
 /** Sandbox 内 CCR runner 日志路径，避免写入用户 workspace。 */
 const RUNNER_LOG_PATH = "/tmp/neo-noumi/ccr-runner.log";
 
+/** Sandbox 内观测服务的虚拟上报 host，由 Worker outbound handler 接收。 */
+const SANDBOX_OBSERVABILITY_HOST = "neo-noumi-observability.internal";
+
 /** 旧版 /workspace cwd 对应的 Claude Code 项目状态目录。 */
 const CLAUDE_LEGACY_PROJECT_STATE_DIR = "/root/.claude/projects/-workspace";
 
@@ -40,6 +45,16 @@ const TRANSCRIPT_RESTORE_PAGE_SIZE = 500;
 
 /** Claude Code 默认模型；固定到网关可识别的 Sonnet 模型，避免 CLI 选择 Opus 后缀模型。 */
 const CLAUDE_MODEL = "claude-sonnet-4-6";
+
+/** Sandbox 观测事件类型白名单。 */
+const SANDBOX_OBSERVATION_EVENT_TYPES = new Set([
+	"startup",
+	"heartbeat",
+	"resource",
+	"signal",
+	"shutdown",
+	"error",
+]);
 
 /** Project workspace 挂载信息。 */
 type ProjectWorkspaceMount = {
@@ -96,7 +111,92 @@ export class NeoNoumiSandbox extends Sandbox {
 	interceptHttps = true;
 }
 
+/**
+ * 读取 Worker 可用的 PostgreSQL 连接串。
+ * @param env Worker 绑定
+ * @returns PostgreSQL 连接串
+ */
+function getDatabaseUrl(env: NeoNoumiSandboxBindings): string {
+	const databaseUrl = env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL;
+	if (!databaseUrl) {
+		throw new Error("DATABASE_URL or HYPERDRIVE.connectionString is required");
+	}
+	return databaseUrl;
+}
+
+/**
+ * 从观测事件 payload 中读取用户级 sandbox ID。
+ * @param payload 观测事件 payload
+ * @param fallback 无法读取时使用的容器运行时 ID
+ * @returns sandbox ID
+ */
+function readObservedSandboxId(payload: JsonObject, fallback: string): string {
+	const sandboxId = payload.sandbox_id;
+	return typeof sandboxId === "string" && sandboxId.length > 0
+		? sandboxId
+		: fallback;
+}
+
+/**
+ * 写入 sandbox 观测事件。
+ * @param request 容器内观测进程发出的请求
+ * @param env Worker 绑定
+ * @param context outbound handler 上下文
+ * @returns 写入结果响应
+ */
+async function recordSandboxObservation(
+	request: Request,
+	env: NeoNoumiSandboxBindings,
+	context: OutboundHandlerContext,
+): Promise<Response> {
+	if (request.method !== "POST") {
+		return new Response("Method Not Allowed", { status: 405 });
+	}
+	const url = new URL(request.url);
+	if (url.pathname !== "/events") {
+		return new Response("Not Found", { status: 404 });
+	}
+	const input = await request.json().catch(() => null);
+	if (!isJsonObject(input)) {
+		return Response.json({ error: "Invalid observation payload" }, { status: 400 });
+	}
+	const eventType = typeof input.eventType === "string" ? input.eventType : "";
+	if (!SANDBOX_OBSERVATION_EVENT_TYPES.has(eventType)) {
+		return Response.json({ error: "Invalid observation event type" }, { status: 400 });
+	}
+	const payload = isJsonObject(input.payload) ? input.payload : {};
+	const observedAt =
+		typeof input.observedAt === "string" ? new Date(input.observedAt) : new Date();
+	const sequence =
+		typeof input.sequence === "number" && Number.isInteger(input.sequence)
+			? input.sequence
+			: null;
+	const prisma = createPrismaClient(getDatabaseUrl(env));
+	await prisma.sandboxObservationEvent.create({
+		data: {
+			sandboxId: readObservedSandboxId(payload, context.containerId),
+			containerId: context.containerId,
+			eventType,
+			sequence,
+			observedAt: Number.isNaN(observedAt.getTime()) ? new Date() : observedAt,
+			payload: toJsonValue(payload) ?? {},
+		},
+	});
+	return Response.json({ ok: true });
+}
+
 NeoNoumiSandbox.outboundByHost = {
+	[SANDBOX_OBSERVABILITY_HOST]: async (
+		request: Request,
+		env: Env,
+		context: OutboundHandlerContext,
+	) => {
+		return recordSandboxObservation(
+			request,
+			env as Env & NeoNoumiSandboxBindings,
+			context,
+		);
+	},
 	[CCR_SDK_APPROVED_HOST]: async (request: Request, env: Env) => {
 		// Claude Code 请求 approved host，Worker 内部重写回本服务的 CCR routes
 		const url = new URL(request.url);
@@ -701,6 +801,11 @@ export async function startCcrSandbox(
 	await store.updateActiveContainer(sessionId, {
 		containerStatus: "starting",
 		sandboxId,
+	});
+	await sandbox.setEnvVars({
+		// 非敏感标识注入容器，供观测主进程上报时标记用户级 sandbox。
+		NEO_NOUMI_SANDBOX_ID: sandboxId,
+		NEO_NOUMI_OBSERVABILITY_ENDPOINT: `http://${SANDBOX_OBSERVABILITY_HOST}/events`,
 	});
 	const workspaceMount = await ensureProjectWorkspaceMounted(
 		sandbox,
