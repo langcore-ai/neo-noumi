@@ -5,12 +5,14 @@ import { createAuth } from "./auth";
 import {
 	buildCanUseToolDecisionResponse,
 	handleControlRequest,
+	isCcrPermissionMode,
 	type ToolPermissionDecision,
 } from "./ccr-control";
 import {
 	CLAUDE_SESSION_STORE_PROJECT_KEY,
 	CcrStore,
 	ProjectNameConflictError,
+	type ChatControlInput,
 } from "./ccr-store";
 import {
 	destroyCcrSandbox,
@@ -172,6 +174,36 @@ function readHistoryLimit(limitQuery: string | undefined): number {
 function readPositiveIntegerQuery(value: string | undefined): number | null {
 	const parsed = Number(value);
 	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+/**
+ * 读取 chat 请求携带的 Claude Code 控制选项。
+ * @param body 请求 JSON
+ * @returns 已校验的控制选项
+ */
+function readChatControlInput(body: Record<string, unknown>): ChatControlInput {
+	const permissionMode = body.permissionMode ?? body.permission_mode;
+	const model = getStringField(body, "model")?.trim();
+	const rawMaxThinkingTokens = body.maxThinkingTokens ?? body.max_thinking_tokens;
+	const control: ChatControlInput = {};
+	if (isCcrPermissionMode(permissionMode)) {
+		// plan 模式是明确产品需求；ultraplan 只作为额外标记，不影响普通 plan。
+		control.permissionMode = permissionMode;
+		control.ultraplan = body.ultraplan === true;
+	}
+	if (model) {
+		control.model = model;
+	}
+	if (rawMaxThinkingTokens === null) {
+		control.maxThinkingTokens = null;
+	} else if (
+		typeof rawMaxThinkingTokens === "number" &&
+		Number.isSafeInteger(rawMaxThinkingTokens) &&
+		rawMaxThinkingTokens >= 0
+	) {
+		control.maxThinkingTokens = rawMaxThinkingTokens;
+	}
+	return control;
 }
 
 /**
@@ -937,6 +969,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 						content: toJsonValue(body.message ?? body.content),
 					},
 				];
+		const control = readChatControlInput(body);
 		if (c.req.header("accept")?.includes("text/event-stream")) {
 			const cursor = readSseCursor(
 				c.req.header("Last-Event-ID"),
@@ -951,7 +984,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 							session,
 						}),
 					);
-					acceptedEvents = await store.enqueueChatInput(sessionId, messages);
+					acceptedEvents = await store.enqueueChatInput(sessionId, messages, control);
 					try {
 						await startCcrSandbox(
 							c.req.raw,
@@ -997,7 +1030,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 				}
 			});
 		}
-		const acceptedEvents = await store.enqueueChatInput(sessionId, messages);
+		const acceptedEvents = await store.enqueueChatInput(sessionId, messages, control);
 		try {
 			await startCcrSandbox(c.req.raw, c.env, store, c.get("userId"), sessionId);
 		} catch (error) {

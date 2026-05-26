@@ -9,6 +9,26 @@ import {
 import { readError } from "@/lib/api-error";
 import type { ChatSession } from "@/hooks/use-chat-sessions";
 
+/** Claude Code 支持的外部权限模式。 */
+export type ChatPermissionMode =
+	| "default"
+	| "acceptEdits"
+	| "bypassPermissions"
+	| "plan"
+	| "dontAsk";
+
+/** 单次发送前需要下发给 Claude Code 的控制选项。 */
+export interface ChatControlOptions {
+	/** 本轮权限模式。 */
+	permissionMode?: ChatPermissionMode;
+	/** 是否带 ultraplan 标记。 */
+	ultraplan?: boolean;
+	/** 本轮模型。 */
+	model?: string;
+	/** thinking token 上限；null 表示恢复默认。 */
+	maxThinkingTokens?: number | null;
+}
+
 /** Chat 业务 hook 入参。 */
 interface UseChatBusinessOptions {
 	/** 当前会话；session 生命周期由 useChatSessions 控制。 */
@@ -31,6 +51,8 @@ interface UseChatBusinessOptions {
 	appendTimelineEvent: (event: TimelineEvent) => void;
 	/** 用户主动发送时请求滚动到底部。 */
 	onRequestScrollToBottom?: () => void;
+	/** 读取发送时使用的控制选项。 */
+	getControlOptions?: () => ChatControlOptions;
 }
 
 /**
@@ -130,6 +152,7 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 		setSession,
 		timeline,
 		updateClientEvent,
+		getControlOptions,
 	} = options;
 	const streamAbortRef = useRef<AbortController | null>(null);
 	const [draft, setDraft] = useState("");
@@ -268,6 +291,7 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 		sessionId: string,
 		content: string,
 		cursor: number,
+		controlOptions: ChatControlOptions,
 	): Promise<ChatStreamFrameResult> {
 		closeTimelineStream();
 		const controller = new AbortController();
@@ -282,7 +306,7 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 						accept: "text/event-stream",
 						"content-type": "application/json",
 					},
-					body: JSON.stringify({ message: content }),
+					body: JSON.stringify({ message: content, ...controlOptions }),
 					signal: controller.signal,
 				},
 			);
@@ -425,7 +449,12 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 		try {
 			const activeSession = await ensureSession(content);
 			const cursor = timeline.reduce((maxId, event) => Math.max(maxId, event.id), 0);
-			const streamResult = await streamMessage(activeSession.id, content, cursor);
+			const streamResult = await streamMessage(
+				activeSession.id,
+				content,
+				cursor,
+				getControlOptions?.() ?? {},
+			);
 			if (streamResult === "terminal") {
 				markSessionIdle(activeSession.id);
 			}

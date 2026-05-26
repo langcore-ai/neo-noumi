@@ -13,6 +13,7 @@ import {
 	ClockIcon,
 	Loader2Icon,
 	MessageSquarePlusIcon,
+	PauseCircleIcon,
 	RefreshCwIcon,
 	SendIcon,
 	SquareIcon,
@@ -58,6 +59,14 @@ import {
 	ResizablePanelGroup,
 } from "@/components/ui/resizable";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+	Select,
+	SelectContent,
+	SelectGroup,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { authClient } from "@/lib/auth-client";
@@ -67,7 +76,10 @@ import {
 	type Project,
 	useChatSessions,
 } from "@/hooks/use-chat-sessions";
-import { useChatBusiness } from "@/hooks/use-chat-business";
+import {
+	type ChatPermissionMode,
+	useChatBusiness,
+} from "@/hooks/use-chat-business";
 import { readError } from "@/lib/api-error";
 import {
 	addOptimisticWorkspaceDirectory,
@@ -100,6 +112,68 @@ const CHAT_BOTTOM_STICK_THRESHOLD = 48;
 
 /** 触顶加载更早历史的像素阈值。 */
 const CHAT_HISTORY_TOP_THRESHOLD = 24;
+
+/** Chat 输入区可选的权限模式。 */
+const CHAT_PERMISSION_MODE_OPTIONS: Array<{
+	/** Claude Code control_request 使用的模式值。 */
+	value: ChatPermissionMode;
+	/** UI 展示名称。 */
+	label: string;
+}> = [
+	{ value: "default", label: "Default" },
+	{ value: "plan", label: "Plan" },
+	{ value: "acceptEdits", label: "Accept edits" },
+	{ value: "bypassPermissions", label: "Bypass permissions" },
+	{ value: "dontAsk", label: "Don't ask" },
+];
+
+/** Chat 输入区可选的模型。 */
+const CHAT_MODEL_OPTIONS = ["sonnet", "opus", "default"] as const;
+
+/**
+ * 判断 metadata 中的权限模式是否可由当前页面控制。
+ * @param value metadata 字段值
+ * @returns 是否为已知权限模式
+ */
+function isChatPermissionMode(value: unknown): value is ChatPermissionMode {
+	return CHAT_PERMISSION_MODE_OPTIONS.some((option) => option.value === value);
+}
+
+/**
+ * 读取权限模式展示名称。
+ * @param mode 权限模式
+ * @returns 展示名称
+ */
+function getPermissionModeLabel(mode: string): string {
+	return (
+		CHAT_PERMISSION_MODE_OPTIONS.find((option) => option.value === mode)?.label ?? mode
+	);
+}
+
+/**
+ * 判断模型是否在当前页面的预设选项里。
+ * @param model 模型名
+ * @returns 是否为预设模型
+ */
+function isChatModelOption(
+	model: string,
+): model is (typeof CHAT_MODEL_OPTIONS)[number] {
+	return CHAT_MODEL_OPTIONS.includes(model as (typeof CHAT_MODEL_OPTIONS)[number]);
+}
+
+/**
+ * 读取会话 metadata 中的字符串字段。
+ * @param metadata 会话 metadata
+ * @param key 字段名
+ * @returns 字符串字段
+ */
+function readMetadataString(
+	metadata: Record<string, unknown> | undefined,
+	key: string,
+): string | undefined {
+	const value = metadata?.[key];
+	return typeof value === "string" ? value : undefined;
+}
 
 export const Route = createFileRoute("/chat")({
 	validateSearch: (search): ChatSearch => ({
@@ -141,6 +215,8 @@ function ChatPage() {
 		useState<CreateDirectoryTarget | null>(null);
 	const [createDirectoryValue, setCreateDirectoryValue] = useState("新建文件夹");
 	const [uploadTarget, setUploadTarget] = useState<UploadTarget | null>(null);
+	const [permissionMode, setPermissionMode] = useState<string>("default");
+	const [chatModel, setChatModel] = useState("sonnet");
 
 	/**
 	 * 同步 chat 页面 URL 查询参数。
@@ -197,6 +273,20 @@ function ChatPage() {
 		submitToolPermissionDecision,
 	} = useChatBusiness({
 		...chatSessionState,
+		getControlOptions: () => {
+			const controlMode = isChatPermissionMode(permissionMode)
+				? permissionMode
+				: undefined;
+			return {
+				...(controlMode
+					? {
+							permissionMode: controlMode,
+							ultraplan: controlMode === "plan",
+						}
+					: {}),
+				model: chatModel,
+			};
+		},
 		loadSessions,
 		onRequestScrollToBottom: () => {
 			forceStickToBottomRef.current = true;
@@ -206,6 +296,33 @@ function ChatPage() {
 	});
 	const latestSessionTitle = session?.title || DEFAULT_SESSION_TITLE;
 	const displayError = error ?? sessionError;
+	const sessionPermissionMode = readMetadataString(
+		session?.externalMetadata,
+		"permission_mode",
+	);
+	const sessionModel = readMetadataString(session?.externalMetadata, "model");
+	const taskSummary = readMetadataString(session?.externalMetadata, "task_summary");
+	const permissionModeLabel = getPermissionModeLabel(permissionMode);
+	const permissionModeOptions = isChatPermissionMode(permissionMode)
+		? CHAT_PERMISSION_MODE_OPTIONS
+		: [
+				{ value: permissionMode, label: permissionMode },
+				...CHAT_PERMISSION_MODE_OPTIONS,
+			];
+	const chatModelOptions = isChatModelOption(chatModel)
+		? CHAT_MODEL_OPTIONS
+		: ([chatModel, ...CHAT_MODEL_OPTIONS] as const);
+
+	useEffect(() => {
+		if (sessionPermissionMode) {
+			// metadata 是 worker/route 的真实状态来源；即使未来新增模式，UI 也要先保留并展示。
+			setPermissionMode(sessionPermissionMode);
+		}
+		if (sessionModel) {
+			// Claude Code 的 set_model 接受任意字符串，不能因为不在预设里就丢掉真实模型名。
+			setChatModel(sessionModel);
+		}
+	}, [sessionModel, sessionPermissionMode]);
 
 	/**
 	 * 重置完整对话上下文。
@@ -1078,9 +1195,16 @@ function ChatPage() {
 											就绪
 										</Badge>
 									)}
+									<Badge variant={permissionMode === "plan" ? "secondary" : "outline"}>
+										{permissionMode === "plan" ? (
+											<PauseCircleIcon data-icon="inline-start" />
+										) : null}
+										{permissionModeLabel}
+									</Badge>
+									<Badge variant="outline">{chatModel}</Badge>
 								</div>
 								<p className="truncate text-sm text-muted-foreground">
-									{session?.id ?? "发送消息后会自动创建会话"}
+									{taskSummary || session?.id || "发送消息后会自动创建会话"}
 								</p>
 							</div>
 							<div className="flex shrink-0 items-center gap-2">
@@ -1205,6 +1329,58 @@ function ChatPage() {
 						<footer className="shrink-0 border-t bg-background px-4 py-4">
 							<div className="mx-auto flex max-w-4xl flex-col gap-3">
 								<div className="rounded-xl border bg-card p-2 shadow-sm">
+									<div className="flex flex-wrap items-center gap-2 px-1 pb-2">
+										<Select
+											value={permissionMode}
+											onValueChange={(value) => {
+												if (value) {
+													setPermissionMode(value);
+												}
+											}}
+											disabled={running}
+										>
+											<SelectTrigger size="sm" className="min-w-36">
+												<SelectValue />
+											</SelectTrigger>
+											<SelectContent>
+												<SelectGroup>
+													{permissionModeOptions.map((option) => (
+														<SelectItem key={option.value} value={option.value}>
+															{option.label}
+														</SelectItem>
+													))}
+												</SelectGroup>
+											</SelectContent>
+										</Select>
+										<Select
+											value={chatModel}
+											onValueChange={(value) => {
+												if (value) {
+													setChatModel(value);
+												}
+											}}
+											disabled={running}
+										>
+											<SelectTrigger size="sm" className="min-w-28">
+												<SelectValue />
+											</SelectTrigger>
+											<SelectContent>
+												<SelectGroup>
+													{chatModelOptions.map((model) => (
+														<SelectItem key={model} value={model}>
+															{model}
+														</SelectItem>
+													))}
+												</SelectGroup>
+											</SelectContent>
+										</Select>
+										{permissionMode === "plan" ? (
+											<Badge variant="secondary">
+												<PauseCircleIcon data-icon="inline-start" />
+												Plan mode
+											</Badge>
+										) : null}
+									</div>
 									<Textarea
 										value={draft}
 										disabled={running}

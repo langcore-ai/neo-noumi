@@ -1,6 +1,12 @@
 import { Prisma, type PrismaClient } from "../../generated/prisma/client";
 import { getStringField, isJsonObject, mergeJsonObject, toJsonValue } from "./ccr-json";
-import { buildRouteMcpInitializeRequest } from "./ccr-control";
+import {
+	buildRouteMcpInitializeRequest,
+	buildSetMaxThinkingTokensRequest,
+	buildSetModelRequest,
+	buildSetPermissionModeRequest,
+	type CcrPermissionMode,
+} from "./ccr-control";
 import {
 	CLIENT_EVENT_STATUS_FAILED,
 	CLIENT_EVENT_STATUS_QUEUED,
@@ -94,6 +100,36 @@ export class ProjectNameConflictError extends Error {
 	}
 }
 
+/** 下发给 Claude Code 的会话控制选项。 */
+export type ChatControlInput = {
+	/** 本轮使用的权限模式；plan 模式通过该字段下发。 */
+	permissionMode?: CcrPermissionMode;
+	/** 是否标记为 ultraplan；仅在 permissionMode=plan 时有意义。 */
+	ultraplan?: boolean;
+	/** 本轮目标模型；空字符串表示不下发模型切换。 */
+	model?: string;
+	/** thinking token 上限；null 表示恢复 Claude Code 默认配置。 */
+	maxThinkingTokens?: number | null;
+};
+
+/** route 准备入队的 client event。 */
+type ClientEventEnqueueInput = {
+	/** client event payload。 */
+	payload: JsonObject;
+	/** 显式事件类型；缺省时使用 payload.type。 */
+	eventType?: string;
+	/** 事件来源。 */
+	source?: string;
+};
+
+/** chat 控制事件和对应 metadata patch。 */
+type ChatControlBuildResult = {
+	/** 需要先于用户消息入队的控制事件。 */
+	events: ClientEventEnqueueInput[];
+	/** 可提前同步的 session metadata。 */
+	metadata: JsonObject;
+};
+
 /**
  * 计算恢复窗口查询游标，保留最新 compact boundary 本身。
  * @param cursor 客户端分页游标
@@ -143,6 +179,16 @@ function newEventId(): string {
  */
 function newAiProxyToken(): string {
 	return `${AI_PROXY_TOKEN_PREFIX}${crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+/**
+ * 判断权限模式切换是否适合在 route 侧提前同步 metadata。
+ * @param mode 权限模式
+ * @returns 可以提前同步时返回 true
+ */
+function canOptimisticallySyncPermissionMode(mode: CcrPermissionMode): boolean {
+	// bypassPermissions 会被 Claude Code 按启动参数和设置二次拒绝，不能在成功前确认到 metadata。
+	return mode !== "bypassPermissions";
 }
 
 /** internal event fallback 恢复用 DTO。 */
@@ -1352,23 +1398,138 @@ export class CcrStore {
 	}
 
 	/**
+	 * 合并写入 route 主动下发的会话 metadata。
+	 * @param sessionId session ID
+	 * @param metadata metadata patch；null 字段按 merge patch 语义删除
+	 * @returns 是否写入成功
+	 */
+	async updateSessionExternalMetadata(
+		sessionId: string,
+		metadata: JsonObject,
+	): Promise<boolean> {
+		return this.prisma.$transaction(async (tx) => {
+			const session = await tx.chatSession.findFirst({
+				where: { id: sessionId, deletedAt: null },
+				select: { externalMetadata: true },
+			});
+			if (!session) {
+				return false;
+			}
+			const result = await tx.chatSession.updateMany({
+				where: { id: sessionId, deletedAt: null },
+				data: {
+					externalMetadata: mergeJsonObject(
+						asJsonObject(session.externalMetadata),
+						metadata,
+					),
+				},
+			});
+			if (result.count === 0) {
+				return false;
+			}
+			await tx.chatOperationLog.create({
+				data: {
+					sessionId,
+					direction: "route_to_worker",
+					category: "session_metadata",
+					payload: metadata,
+				},
+			});
+			return true;
+		});
+	}
+
+	/**
+	 * 构造并入队本轮需要先于用户消息执行的控制事件。
+	 * @param sessionId session ID
+	 * @param control 控制选项
+	 * @returns 已入队的 client events
+	 */
+	async enqueueChatControls(sessionId: string, control: ChatControlInput = {}) {
+		const built = this.buildChatControlEvents(control);
+		return this.enqueueClientEvents(sessionId, built.events, built.metadata);
+	}
+
+	/**
+	 * 构造本轮 chat 控制事件和可提前同步的 metadata。
+	 * @param control 控制选项
+	 * @returns 控制事件与 metadata patch
+	 */
+	private buildChatControlEvents(control: ChatControlInput = {}): ChatControlBuildResult {
+		const events: ClientEventEnqueueInput[] = [];
+		const metadata: JsonObject = {};
+		if (control.permissionMode) {
+			events.push(
+				{
+					payload: buildSetPermissionModeRequest(control.permissionMode, {
+						ultraplan:
+							control.permissionMode === "plan" ? control.ultraplan === true : undefined,
+					}),
+					eventType: "control_request",
+					source: "chat-api",
+				},
+			);
+			if (canOptimisticallySyncPermissionMode(control.permissionMode)) {
+				// route 只能提前同步不会被当前 CLI 二次拒绝的模式，避免 UI 进入假状态。
+				metadata.permission_mode = control.permissionMode;
+				metadata.is_ultraplan_mode =
+					control.permissionMode === "plan" && control.ultraplan === true ? true : null;
+			}
+		}
+
+		if (control.model) {
+			events.push(
+				{
+					payload: buildSetModelRequest(control.model),
+					eventType: "control_request",
+					source: "chat-api",
+				},
+			);
+			if (control.model !== "default") {
+				// default 会由 Claude Code 解析成真实模型名，route 侧不能提前猜测。
+				metadata.model = control.model;
+			}
+		}
+
+		if (Object.hasOwn(control, "maxThinkingTokens")) {
+			const tokens = control.maxThinkingTokens ?? null;
+			events.push(
+				{
+					payload: buildSetMaxThinkingTokensRequest(tokens),
+					eventType: "control_request",
+					source: "chat-api",
+				},
+			);
+			metadata.max_thinking_tokens = tokens;
+		}
+
+		return { events, metadata };
+	}
+
+	/**
 	 * 写入用户消息并启动用 client event。
 	 * @param sessionId session ID
 	 * @param messages 用户消息列表
+	 * @param control 需要在用户消息前下发的控制选项
 	 */
-	async enqueueChatInput(sessionId: string, messages: ChatMessageInput[]) {
-		const events: Array<Awaited<ReturnType<CcrStore["enqueueClientEvent"]>>> = [];
-		events.push(
-			await this.enqueueClientEvent(sessionId, buildRouteMcpInitializeRequest(), {
+	async enqueueChatInput(
+		sessionId: string,
+		messages: ChatMessageInput[],
+		control: ChatControlInput = {},
+	) {
+		const builtControls = this.buildChatControlEvents(control);
+		const events: ClientEventEnqueueInput[] = [
+			{
+				payload: buildRouteMcpInitializeRequest(),
 				eventType: "control_request",
 				source: "chat-api",
-			}),
-		);
+			},
+			...builtControls.events,
+		];
 		for (const message of messages) {
 			events.push(
-				await this.enqueueClientEvent(
-					sessionId,
-					{
+				{
+					payload: {
 						type: "user",
 						message: {
 							role: message.role,
@@ -1377,11 +1538,12 @@ export class CcrStore {
 						session_id: sessionId,
 						parent_tool_use_id: null,
 					},
-					{ eventType: "user", source: "chat-api" },
-				),
+					eventType: "user",
+					source: "chat-api",
+				},
 			);
 		}
-		return events;
+		return this.enqueueClientEvents(sessionId, events, builtControls.metadata);
 	}
 
 	/**
@@ -1415,37 +1577,88 @@ export class CcrStore {
 		payload: JsonObject,
 		options: { eventType?: string; source?: string } = {},
 	) {
-		const eventType = options.eventType ?? String(payload.type ?? "message");
-		const source = options.source ?? "route";
-		const created = await this.prisma.$transaction(async (tx) => {
+		const [created] = await this.enqueueClientEvents(sessionId, [
+			{ payload, eventType: options.eventType, source: options.source },
+		]);
+		if (!created) {
+			throw new Error("Failed to enqueue client event");
+		}
+		return created;
+	}
+
+	/**
+	 * 批量下发 client events，并为同一轮 chat 分配连续 sequence。
+	 * @param sessionId session ID
+	 * @param inputs 待入队事件
+	 * @param metadata 可随本批事件一起写入的 metadata patch
+	 * @returns 事件记录
+	 */
+	private async enqueueClientEvents(
+		sessionId: string,
+		inputs: ClientEventEnqueueInput[],
+		metadata: JsonObject = {},
+	) {
+		if (inputs.length === 0) {
+			return [];
+		}
+		const created = await runSerializableTransaction(this.prisma, async (tx) => {
 			const [session] = await tx.chatSession.updateManyAndReturn({
 				where: { id: sessionId, deletedAt: null },
-				// client event 序号由 session 行集中分配，避免并发读 max(sequenceNum) 抢号。
-				data: { nextClientSequence: { increment: 1 } },
-				select: { nextClientSequence: true },
+				// 同一批 chat 输入必须一次性分配连续 sequence，避免并发发送把控制事件串到别的 prompt。
+				data: { nextClientSequence: { increment: inputs.length } },
+				select: { nextClientSequence: true, externalMetadata: true },
 			});
 			if (!session) {
 				throw new Error("Session not found or deleting");
 			}
-			const sequenceNum = session.nextClientSequence - 1;
-			return tx.chatClientEvent.create({
-				data: {
-					sessionId,
-					eventId: newEventId(),
-					sequenceNum,
-					eventType,
-					source,
-					payload,
-				},
-			});
+			const firstSequenceNum = session.nextClientSequence - inputs.length;
+			const rows = [];
+			for (const [index, input] of inputs.entries()) {
+				const eventType = input.eventType ?? String(input.payload.type ?? "message");
+				const source = input.source ?? "route";
+				const row = await tx.chatClientEvent.create({
+					data: {
+						sessionId,
+						eventId: newEventId(),
+						sequenceNum: firstSequenceNum + index,
+						eventType,
+						source,
+						payload: input.payload,
+					},
+				});
+				await tx.chatOperationLog.create({
+					data: {
+						sessionId,
+						direction: "route_to_worker",
+						category: eventType,
+						eventId: row.eventId,
+						payload: input.payload,
+					},
+				});
+				rows.push(row);
+			}
+			if (Object.keys(metadata).length > 0) {
+				await tx.chatSession.updateMany({
+					where: { id: sessionId, deletedAt: null },
+					data: {
+						externalMetadata: mergeJsonObject(
+							asJsonObject(session.externalMetadata),
+							metadata,
+						),
+					},
+				});
+				await tx.chatOperationLog.create({
+					data: {
+						sessionId,
+						direction: "route_to_worker",
+						category: "session_metadata",
+						payload: metadata,
+					},
+				});
+			}
+			return rows;
 		});
-		await this.recordOperation(sessionId, {
-			direction: "route_to_worker",
-			category: eventType,
-			eventId: created.eventId,
-			payload,
-		});
-		return this.toClientEventDto(created);
+		return created.map((row) => this.toClientEventDto(row));
 	}
 
 	/**

@@ -170,6 +170,142 @@ describe("CcrStore tool permission lookup", () => {
 	});
 });
 
+describe("chat control event enqueueing", () => {
+	test("queues one chat turn in a single consecutive sequence transaction", async () => {
+		const createdEvents: Array<{
+			eventId: string;
+			sequenceNum: number;
+			eventType: string;
+			source: string;
+			payload: unknown;
+			createdAt: Date;
+		}> = [];
+		const operationLogs: unknown[] = [];
+		const sessionUpdates: unknown[] = [];
+		const store = createStoreFromFakePrisma({
+			$transaction: async (fn: (tx: unknown) => Promise<unknown>) =>
+				fn({
+					chatSession: {
+						updateManyAndReturn: async (args: unknown) => {
+							sessionUpdates.push(args);
+							return [
+								{
+									nextClientSequence: 105,
+									externalMetadata: { model: "sonnet" },
+								},
+							];
+						},
+						updateMany: async (args: unknown) => {
+							sessionUpdates.push(args);
+							return { count: 1 };
+						},
+					},
+					chatClientEvent: {
+						create: async ({
+							data,
+						}: {
+							data: Omit<typeof createdEvents[number], "createdAt">;
+						}) => {
+							const row = {
+								...data,
+								createdAt: new Date("2026-05-26T00:00:00.000Z"),
+							};
+							createdEvents.push(row);
+							return row;
+						},
+					},
+					chatOperationLog: {
+						create: async (args: unknown) => {
+							operationLogs.push(args);
+							return {};
+						},
+					},
+					}),
+			});
+
+		const events = await store.enqueueChatInput(
+			"session-1",
+			[{ role: "user", content: "先制定计划" }],
+			{
+				permissionMode: "plan",
+				ultraplan: true,
+				model: "opus",
+				maxThinkingTokens: 4096,
+			},
+		);
+
+		expect(events.map((event) => event.sequence_num)).toEqual([100, 101, 102, 103, 104]);
+		expect(createdEvents.map((event) => (event.payload as { request?: { subtype?: string } }).request?.subtype ?? (event.payload as { type?: string }).type)).toEqual([
+			"initialize",
+			"set_permission_mode",
+			"set_model",
+			"set_max_thinking_tokens",
+			"user",
+		]);
+		expect((createdEvents[1]?.payload as { request: Record<string, unknown> }).request).toMatchObject({
+			subtype: "set_permission_mode",
+			mode: "plan",
+			ultraplan: true,
+		});
+		expect(sessionUpdates[0]).toMatchObject({
+			data: { nextClientSequence: { increment: 5 } },
+		});
+		expect(sessionUpdates[1]).toEqual({
+			where: { id: "session-1", deletedAt: null },
+			data: {
+				externalMetadata: {
+					model: "opus",
+					permission_mode: "plan",
+					is_ultraplan_mode: true,
+					max_thinking_tokens: 4096,
+				},
+			},
+		});
+		expect(operationLogs).toHaveLength(6);
+	});
+
+	test("does not confirm bypassPermissions in metadata before Claude Code accepts it", async () => {
+		const sessionUpdates: unknown[] = [];
+		const store = createStoreFromFakePrisma({
+			$transaction: async (fn: (tx: unknown) => Promise<unknown>) =>
+				fn({
+					chatSession: {
+						updateManyAndReturn: async (args: unknown) => {
+							sessionUpdates.push(args);
+							return [
+								{
+									nextClientSequence: 2,
+									externalMetadata: { permission_mode: "default" },
+								},
+							];
+						},
+					},
+					chatClientEvent: {
+						create: async ({ data }: { data: Record<string, unknown> }) => ({
+							...data,
+							createdAt: new Date("2026-05-26T00:00:00.000Z"),
+						}),
+					},
+					chatOperationLog: {
+						create: async () => ({}),
+					},
+					}),
+			});
+
+		await store.enqueueChatControls("session-1", {
+			permissionMode: "bypassPermissions",
+		});
+
+		expect(sessionUpdates).toEqual([
+			{
+				where: { id: "session-1", deletedAt: null },
+				data: { nextClientSequence: { increment: 1 } },
+				select: { nextClientSequence: true, externalMetadata: true },
+			},
+		]);
+	});
+});
+
 describe("normalizeAiProxyCredentialInput", () => {
 	test("normalizes AI proxy credential defaults and /v1 base URL", () => {
 		expect(
@@ -785,7 +921,7 @@ describe("CcrStore worker lifecycle guards", () => {
 					return {};
 				},
 			},
-		};
+			};
 		const store = createStoreFromFakePrisma({
 			$transaction: async (fn: (transaction: unknown) => Promise<unknown>) => fn(tx),
 		});

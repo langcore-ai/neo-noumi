@@ -7,6 +7,23 @@ import {
 } from "./ccr-route-tools";
 import type { JsonObject } from "./ccr-types";
 
+/** Claude Code 对外可见的权限模式。 */
+export type CcrPermissionMode =
+	| "default"
+	| "acceptEdits"
+	| "bypassPermissions"
+	| "plan"
+	| "dontAsk";
+
+/** 权限模式允许值，必须和 Claude Code SDK schema 保持一致。 */
+const CCR_PERMISSION_MODES = new Set<CcrPermissionMode>([
+	"default",
+	"acceptEdits",
+	"bypassPermissions",
+	"plan",
+	"dontAsk",
+]);
+
 /** StructuredIO control_response payload。 */
 export interface ControlResponsePayload extends JsonObject {
 	/** 事件类型。 */
@@ -27,6 +44,70 @@ export function buildRouteMcpInitializeRequest(): JsonObject {
 		type: "control_request",
 		request_id: crypto.randomUUID(),
 		request: { subtype: "initialize", sdkMcpServers: [ROUTE_MCP_SERVER_NAME] },
+	};
+}
+
+/**
+ * 判断权限模式是否是 Claude Code 可接受的外部模式。
+ * @param value 原始模式
+ * @returns 是否为合法权限模式
+ */
+export function isCcrPermissionMode(value: unknown): value is CcrPermissionMode {
+	return typeof value === "string" && CCR_PERMISSION_MODES.has(value as CcrPermissionMode);
+}
+
+/**
+ * 构造权限模式 control_request。
+ * @param mode 权限模式
+ * @param options 附加选项
+ * @returns 下发给 Claude Code 的 control_request payload
+ */
+export function buildSetPermissionModeRequest(
+	mode: CcrPermissionMode,
+	options: { ultraplan?: boolean } = {},
+): JsonObject {
+	return {
+		type: "control_request",
+		request_id: `set-mode-${crypto.randomUUID()}`,
+		request: {
+			subtype: "set_permission_mode",
+			mode,
+			...(options.ultraplan !== undefined ? { ultraplan: options.ultraplan } : {}),
+		},
+	};
+}
+
+/**
+ * 构造模型切换 control_request。
+ * @param model 模型名；为空时交给 Claude Code 恢复默认模型
+ * @returns 下发给 Claude Code 的 control_request payload
+ */
+export function buildSetModelRequest(model?: string): JsonObject {
+	return {
+		type: "control_request",
+		request_id: `set-model-${crypto.randomUUID()}`,
+		request: {
+			subtype: "set_model",
+			...(model ? { model } : {}),
+		},
+	};
+}
+
+/**
+ * 构造 thinking token 配置 control_request。
+ * @param maxThinkingTokens 最大 thinking tokens；null 表示恢复默认
+ * @returns 下发给 Claude Code 的 control_request payload
+ */
+export function buildSetMaxThinkingTokensRequest(
+	maxThinkingTokens: number | null,
+): JsonObject {
+	return {
+		type: "control_request",
+		request_id: `set-thinking-${crypto.randomUUID()}`,
+		request: {
+			subtype: "set_max_thinking_tokens",
+			max_thinking_tokens: maxThinkingTokens,
+		},
 	};
 }
 

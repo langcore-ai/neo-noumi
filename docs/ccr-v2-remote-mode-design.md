@@ -296,6 +296,7 @@ Claude Code CLI in Cloudflare Container
 - 基础会话：route 下发 user event，worker 写回 system/user/assistant/result/internal events，最终 result 成功落库。
 - route 侧 MCP 工具：route 先通过 `control_request.initialize` 注入 `sdkMcpServers: ["ccr-route"]`，Claude Code 随后通过 `mcp_message` 完成 `initialize`、`tools/list`、`tools/call`，route 在本进程执行工具并返回 MCP `CallToolResult`。
 - 用户问询：Claude Code 调用受控工具时会先发出 `can_use_tool`；route 只负责持久化该请求，前端弹出权限申请，用户允许后通过 `POST /api/ccr/sessions/{sessionId}/tool-permission` 入队 `control_response`。allow 响应必须返回 `updatedInput`，否则 Claude Code `2.1.120` 会因权限 schema 校验失败而拒绝工具调用。
+- 会话控制：`POST /api/ccr/sessions/{sessionId}/messages` 可在用户消息前入队 `set_permission_mode`、`set_model`、`set_max_thinking_tokens` 控制事件；同一轮控制事件和用户消息在一个事务里分配连续 client sequence，避免并发发送时控制状态串到其他 prompt。Plan 模式通过 `permissionMode: "plan"` 下发，并同步写入 `externalMetadata.permission_mode` / `is_ultraplan_mode`；`bypassPermissions` 可能被 Claude Code 按配置拒绝，因此 route 不提前把它确认为 metadata 状态。
 - subagent：Claude Code 调用 Task/Agent 后，route 能记录 `task_started`、`task_notification`、tool result，以及带 `agent_id` 的 subagent internal events。
 - SSE 稳定性：真实 CLI 曾在 15 秒心跳下约 12 秒空闲断连；route 心跳调整为 5 秒后，复测日志未再出现 `Stream read error` 或 `socket connection was closed unexpectedly`。
 - 业务 chat API：`POST /api/ccr/sessions/{sessionId}/messages` 在 `Accept: text/event-stream` 下会先返回 `session` SSE frame，再写入用户消息、启动真实远程模式 Claude Code CLI，并在同一个请求里持续输出 `timeline` frame；收到 `result` 后返回 `done` 并结束本次前端长连接。所有 SSE 入口必须显式返回 `Content-Type: text/event-stream`、禁用缓存和 `no-transform`，不能只依赖普通 streaming body。
@@ -779,7 +780,9 @@ received | processing | processed
       "permission_mode": "default",
       "model": "sonnet",
       "pending_action": null,
-      "task_summary": null
+      "task_summary": null,
+      "post_turn_summary": null,
+      "max_thinking_tokens": null
     }
   }
 }
@@ -1104,6 +1107,7 @@ Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metada
 - 实现 `/worker/events` 收集 worker 输出。
 - 实现 `/worker/heartbeat` 和 `/worker` 状态上报。
 - 支持用户级 sandbox、session 级 runner、worker epoch 防旧进程写入。
+- 支持 route 主动下发 `set_permission_mode`、`set_model`、`set_max_thinking_tokens`，并把已知不会被 CLI 二次拒绝的权限模式、非 default 模型、thinking token 目标同步到 session `externalMetadata`。
 
 ### 已实现的 internal events 与 resume
 

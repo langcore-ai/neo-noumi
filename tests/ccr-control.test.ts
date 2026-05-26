@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
 	buildCanUseToolDecisionResponse,
 	buildRouteMcpInitializeRequest,
+	buildSetMaxThinkingTokensRequest,
+	buildSetModelRequest,
+	buildSetPermissionModeRequest,
 	handleControlRequest,
+	isCcrPermissionMode,
 } from "../src/worker/lib/ccr-control";
 import {
 	A_EXTERNAL_TOOL_TEST_NAME,
@@ -62,6 +66,38 @@ describe("route MCP tools", () => {
 		expect(payload.request).toEqual({
 			subtype: "initialize",
 			sdkMcpServers: [ROUTE_MCP_SERVER_NAME],
+		});
+	});
+
+	test("builds permission mode control request for plan mode", () => {
+		const payload = buildSetPermissionModeRequest("plan", { ultraplan: true });
+
+		expect(payload.type).toBe("control_request");
+		expect(String(payload.request_id)).toMatch(/^set-mode-/);
+		expect(payload.request).toEqual({
+			subtype: "set_permission_mode",
+			mode: "plan",
+			ultraplan: true,
+		});
+		expect(isCcrPermissionMode("plan")).toBe(true);
+		expect(isCcrPermissionMode("auto")).toBe(false);
+	});
+
+	test("builds model and thinking control requests", () => {
+		expect(buildSetModelRequest("opus").request).toEqual({
+			subtype: "set_model",
+			model: "opus",
+		});
+		expect(buildSetModelRequest().request).toEqual({
+			subtype: "set_model",
+		});
+		expect(buildSetMaxThinkingTokensRequest(null).request).toEqual({
+			subtype: "set_max_thinking_tokens",
+			max_thinking_tokens: null,
+		});
+		expect(buildSetMaxThinkingTokensRequest(4096).request).toEqual({
+			subtype: "set_max_thinking_tokens",
+			max_thinking_tokens: 4096,
 		});
 	});
 

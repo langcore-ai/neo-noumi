@@ -25,6 +25,10 @@ export interface ChatSession {
 	containerStatus: string;
 	sandboxId: string | null;
 	workerEpoch: number;
+	/** Claude Code 可恢复的外部 metadata。 */
+	externalMetadata?: Record<string, unknown>;
+	/** 当前需要用户处理的动作详情。 */
+	requiresActionDetails?: Record<string, unknown> | null;
 	updatedAt: string;
 }
 
