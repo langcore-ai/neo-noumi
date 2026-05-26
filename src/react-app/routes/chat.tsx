@@ -28,7 +28,7 @@ import {
 	WrenchIcon,
 	XIcon,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import WorkspaceUploadPanel, {
 	type WorkspaceUploadFile,
 } from "@/components/comp-549";
@@ -256,6 +256,9 @@ const WORKSPACE_ROOT_ID = "root";
 
 /** 文件树缩进宽度。 */
 const WORKSPACE_TREE_INDENT = 18;
+
+/** 判断 chat 是否仍贴近底部的像素阈值。 */
+const CHAT_BOTTOM_STICK_THRESHOLD = 48;
 
 /**
  * 从 API 响应中读取错误消息。
@@ -735,7 +738,10 @@ function ChatPage() {
 	const bootstrappedUserIdRef = useRef<string | null>(null);
 	const streamAbortRef = useRef<AbortController | null>(null);
 	const timelineIdsRef = useRef<Set<number>>(new Set());
+	const chatViewportRef = useRef<HTMLDivElement | null>(null);
 	const messagesEndRef = useRef<HTMLDivElement | null>(null);
+	const shouldStickToBottomRef = useRef(true);
+	const forceStickToBottomRef = useRef(false);
 	const [session, setSession] = useState<ChatSession | null>(null);
 	const [sessions, setSessions] = useState<ChatSession[]>([]);
 	const [projects, setProjects] = useState<Project[]>([]);
@@ -822,6 +828,47 @@ function ChatPage() {
 	}
 
 	/**
+	 * 计算 chat viewport 距离底部的距离。
+	 * @param viewport chat 滚动容器
+	 * @returns 距离底部的像素数
+	 */
+	function getChatBottomDistance(viewport: HTMLDivElement): number {
+		return Math.max(0, viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight);
+	}
+
+	/**
+	 * 判断 chat viewport 是否应继续吸附底部。
+	 * @param viewport chat 滚动容器
+	 * @returns 是否接近底部
+	 */
+	function isChatNearBottom(viewport: HTMLDivElement): boolean {
+		return getChatBottomDistance(viewport) <= CHAT_BOTTOM_STICK_THRESHOLD;
+	}
+
+	/**
+	 * 记录用户当前是否仍希望跟随最新输出。
+	 */
+	function updateChatStickState() {
+		if (!chatViewportRef.current) {
+			return;
+		}
+		// 只有用户停留在底部附近时，后续 SSE 增量才继续自动贴底。
+		shouldStickToBottomRef.current = isChatNearBottom(chatViewportRef.current);
+	}
+
+	/**
+	 * 滚动 chat 到底部。
+	 */
+	const scrollChatToBottom = useCallback(() => {
+		if (chatViewportRef.current) {
+			// 流式输出频率高，直接设置 scrollTop，避免 smooth 动画抢占用户滚动。
+			chatViewportRef.current.scrollTop = chatViewportRef.current.scrollHeight;
+			return;
+		}
+		messagesEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+	}, []);
+
+	/**
 	 * 重置当前会话详情。
 	 */
 	function resetConversation() {
@@ -833,6 +880,8 @@ function ChatPage() {
 		setHandledPermissionRequestIds(new Set());
 		setPermissionError(null);
 		timelineIdsRef.current = new Set();
+		shouldStickToBottomRef.current = true;
+		forceStickToBottomRef.current = false;
 	}
 
 	/**
@@ -1201,6 +1250,9 @@ function ChatPage() {
 			throw new Error(await readError(response));
 		}
 		const body = (await response.json()) as SessionDetailResponse;
+		// 切换历史会话时主动定位到底部，后续由用户滚动状态决定是否继续跟随。
+		forceStickToBottomRef.current = true;
+		shouldStickToBottomRef.current = true;
 		setSession(body.session);
 		setClientEvents(body.clientEvents ?? []);
 		timelineIdsRef.current = new Set(body.timeline.map((event) => event.id));
@@ -1398,6 +1450,9 @@ function ChatPage() {
 		setError(null);
 		setIsSending(true);
 		setDraft("");
+		// 用户主动发送消息时，应立即恢复对本轮输出的底部跟随。
+		forceStickToBottomRef.current = true;
+		shouldStickToBottomRef.current = true;
 		const optimisticEvent: ClientEvent = {
 			event_id: crypto.randomUUID(),
 			sequence_num: Date.now(),
@@ -1551,8 +1606,12 @@ function ChatPage() {
 	}, [project?.id, isBootstrapping, authSession.isPending, authUserId]);
 
 	useEffect(() => {
-		messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-	}, [messages.length, isSending]);
+		if (!forceStickToBottomRef.current && !shouldStickToBottomRef.current) {
+			return;
+		}
+		scrollChatToBottom();
+		forceStickToBottomRef.current = false;
+	}, [messages.length, isSending, scrollChatToBottom]);
 
 	if (authSession.isPending) {
 		return (
@@ -2010,7 +2069,11 @@ function ChatPage() {
 							</div>
 						</header>
 
-						<ScrollArea className="min-h-0 flex-1">
+						<ScrollArea
+							className="min-h-0 flex-1"
+							viewportRef={chatViewportRef}
+							onViewportScroll={updateChatStickState}
+						>
 							<div className="mx-auto flex max-w-4xl flex-col gap-4 px-4 py-6">
 								{error ? (
 									<Alert variant="destructive">
