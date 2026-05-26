@@ -6,14 +6,52 @@ import {
 } from "../src/worker/lib/ccr-control";
 import {
 	A_EXTERNAL_TOOL_TEST_NAME,
+	callRouteTool,
 	listRouteTools,
 	ROUTE_MCP_SERVER_NAME,
 } from "../src/worker/lib/ccr-route-tools";
+import type { CcrStore } from "../src/worker/lib/ccr-store";
+import { WORKSPACE_READ_MAX_FILE_SIZE } from "../src/worker/lib/project-workspace";
+
+/**
+ * 创建 workspace MCP 工具测试上下文。
+ * @returns route-side 工具上下文
+ */
+function createWorkspaceToolContext(bucket?: R2Bucket) {
+	const defaultBucket = {
+		head: async () => null,
+		list: async () => ({ objects: [], delimitedPrefixes: [], truncated: false }),
+	} as unknown as R2Bucket;
+	const store = {
+		findUserSessionSummary: async () => ({
+			id: "session-1",
+			projectId: "project-1",
+			deletedAt: null,
+		}),
+	} as unknown as CcrStore;
+	return {
+		env: { PROJECT_WORKSPACE_BUCKET: bucket ?? defaultBucket },
+		sessionId: "session-1",
+		store,
+		userId: "user-1",
+	};
+}
 
 describe("route MCP tools", () => {
 	test("lists AExternalToolTest for Claude Code", () => {
 		expect(listRouteTools()).toContainEqual(
 			expect.objectContaining({ name: A_EXTERNAL_TOOL_TEST_NAME }),
+		);
+	});
+
+	test("lists workspace MCP tools for Claude Code", () => {
+		expect(listRouteTools()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ name: "workspace_stat" }),
+				expect.objectContaining({ name: "workspace_write_file" }),
+				expect.objectContaining({ name: "workspace_delete" }),
+				expect.objectContaining({ name: "workspace_move" }),
+			]),
 		);
 	});
 
@@ -85,6 +123,71 @@ describe("route MCP tools", () => {
 			}),
 		);
 		expect(JSON.stringify(mcpResponse)).toContain("hello route");
+	});
+
+	test("handles workspace stat tools/call MCP message", async () => {
+		const response = await handleControlRequest(
+			{
+				type: "control_request",
+				request_id: "request-workspace-stat",
+				request: {
+					subtype: "mcp_message",
+					server_name: ROUTE_MCP_SERVER_NAME,
+					message: {
+						jsonrpc: "2.0",
+						id: 20,
+						method: "tools/call",
+						params: {
+							name: "workspace_stat",
+							arguments: { path: "missing.txt" },
+						},
+					},
+				},
+			},
+			createWorkspaceToolContext(),
+		);
+
+		const mcpResponse = response?.response.response?.mcp_response;
+		expect(response?.response.subtype).toBe("success");
+		expect(mcpResponse).toEqual(
+			expect.objectContaining({
+				jsonrpc: "2.0",
+				id: 20,
+				result: expect.objectContaining({
+					content: expect.any(Array),
+				}),
+			}),
+		);
+		expect(mcpResponse?.result?.content?.[0]?.text).toContain("\"stat\":null");
+	});
+
+	test("rejects oversized workspace read_file route tool calls", async () => {
+		const bucket = {
+			head: async (key: string) =>
+				({
+					key,
+					size: WORKSPACE_READ_MAX_FILE_SIZE + 1,
+					etag: "etag-large",
+					version: "version-large",
+					uploaded: new Date("2026-05-26T00:00:00.000Z"),
+					httpMetadata: { contentType: "text/plain" },
+				}) as unknown as R2Object,
+		} as unknown as R2Bucket;
+
+		await expect(
+			callRouteTool(
+				"workspace_read_file",
+				{ path: "large.txt" },
+				createWorkspaceToolContext(bucket),
+			),
+		).resolves.toMatchObject({
+			isError: true,
+			content: [
+				expect.objectContaining({
+					text: expect.stringContaining("Workspace read file exceeds the maximum size"),
+				}),
+			],
+		});
 	});
 
 	test("does not auto answer tool permission requests", async () => {

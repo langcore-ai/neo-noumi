@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	buildWorkspaceObjectKey,
+	copyWorkspacePath,
 	createWorkspaceDirectory,
 	createWorkspaceUploadUrls,
 	deleteWorkspacePath,
@@ -10,6 +11,7 @@ import {
 	normalizeWorkspacePath,
 	readWorkspaceFile,
 	signWorkspaceOperation,
+	statWorkspacePath,
 	writeWorkspaceFile,
 } from "../src/worker/lib/project-workspace";
 
@@ -134,6 +136,15 @@ describe("workspace path helpers", () => {
 			"Workspace path cannot contain parent traversal",
 		);
 	});
+
+	test("rejects control characters and Windows drive paths", () => {
+		expect(() => normalizeWorkspacePath("src/\nsecret.txt")).toThrow(
+			"Workspace path cannot contain control characters",
+		);
+		expect(() => normalizeWorkspacePath("C:/secret.txt")).toThrow(
+			"Workspace path cannot be a Windows drive path",
+		);
+	});
 });
 
 describe("workspace R2 operations", () => {
@@ -152,6 +163,62 @@ describe("workspace R2 operations", () => {
 		).resolves.toMatchObject({ path: "src/b.txt", size: 5 });
 		expect(objects.has("project-1/src/a.txt")).toBe(false);
 		expect(objects.has("project-1/src/b.txt")).toBe(true);
+	});
+
+	test("stats files and implicit directories", async () => {
+		const { bucket } = createFakeR2Bucket({
+			"project-1/src/index.ts": "code",
+		});
+
+		await expect(statWorkspacePath(bucket, "project-1", "src/index.ts")).resolves.toMatchObject({
+			path: "src/index.ts",
+			type: "file",
+			etag: "etag-project-1/src/index.ts",
+		});
+		await expect(statWorkspacePath(bucket, "project-1", "src")).resolves.toMatchObject({
+			path: "src",
+			type: "directory",
+		});
+		await expect(statWorkspacePath(bucket, "project-1", "missing")).resolves.toBeNull();
+	});
+
+	test("creates files without overwriting and supports etag guarded writes", async () => {
+		const { bucket } = createFakeR2Bucket({
+			"project-1/src/a.txt": "old",
+		});
+
+		await expect(
+			writeWorkspaceFile(bucket, "project-1", "src/a.txt", "new", undefined, {
+				overwrite: false,
+			}),
+		).rejects.toThrow("Workspace file already exists");
+		await expect(
+			writeWorkspaceFile(bucket, "project-1", "src/a.txt", "new", undefined, {
+				ifMatch: "stale",
+			}),
+		).rejects.toThrow("Workspace path etag does not match");
+		await expect(
+			writeWorkspaceFile(bucket, "project-1", "src/a.txt", "new", undefined, {
+				ifMatch: "etag-project-1/src/a.txt",
+			}),
+		).resolves.toMatchObject({ path: "src/a.txt", size: 3 });
+	});
+
+	test("rejects writes and directories under a file path", async () => {
+		const { bucket } = createFakeR2Bucket({
+			"project-1/src": "file",
+			"project-1/other.txt": "other",
+		});
+
+		await expect(writeWorkspaceFile(bucket, "project-1", "src/a.txt", "new")).rejects.toThrow(
+			"Workspace parent path is a file",
+		);
+		await expect(createWorkspaceDirectory(bucket, "project-1", "src/nested")).rejects.toThrow(
+			"Workspace parent path is a file",
+		);
+		await expect(
+			moveWorkspacePath(bucket, "project-1", "other.txt", "src/other.txt", "file"),
+		).rejects.toThrow("Workspace parent path is a file");
 	});
 
 	test("moves directories by copying all objects under the source prefix", async () => {
@@ -175,6 +242,28 @@ describe("workspace R2 operations", () => {
 		expect(objects.get("project-1/archive/src/index.ts")?.content).toBe("code");
 		expect(objects.get("project-1/archive/src/nested/a.ts")?.content).toBe("nested");
 		expect(objects.has("project-1/src-other/file.ts")).toBe(true);
+	});
+
+	test("preserves target when overwrite move preconditions fail", async () => {
+		const { bucket, objects } = createFakeR2Bucket({
+			"project-1/src/a.txt": "source",
+			"project-1/target.txt": "target",
+		});
+
+		await expect(
+			moveWorkspacePath(bucket, "project-1", "missing.txt", "target.txt", "file", {
+				overwrite: true,
+			}),
+		).resolves.toBeNull();
+		expect(objects.get("project-1/target.txt")?.content).toBe("target");
+
+		await expect(
+			moveWorkspacePath(bucket, "project-1", "src/a.txt", "target.txt", "file", {
+				overwrite: true,
+				ifMatch: "stale",
+			}),
+		).rejects.toThrow("Workspace path etag does not match");
+		expect(objects.get("project-1/target.txt")?.content).toBe("target");
 	});
 
 	test("allows moving a file into a directory whose path starts with the file path", async () => {
@@ -219,7 +308,12 @@ describe("workspace R2 operations", () => {
 			"project-1/src-other/file.ts": "sibling",
 		});
 
-		await expect(deleteWorkspacePath(bucket, "project-1", "src")).resolves.toEqual({
+		await expect(deleteWorkspacePath(bucket, "project-1", "src")).rejects.toThrow(
+			"Workspace directory delete requires recursive=true",
+		);
+		await expect(
+			deleteWorkspacePath(bucket, "project-1", "src", { recursive: true }),
+		).resolves.toEqual({
 			path: "src",
 			deletedObjectCount: 3,
 		});
@@ -228,6 +322,25 @@ describe("workspace R2 operations", () => {
 		expect(objects.has("project-1/src/index.ts")).toBe(false);
 		expect(objects.has("project-1/src/nested/a.ts")).toBe(false);
 		expect(objects.has("project-1/src-other/file.ts")).toBe(true);
+	});
+
+	test("requires recursive when deleting an empty directory marker", async () => {
+		const { bucket, objects } = createFakeR2Bucket({
+			"project-1/empty/.keep": "",
+		});
+
+		await expect(deleteWorkspacePath(bucket, "project-1", "empty")).rejects.toThrow(
+			"Workspace directory delete requires recursive=true",
+		);
+		expect(objects.has("project-1/empty/.keep")).toBe(true);
+
+		await expect(
+			deleteWorkspacePath(bucket, "project-1", "empty", { recursive: true }),
+		).resolves.toEqual({
+			path: "empty",
+			deletedObjectCount: 1,
+		});
+		expect(objects.has("project-1/empty/.keep")).toBe(false);
 	});
 
 	test("lists direct children and empty directory markers", async () => {
@@ -245,6 +358,56 @@ describe("workspace R2 operations", () => {
 				{ path: "README.md", name: "README.md", type: "file" },
 			],
 		});
+	});
+
+	test("creates recursive directory markers like mkdir -p", async () => {
+		const { bucket, objects } = createFakeR2Bucket();
+
+		await createWorkspaceDirectory(bucket, "project-1", "src/nested", { recursive: true });
+
+		expect(objects.has("project-1/src/.keep")).toBe(true);
+		expect(objects.has("project-1/src/nested/.keep")).toBe(true);
+	});
+
+	test("copies files and directories without deleting the source", async () => {
+		const { bucket, objects } = createFakeR2Bucket({
+			"project-1/src/.keep": "",
+			"project-1/src/index.ts": "code",
+			"project-1/src/nested/a.ts": "nested",
+		});
+
+		await expect(
+			copyWorkspacePath(bucket, "project-1", "src", "copy/src", "directory"),
+		).resolves.toMatchObject({
+			path: "copy/src",
+			movedObjectCount: 3,
+		});
+
+		expect(objects.get("project-1/src/index.ts")?.content).toBe("code");
+		expect(objects.get("project-1/copy/src/index.ts")?.content).toBe("code");
+		expect(objects.get("project-1/copy/src/nested/a.ts")?.content).toBe("nested");
+	});
+
+	test("preserves target when overwrite copy preconditions fail", async () => {
+		const { bucket, objects } = createFakeR2Bucket({
+			"project-1/src/a.txt": "source",
+			"project-1/target.txt": "target",
+		});
+
+		await expect(
+			copyWorkspacePath(bucket, "project-1", "missing.txt", "target.txt", "file", {
+				overwrite: true,
+			}),
+		).resolves.toBeNull();
+		expect(objects.get("project-1/target.txt")?.content).toBe("target");
+
+		await expect(
+			copyWorkspacePath(bucket, "project-1", "src/a.txt", "target.txt", "file", {
+				overwrite: true,
+				ifMatch: "stale",
+			}),
+		).rejects.toThrow("Workspace path etag does not match");
+		expect(objects.get("project-1/target.txt")?.content).toBe("target");
 	});
 
 	test("forwards R2 list cursor for paged workspace reads", async () => {

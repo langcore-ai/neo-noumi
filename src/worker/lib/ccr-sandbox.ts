@@ -730,6 +730,8 @@ async function ensureProjectWorkspaceMounted(
 		endpoint: mountConfig.endpoint,
 		// Sandbox SDK 的 s3fs prefix 必须同时以 `/` 开头和结尾。
 		prefix: buildProjectWorkspaceMountPrefix(context.projectId),
+		// workspace 挂载只用于观察，写入统一走 route-side MCP 工具。
+		readOnly: true,
 	});
 	await store.recordOperation(sessionId, {
 		direction: "route_internal",

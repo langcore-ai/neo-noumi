@@ -21,6 +21,15 @@ export const WORKSPACE_UPLOAD_MAX_FILES = 500;
 /** 单个直传文件最大大小，单位字节。 */
 export const WORKSPACE_UPLOAD_MAX_FILE_SIZE = 100 * 1024 * 1024;
 
+/** MCP/全量写入单文件最大大小，单位字节。 */
+export const WORKSPACE_WRITE_MAX_FILE_SIZE = 2 * 1024 * 1024;
+
+/** MCP 读取单文件最大大小，单位字节。 */
+export const WORKSPACE_READ_MAX_FILE_SIZE = 2 * 1024 * 1024;
+
+/** 单次目录批量变更最大对象数。 */
+export const WORKSPACE_MUTATION_MAX_OBJECTS = 2_000;
+
 /** workspace 支持的操作类型。 */
 type WorkspaceOperation =
 	| "list"
@@ -29,6 +38,7 @@ type WorkspaceOperation =
 	| "upload"
 	| "delete"
 	| "move"
+	| "copy"
 	| "mkdir";
 
 /** workspace API 运行所需 Worker 绑定。 */
@@ -59,6 +69,26 @@ export type WorkspaceTreeNode = {
 	size?: number;
 	/** R2 对象上传时间；目录没有该字段。 */
 	uploaded?: string;
+};
+
+/** workspace 路径状态。 */
+export type WorkspacePathStat = {
+	/** 相对 workspace 根目录的路径；根目录为空字符串。 */
+	path: string;
+	/** 节点类型。 */
+	type: "directory" | "file";
+	/** 文件大小；目录为空。 */
+	size?: number;
+	/** R2 etag；目录为空。 */
+	etag?: string;
+	/** R2 object version；目录为空。 */
+	version?: string;
+	/** R2 对象上传时间；目录为空。 */
+	uploaded?: string;
+	/** 文件内容类型；目录为空。 */
+	contentType?: string;
+	/** 目录下是否至少存在一个对象。 */
+	hasChildren?: boolean;
 };
 
 /** workspace 删除结果。 */
@@ -118,6 +148,15 @@ export function normalizeWorkspacePath(
 	options: { allowEmpty?: boolean } = {},
 ): string {
 	const rawPath = (path ?? "").trim().replaceAll("\\", "/");
+	if ([...rawPath].some((char) => {
+		const code = char.charCodeAt(0);
+		return code <= 31 || code === 127;
+	})) {
+		throw new Error("Workspace path cannot contain control characters");
+	}
+	if (/^[A-Za-z]:/.test(rawPath)) {
+		throw new Error("Workspace path cannot be a Windows drive path");
+	}
 	const parts: string[] = [];
 	for (const part of rawPath.split("/")) {
 		const trimmedPart = part.trim();
@@ -134,6 +173,26 @@ export function normalizeWorkspacePath(
 		throw new Error("Workspace path is required");
 	}
 	return normalized;
+}
+
+/**
+ * 判断路径是否位于指定目录下。
+ * @param path 待判断路径
+ * @param parentPath 父目录路径
+ * @returns 是否是同一路径或子路径
+ */
+function isPathOrChild(path: string, parentPath: string): boolean {
+	return path === parentPath || path.startsWith(`${parentPath}/`);
+}
+
+/**
+ * 列出路径的父级路径。
+ * @param path workspace 相对路径
+ * @returns 从近根到近叶子的父级路径
+ */
+function listParentPaths(path: string): string[] {
+	const parts = normalizeWorkspacePath(path).split("/");
+	return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"));
 }
 
 /**
@@ -406,6 +465,74 @@ export async function readWorkspaceFile(
 }
 
 /**
+ * 查询 workspace 路径状态。
+ * @param bucket R2 bucket
+ * @param projectId Project ID
+ * @param path workspace 相对路径；空路径表示根目录
+ * @returns 路径状态；不存在返回 null
+ */
+export async function statWorkspacePath(
+	bucket: R2Bucket,
+	projectId: string,
+	path = "",
+): Promise<WorkspacePathStat | null> {
+	const normalizedPath = normalizeWorkspacePath(path, { allowEmpty: true });
+	if (!normalizedPath) {
+		return { path: "", type: "directory", hasChildren: true };
+	}
+	const exactKey = buildWorkspaceObjectKey(projectId, normalizedPath);
+	const object = await bucket.head(exactKey);
+	if (object) {
+		return {
+			path: normalizedPath,
+			type: "file",
+			size: object.size,
+			etag: object.etag,
+			version: object.version,
+			uploaded: object.uploaded.toISOString(),
+			contentType: object.httpMetadata?.contentType ?? "application/octet-stream",
+		};
+	}
+	const listed = await bucket.list({
+		prefix: `${exactKey}/`,
+		limit: 1,
+	});
+	return listed.objects.length > 0
+		? { path: normalizedPath, type: "directory", hasChildren: true }
+		: null;
+}
+
+/**
+ * 检查 etag 前置条件。
+ * @param stat 当前路径状态
+ * @param ifMatch 期望 etag
+ */
+function assertEtagMatch(stat: WorkspacePathStat | null, ifMatch?: string) {
+	if (ifMatch && stat?.etag !== ifMatch) {
+		throw new Error("Workspace path etag does not match");
+	}
+}
+
+/**
+ * 确保目标路径的父级都不是文件。
+ * @param bucket R2 bucket
+ * @param projectId Project ID
+ * @param path workspace 相对路径
+ */
+async function assertWorkspaceParentsAreDirectories(
+	bucket: R2Bucket,
+	projectId: string,
+	path: string,
+) {
+	for (const parentPath of listParentPaths(path)) {
+		// R2 允许 file 与 prefix 同名；写入前主动收紧成文件系统语义。
+		if (await bucket.head(buildWorkspaceObjectKey(projectId, parentPath))) {
+			throw new Error("Workspace parent path is a file");
+		}
+	}
+}
+
+/**
  * 写入 workspace 文件。
  * @param bucket R2 bucket
  * @param projectId Project ID
@@ -420,12 +547,27 @@ export async function writeWorkspaceFile(
 	path: string,
 	content: string,
 	contentType = "text/plain; charset=utf-8",
+	options: { overwrite?: boolean; ifMatch?: string } = {},
 ) {
 	const normalizedPath = normalizeWorkspacePath(path);
+	const contentSize = new TextEncoder().encode(content).byteLength;
+	if (contentSize > WORKSPACE_WRITE_MAX_FILE_SIZE) {
+		throw new Error("Workspace write file exceeds the maximum size");
+	}
+	await assertWorkspaceParentsAreDirectories(bucket, projectId, normalizedPath);
+	const current = await statWorkspacePath(bucket, projectId, normalizedPath);
+	if (current?.type === "directory") {
+		throw new Error("Workspace path is a directory");
+	}
+	if (current && options.overwrite === false) {
+		throw new Error("Workspace file already exists");
+	}
+	assertEtagMatch(current, options.ifMatch);
 	const object = await bucket.put(
 		buildWorkspaceObjectKey(projectId, normalizedPath),
 		content,
 		{
+			onlyIf: options.ifMatch ? { etagMatches: options.ifMatch } : undefined,
 			httpMetadata: { contentType },
 		},
 	);
@@ -527,12 +669,24 @@ export async function deleteWorkspacePath(
 	bucket: R2Bucket,
 	projectId: string,
 	path: string,
+	options: { recursive?: boolean; ifMatch?: string } = {},
 ): Promise<WorkspaceDeleteResult> {
 	const normalizedPath = normalizeWorkspacePath(path);
 	const exactKey = buildWorkspaceObjectKey(projectId, normalizedPath);
 	const directoryPrefix = `${exactKey}/`;
 	const keysToDelete = new Set<string>();
-	if (await bucket.head(exactKey)) {
+	const exactObject = await bucket.head(exactKey);
+	let hasDirectoryObjects = false;
+	if (exactObject) {
+		assertEtagMatch(
+			{
+				path: normalizedPath,
+				type: "file",
+				size: exactObject.size,
+				etag: exactObject.etag,
+			},
+			options.ifMatch,
+		);
 		// 文件和目录 marker 都可能是精确 key，存在时才纳入删除结果。
 		keysToDelete.add(exactKey);
 	}
@@ -545,10 +699,18 @@ export async function deleteWorkspacePath(
 			cursor,
 		});
 		for (const object of listed.objects) {
+			hasDirectoryObjects = true;
 			keysToDelete.add(object.key);
 		}
 		cursor = listed.truncated ? listed.cursor : undefined;
 	} while (cursor);
+
+	if (hasDirectoryObjects && !options.recursive) {
+		throw new Error("Workspace directory delete requires recursive=true");
+	}
+	if (keysToDelete.size > WORKSPACE_MUTATION_MAX_OBJECTS) {
+		throw new Error("Workspace delete exceeds the maximum object count");
+	}
 
 	const keys = [...keysToDelete];
 	for (let index = 0; index < keys.length; index += WORKSPACE_DELETE_BATCH_SIZE) {
@@ -572,12 +734,23 @@ export async function createWorkspaceDirectory(
 	bucket: R2Bucket,
 	projectId: string,
 	path: string,
+	options: { recursive?: boolean } = {},
 ) {
 	const normalizedPath = normalizeWorkspacePath(path);
-	const markerPath = directoryMarkerPath(normalizedPath);
-	await bucket.put(buildWorkspaceObjectKey(projectId, markerPath), "", {
-		httpMetadata: { contentType: "application/x-directory" },
-	});
+	await assertWorkspaceParentsAreDirectories(bucket, projectId, normalizedPath);
+	const exactObject = await bucket.head(buildWorkspaceObjectKey(projectId, normalizedPath));
+	if (exactObject) {
+		throw new Error("Workspace path is a file");
+	}
+	const paths = options.recursive
+		? normalizedPath.split("/").map((_, index, parts) => parts.slice(0, index + 1).join("/"))
+		: [normalizedPath];
+	for (const directoryPath of paths) {
+		const markerPath = directoryMarkerPath(directoryPath);
+		await bucket.put(buildWorkspaceObjectKey(projectId, markerPath), "", {
+			httpMetadata: { contentType: "application/x-directory" },
+		});
+	}
 	return { path: normalizedPath };
 }
 
@@ -613,16 +786,28 @@ export async function moveWorkspacePath(
 	fromPath: string,
 	toPath: string,
 	sourceType?: WorkspaceMoveSourceType,
+	options: { overwrite?: boolean; ifMatch?: string } = {},
 ): Promise<WorkspaceMoveResult | null> {
 	const sourcePath = normalizeWorkspacePath(fromPath);
 	const targetPath = normalizeWorkspacePath(toPath);
 	if (sourcePath === targetPath) {
 		return null;
 	}
+	await assertWorkspaceParentsAreDirectories(bucket, projectId, targetPath);
 	const sourceKey = buildWorkspaceObjectKey(projectId, sourcePath);
 	const targetKey = buildWorkspaceObjectKey(projectId, targetPath);
 	const object = sourceType === "directory" ? null : await bucket.get(sourceKey);
 	if (object && sourceType !== "directory") {
+		assertEtagMatch(
+			{ path: sourcePath, type: "file", size: object.size, etag: object.etag },
+			options.ifMatch,
+		);
+		if (await statWorkspacePath(bucket, projectId, targetPath)) {
+			if (options.overwrite !== true) {
+				throw new Error("Workspace target path already exists");
+			}
+			await deleteWorkspacePath(bucket, projectId, targetPath, { recursive: true });
+		}
 		const moved = await bucket.put(targetKey, object.body, {
 			httpMetadata: object.httpMetadata,
 			customMetadata: object.customMetadata,
@@ -658,6 +843,15 @@ export async function moveWorkspacePath(
 	if (sourceObjects.length === 0) {
 		return null;
 	}
+	if (sourceObjects.length > WORKSPACE_MUTATION_MAX_OBJECTS) {
+		throw new Error("Workspace move exceeds the maximum object count");
+	}
+	if (await statWorkspacePath(bucket, projectId, targetPath)) {
+		if (options.overwrite !== true) {
+			throw new Error("Workspace target path already exists");
+		}
+		await deleteWorkspacePath(bucket, projectId, targetPath, { recursive: true });
+	}
 
 	const movedKeys: string[] = [];
 	for (const sourceObject of sourceObjects) {
@@ -683,6 +877,99 @@ export async function moveWorkspacePath(
 }
 
 /**
+ * 复制 workspace 文件或目录。
+ * @param bucket R2 bucket
+ * @param projectId Project ID
+ * @param fromPath 源路径
+ * @param toPath 目标路径
+ * @param sourceType 源节点类型；省略时优先按精确文件复制
+ * @param options 复制选项
+ * @returns 复制后的路径摘要；源路径不存在时返回 null
+ */
+export async function copyWorkspacePath(
+	bucket: R2Bucket,
+	projectId: string,
+	fromPath: string,
+	toPath: string,
+	sourceType?: WorkspaceMoveSourceType,
+	options: { overwrite?: boolean; ifMatch?: string } = {},
+): Promise<WorkspaceMoveResult | null> {
+	const sourcePath = normalizeWorkspacePath(fromPath);
+	const targetPath = normalizeWorkspacePath(toPath);
+	if (sourcePath === targetPath || isPathOrChild(targetPath, sourcePath)) {
+		throw new Error("Workspace path cannot be copied into itself");
+	}
+	await assertWorkspaceParentsAreDirectories(bucket, projectId, targetPath);
+	const sourceKey = buildWorkspaceObjectKey(projectId, sourcePath);
+	const targetKey = buildWorkspaceObjectKey(projectId, targetPath);
+	const object = sourceType === "directory" ? null : await bucket.get(sourceKey);
+	if (object && sourceType !== "directory") {
+		assertEtagMatch(
+			{ path: sourcePath, type: "file", size: object.size, etag: object.etag },
+			options.ifMatch,
+		);
+		if (await statWorkspacePath(bucket, projectId, targetPath)) {
+			if (options.overwrite !== true) {
+				throw new Error("Workspace target path already exists");
+			}
+			await deleteWorkspacePath(bucket, projectId, targetPath, { recursive: true });
+		}
+		const copied = await bucket.put(targetKey, object.body, {
+			httpMetadata: object.httpMetadata,
+			customMetadata: object.customMetadata,
+		});
+		return {
+			path: targetPath,
+			movedObjectCount: 1,
+			size: copied.size,
+			etag: copied.etag,
+			uploaded: copied.uploaded.toISOString(),
+		};
+	}
+
+	const sourcePrefix = `${sourceKey}/`;
+	const targetPrefix = `${targetKey}/`;
+	const sourceObjects: R2Object[] = [];
+	let cursor: string | undefined;
+	do {
+		const listed = await bucket.list({
+			prefix: sourcePrefix,
+			limit: WORKSPACE_LIST_LIMIT,
+			cursor,
+		});
+		sourceObjects.push(...listed.objects);
+		cursor = listed.truncated ? listed.cursor : undefined;
+	} while (cursor);
+	if (sourceObjects.length === 0) {
+		return null;
+	}
+	if (sourceObjects.length > WORKSPACE_MUTATION_MAX_OBJECTS) {
+		throw new Error("Workspace copy exceeds the maximum object count");
+	}
+	if (await statWorkspacePath(bucket, projectId, targetPath)) {
+		if (options.overwrite !== true) {
+			throw new Error("Workspace target path already exists");
+		}
+		await deleteWorkspacePath(bucket, projectId, targetPath, { recursive: true });
+	}
+	for (const sourceObject of sourceObjects) {
+		const childObject = await bucket.get(sourceObject.key);
+		if (!childObject) {
+			continue;
+		}
+		const targetChildKey = `${targetPrefix}${sourceObject.key.slice(sourcePrefix.length)}`;
+		await bucket.put(targetChildKey, childObject.body, {
+			httpMetadata: childObject.httpMetadata,
+			customMetadata: childObject.customMetadata,
+		});
+	}
+	return {
+		path: targetPath,
+		movedObjectCount: sourceObjects.length,
+	};
+}
+
+/**
  * 移动 workspace 文件。
  * @param bucket R2 bucket
  * @param projectId Project ID
@@ -696,25 +983,7 @@ export async function moveWorkspaceFile(
 	fromPath: string,
 	toPath: string,
 ) {
-	const sourcePath = normalizeWorkspacePath(fromPath);
-	const targetPath = normalizeWorkspacePath(toPath);
-	const object = await bucket.get(buildWorkspaceObjectKey(projectId, sourcePath));
-	if (!object) {
-		return null;
-	}
-	const moved = await bucket.put(
-		buildWorkspaceObjectKey(projectId, targetPath),
-		object.body,
-		{
-			httpMetadata: object.httpMetadata,
-			customMetadata: object.customMetadata,
-		},
-	);
-	await bucket.delete(buildWorkspaceObjectKey(projectId, sourcePath));
-	return {
-		path: targetPath,
-		size: moved.size,
-		etag: moved.etag,
-		uploaded: moved.uploaded.toISOString(),
-	};
+	return moveWorkspacePath(bucket, projectId, fromPath, toPath, "file", {
+		overwrite: true,
+	});
 }

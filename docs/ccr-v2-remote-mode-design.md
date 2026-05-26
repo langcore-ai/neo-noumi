@@ -21,7 +21,7 @@
 - 数据模型已拆成 `projects`、`chat_sessions`、`user_containers`：一个用户可以有多个 project，session 必须归属某个用户和某个 project。
 - `chat_sessions.userId` 和 `chat_sessions.projectId` 是非空外键，创建 session 前会校验 project 属于当前登录用户，避免跨用户挂载 session。
 - 同一用户的活跃 project 名称通过 PostgreSQL partial unique index 保持唯一，软删除项目不占用名称；这是 `/workspace/{projectName}` 挂载路径不串用的前置约束。
-- Project workspace 已接入 R2 bucket `neo-noumi-workspaces`，对象根目录使用 `{projectId}/...`；文件树支持列表、读写、删除、移动、新建目录以及文件/文件夹直传。所有 `/api/projects/{projectId}/workspace/*` 操作都先校验 project owner，再由后端生成 HMAC 操作签名；上传由后端下发短期 R2 presigned PUT URL，前端直接写入 R2，不经过 Worker 转发文件 body。
+- Project workspace 已接入 R2 bucket `neo-noumi-workspaces`，对象根目录使用 `{projectId}/...`；文件树支持列表、读写、删除、移动、新建目录以及文件/文件夹直传。所有 `/api/projects/{projectId}/workspace/*` 操作都先校验 project owner，再由后端生成 HMAC 操作签名；上传由后端下发短期 R2 presigned PUT URL，前端直接写入 R2，不经过 Worker 转发文件 body。Sandbox 内 project workspace 挂载为只读，Claude Code 修改 workspace 必须通过 route-side MCP workspace 工具让主服务执行实际 R2 变更。
 - `/projects` 是 project 管理页面，基于 `/api/projects` 提供列表、创建、编辑和软删除；删除 project 会同步移除其下未删除 session，并对活跃 session 后台停止 runner，聊天页只展示未删除 project/session。
 - Cloudflare 资源使用 `NeoNoumiSandbox` / `NEO_NOUMI_SANDBOX` / `neo-noumi-sandbox` 命名，用户级 sandbox ID 使用 `neo-noumi-user-{userId}`。
 - Cloudflare outbound interception 的 CCR `--sdk-url` host 使用 `beacon.claude-ai.staging.ant.dev`；`api.anthropic.com` 作为 AI Proxy 劫持入口，由 Worker 校验短期 proxy token 后再转发到用户默认渠道或平台 fallback 渠道，真实上游 API key 不再注入 sandbox。
@@ -294,7 +294,7 @@ Claude Code CLI in Cloudflare Container
 当前 Bun/Hono route 已使用真实 Claude Code CLI `2.1.120` 和官方 Anthropic API key 验证以下链路：
 
 - 基础会话：route 下发 user event，worker 写回 system/user/assistant/result/internal events，最终 result 成功落库。
-- route 侧 MCP 工具：route 先通过 `control_request.initialize` 注入 `sdkMcpServers: ["ccr-route"]`，Claude Code 随后通过 `mcp_message` 完成 `initialize`、`tools/list`、`tools/call`，route 在本进程执行 `ccr_echo` 并返回 `route-ok`。
+- route 侧 MCP 工具：route 先通过 `control_request.initialize` 注入 `sdkMcpServers: ["ccr-route"]`，Claude Code 随后通过 `mcp_message` 完成 `initialize`、`tools/list`、`tools/call`，route 在本进程执行工具并返回 MCP `CallToolResult`。
 - 用户问询：Claude Code 调用受控工具时会先发出 `can_use_tool`；route 只负责持久化该请求，前端弹出权限申请，用户允许后通过 `POST /api/ccr/sessions/{sessionId}/tool-permission` 入队 `control_response`。allow 响应必须返回 `updatedInput`，否则 Claude Code `2.1.120` 会因权限 schema 校验失败而拒绝工具调用。
 - subagent：Claude Code 调用 Task/Agent 后，route 能记录 `task_started`、`task_notification`、tool result，以及带 `agent_id` 的 subagent internal events。
 - SSE 稳定性：真实 CLI 曾在 15 秒心跳下约 12 秒空闲断连；route 心跳调整为 5 秒后，复测日志未再出现 `Stream read error` 或 `socket connection was closed unexpectedly`。
@@ -1054,7 +1054,9 @@ Neo Noumi 当前至少会恢复 Claude Code 自己的运行期状态：
 - 每次 workspace API 操作都会基于 `WORKSPACE_SIGNING_SECRET` 生成后端 HMAC 签名，签名覆盖操作类型、projectId、路径、请求体摘要和过期时间。
 - 文件树读取只使用 POST JSON body 传递 `prefix`，避免深层目录或长中文路径突破 URL 长度限制。
 - 文件/文件夹上传先由后端校验数量、声明大小和路径，再签发短期 R2 S3 presigned PUT URL，由前端直接 PUT 到 R2；部署时 `PROJECT_WORKSPACE_BUCKET_NAME` 必须和 R2 binding bucket 保持一致，bucket 必须允许前端 origin 对 R2 S3 endpoint 发起 `PUT` 的 CORS 请求。
-- 每次 chat 启动 Claude Code runner 前，A 会校验 session 所属 project 的 workspace 是否已经挂载到 sandbox：目标路径是 `/workspace/{projectName}`，R2 prefix 是 `/{projectId}`；已挂载时跳过，未挂载时通过 `PROJECT_WORKSPACE_BUCKET` binding 执行 `mountBucket`。
+- 每次 chat 启动 Claude Code runner 前，A 会校验 session 所属 project 的 workspace 是否已经挂载到 sandbox：目标路径是 `/workspace/{projectName}`，R2 prefix 是 `/{projectId}`；已挂载时跳过，未挂载时通过 `PROJECT_WORKSPACE_BUCKET` binding 执行只读 `mountBucket`。
+- workspace 写入由主服务的 route-side MCP 工具执行，当前工具包括 `workspace_stat`、`workspace_list`、`workspace_read_file`、`workspace_mkdir`、`workspace_create_file`、`workspace_write_file`、`workspace_delete`、`workspace_move` 和 `workspace_copy`。这些工具只接收 workspace 相对路径，project 从当前 CCR session 推导，避免模型传入任意 projectId。
+- MCP 写工具的约束：路径拒绝父级穿越、控制字符和 Windows drive path，写入目标的父级不能是文件；`workspace_read_file` 限制单文件读取大小；`workspace_delete` 删除目录必须显式 `recursive=true`；`workspace_mkdir` 支持 `recursive=true` 的 `mkdir -p` 行为；`workspace_create_file` 不覆盖已有文件；`workspace_write_file` 只做全量写入并支持 `ifMatch` etag 防旧写；`workspace_move` / `workspace_copy` 默认不覆盖目标路径，目录操作限制最大对象数。
 - CCR runner、环境变量和日志放在 `/tmp/neo-noumi`，避免写入用户 workspace；Claude Code 进程启动时 cwd 指向 project 挂载路径，Claude 本地 project state 也按该 cwd 恢复，例如 `/workspace/A` 对应 `/root/.claude/projects/-workspace-A`。
 - 如果 workspace 丢失，即使 session 事件恢复成功，模型看到的上下文也会和实际文件状态不一致。
 
@@ -1110,11 +1112,12 @@ Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metada
 - 启动前恢复 Claude local transcript 与 memory，并按是否存在历史 transcript 选择 `--session-id` 或 `--resume`。
 - 把 internal events 当前恢复窗口镜像到 `claude-code` sessionStore。
 
-### 已实现的 route-side MCP 测试工具
+### 已实现的 route-side MCP 工具
 
 - 通过 `control_request.initialize` 注入 `ccr-route` MCP server。
 - 处理 Claude Code 发出的 `mcp_message`，支持 `tools/list` 和 `tools/call`。
-- 暴露 `AExternalToolTest`，在 route 进程内执行并通过 `control_response` 回填结果。
+- 保留测试工具 `AExternalToolTest`，在 route 进程内执行并通过 `control_response` 回填结果。
+- 暴露 workspace MCP 工具，由 route 根据 `sessionId` 和 `userId` 校验 session 归属并推导 project，再调用主服务的 R2 workspace 操作函数。
 - `scripts/ccr-remote-tool-test.ts` 仍保留为 pending action 持久化的低层协议测试脚本。
 
 ## 风险

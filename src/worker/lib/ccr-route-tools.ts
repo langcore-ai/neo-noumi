@@ -1,5 +1,10 @@
 import { isJsonObject } from "./ccr-json";
 import type { JsonObject } from "./ccr-types";
+import {
+	WORKSPACE_ROUTE_TOOLS,
+	type RouteToolDefinition,
+	type WorkspaceToolContext,
+} from "./ccr-workspace-tools";
 
 /** route 侧 MCP server 名称，必须和初始化注入的 sdkMcpServers 保持一致。 */
 export const ROUTE_MCP_SERVER_NAME = "ccr-route";
@@ -8,22 +13,7 @@ export const ROUTE_MCP_SERVER_NAME = "ccr-route";
 export const A_EXTERNAL_TOOL_TEST_NAME = "AExternalToolTest";
 
 /** route 侧工具执行上下文。 */
-export interface RouteToolContext {
-	/** 当前 CCR session ID。 */
-	sessionId: string;
-}
-
-/** route 侧工具定义。 */
-interface RouteToolDefinition {
-	/** 工具名，对外暴露给 MCP tools/list。 */
-	name: string;
-	/** 工具描述。 */
-	description: string;
-	/** MCP inputSchema。 */
-	inputSchema: JsonObject;
-	/** 工具执行函数。 */
-	call: (input: JsonObject, context: RouteToolContext) => Promise<string>;
-}
+export type RouteToolContext = WorkspaceToolContext;
 
 /** route 侧内置工具列表。 */
 const ROUTE_TOOLS: RouteToolDefinition[] = [
@@ -47,6 +37,7 @@ const ROUTE_TOOLS: RouteToolDefinition[] = [
 			});
 		},
 	},
+	...WORKSPACE_ROUTE_TOOLS,
 ];
 
 /**

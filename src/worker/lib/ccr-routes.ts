@@ -783,6 +783,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			c.env.PROJECT_WORKSPACE_BUCKET,
 			projectId,
 			pathResult.path,
+			{ recursive: true },
 		);
 		return c.json({
 			ok: true,
@@ -817,6 +818,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			c.env.PROJECT_WORKSPACE_BUCKET,
 			projectId,
 			pathResult.path,
+			{ recursive: body.recursive === true },
 		);
 		return c.json({
 			directory,
@@ -863,6 +865,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			fromPathResult.path,
 			toPathResult.path,
 			moveSourceType,
+			{ overwrite: true },
 		);
 		if (!item) {
 			return c.json({ error: "Workspace path not found" }, 404);
@@ -1207,7 +1210,12 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			if (payload.type !== "control_request") {
 				continue;
 			}
-			const response = await handleControlRequest(payload, { sessionId });
+			const response = await handleControlRequest(payload, {
+				env: c.env,
+				sessionId,
+				store,
+				userId: c.get("userId"),
+			});
 			if (response) {
 				await store.enqueueClientEvent(sessionId, response, {
 					eventType: "control_response",
