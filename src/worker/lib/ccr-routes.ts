@@ -22,13 +22,15 @@ import {
 } from "./ccr-sandbox";
 import { getStringField, isJsonObject, readJsonObject, toJsonValue } from "./ccr-json";
 import { isTerminalWorkerPayload, readWorkerEpoch } from "./ccr-protocol";
+import { getSessionDetailResponse } from "./session-detail";
+import { createSessionInternalEventsJsonlResponse } from "./session-internal-events-export";
 import {
 	createWorkspaceDirectory,
+	createWorkspaceDownloadUrl,
 	deleteWorkspacePath,
 	listWorkspaceTree,
 	moveWorkspacePath,
 	normalizeWorkspacePath,
-	readWorkspaceFile,
 	signWorkspaceOperation,
 	createWorkspaceUploadUrls,
 	WORKSPACE_UPLOAD_MAX_FILE_SIZE,
@@ -81,13 +83,22 @@ type CcrVariables = {
  * @returns CCR store
  */
 function createStore(env: CcrBindings): CcrStore {
+	return new CcrStore(createRoutePrismaClient(env), {
+		aiProxyCredentialSecret: env.AI_PROXY_CREDENTIAL_SECRET,
+	});
+}
+
+/**
+ * 创建 route 层直接使用的 Prisma Client。
+ * @param env Worker 绑定
+ * @returns 当前请求可用的 Prisma Client
+ */
+function createRoutePrismaClient(env: CcrBindings) {
 	const databaseUrl = env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL;
 	if (!databaseUrl) {
 		throw new Error("DATABASE_URL or HYPERDRIVE.connectionString is required");
 	}
-	return new CcrStore(createPrismaClient(databaseUrl), {
-		aiProxyCredentialSecret: env.AI_PROXY_CREDENTIAL_SECRET,
-	});
+	return createPrismaClient(databaseUrl);
 }
 
 /**
@@ -180,64 +191,6 @@ function isTerminalTimelineEvent(event: Awaited<ReturnType<CcrStore["listChatTim
 function isTerminalWorkerEvent(event: WorkerVisibleEvent): boolean {
 	const payload = isJsonObject(event.payload) ? event.payload : {};
 	return isTerminalWorkerPayload(payload);
-}
-
-/** Session 历史分页结果。 */
-type SessionHistoryPage = {
-	/** client events 当前页。 */
-	clientEvents: Awaited<ReturnType<CcrStore["listClientEvents"]>>;
-	/** timeline 当前页。 */
-	timeline: Awaited<ReturnType<CcrStore["listChatTimeline"]>>;
-	/** 是否还有更早的 client events。 */
-	hasMoreClientEvents: boolean;
-	/** 是否还有更早的 timeline。 */
-	hasMoreTimeline: boolean;
-	/** 当前页最早 client sequence，用于下一次向上翻页。 */
-	beforeClientSequence: number | null;
-	/** 当前页最早 timeline ID，用于下一次向上翻页。 */
-	beforeTimelineId: number | null;
-};
-
-/**
- * 查询 session 历史分页。
- * @param store CCR store
- * @param sessionId session ID
- * @param input 分页参数
- * @returns 历史分页
- */
-async function listSessionHistoryPage(
-	store: CcrStore,
-	sessionId: string,
-	input: {
-		limit: number;
-		older: boolean;
-		beforeClientSequence: number | null;
-		beforeTimelineId: number | null;
-	},
-): Promise<SessionHistoryPage> {
-	const take = input.limit + 1;
-	const [rawClientEvents, rawTimeline] = await Promise.all([
-		input.older
-			? input.beforeClientSequence
-				? store.listClientEventsBefore(sessionId, input.beforeClientSequence, take)
-				: Promise.resolve([])
-			: store.listRecentClientEvents(sessionId, take),
-		input.older
-			? input.beforeTimelineId
-				? store.listChatTimelineBefore(sessionId, input.beforeTimelineId, take)
-				: Promise.resolve([])
-			: store.listRecentChatTimeline(sessionId, take),
-	]);
-	const clientEvents = rawClientEvents.slice(-input.limit);
-	const timeline = rawTimeline.slice(-input.limit);
-	return {
-		clientEvents,
-		timeline,
-		hasMoreClientEvents: rawClientEvents.length > input.limit,
-		hasMoreTimeline: rawTimeline.length > input.limit,
-		beforeClientSequence: clientEvents[0]?.sequence_num ?? null,
-		beforeTimelineId: timeline[0]?.id ?? null,
-	};
 }
 
 /**
@@ -448,6 +401,7 @@ async function handleWorkspaceTreeRequest(
  */
 export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variables: CcrVariables }>) {
 	app.use("/api/ccr/*", authenticateApiUser);
+	app.use("/api/sessions/*", authenticateApiUser);
 	app.use("/api/projects", authenticateApiUser);
 	app.use("/api/projects/*", authenticateApiUser);
 
@@ -631,22 +585,16 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		if ("error" in pathResult) {
 			return c.json({ error: pathResult.error }, 400);
 		}
-		const file = await readWorkspaceFile(
+		const download = await createWorkspaceDownloadUrl(
+			c.env,
 			c.env.PROJECT_WORKSPACE_BUCKET,
 			projectId,
 			pathResult.path,
 		);
-		if (!file) {
+		if (!download) {
 			return c.json({ error: "Workspace file not found" }, 404);
 		}
-		return c.json({
-			file,
-			signature: await signWorkspaceOperation(c.env, {
-				operation: "read",
-				projectId,
-				path: pathResult.path,
-			}),
-		});
+		return c.redirect(download.downloadUrl, 302);
 	});
 
 	app.put("/api/projects/:projectId/workspace/file", async (c) => {
@@ -898,13 +846,10 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 	});
 
 	app.get("/api/ccr/sessions/:sessionId", async (c) => {
-		const store = createStore(c.env);
 		const sessionId = c.req.param("sessionId");
-		const session = await store.findUserSessionSummary(c.get("userId"), sessionId);
-		if (!session) {
-			return c.json({ error: "Session not found" }, 404);
-		}
-		const history = await listSessionHistoryPage(store, sessionId, {
+		const detail = await getSessionDetailResponse(createRoutePrismaClient(c.env), {
+			userId: c.get("userId"),
+			sessionId,
 			limit: readHistoryLimit(c.req.query("limit")),
 			older: c.req.query("older") === "1",
 			beforeClientSequence: readPositiveIntegerQuery(
@@ -912,17 +857,10 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			),
 			beforeTimelineId: readPositiveIntegerQuery(c.req.query("beforeTimelineId")),
 		});
-		return c.json({
-			session,
-			clientEvents: history.clientEvents,
-			timeline: history.timeline,
-			history: {
-				hasMoreClientEvents: history.hasMoreClientEvents,
-				hasMoreTimeline: history.hasMoreTimeline,
-				beforeClientSequence: history.beforeClientSequence,
-				beforeTimelineId: history.beforeTimelineId,
-			},
-		});
+		if (!detail) {
+			return c.json({ error: "Session not found" }, 404);
+		}
+		return c.json(detail);
 	});
 
 	app.delete("/api/ccr/sessions/:sessionId", async (c) => {
@@ -1143,6 +1081,21 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 				closeOnTerminal: false,
 			});
 		});
+	});
+
+	app.get("/api/sessions/:sessionId/internal-events.jsonl", async (c) => {
+		const response = await createSessionInternalEventsJsonlResponse(
+			createRoutePrismaClient(c.env),
+			{
+				userId: c.get("userId"),
+				sessionId: c.req.param("sessionId"),
+				signal: c.req.raw.signal,
+			},
+		);
+		if (!response) {
+			return c.json({ error: "Session not found" }, 404);
+		}
+		return response;
 	});
 
 	app.post("/v1/code/sessions/:sessionId/worker/register", async (c) => {

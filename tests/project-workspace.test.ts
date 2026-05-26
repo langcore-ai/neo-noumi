@@ -3,6 +3,7 @@ import {
 	buildWorkspaceObjectKey,
 	copyWorkspacePath,
 	createWorkspaceDirectory,
+	createWorkspaceDownloadUrl,
 	createWorkspaceUploadUrls,
 	deleteWorkspacePath,
 	listWorkspaceTree,
@@ -469,6 +470,56 @@ describe("workspace R2 operations", () => {
 		expect(url.pathname).toBe("/test-workspaces/project-1/src/nested/a%20b.txt");
 		expect(url.searchParams.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
 		expect(url.searchParams.get("X-Amz-Expires")).toBe("900");
+	});
+
+	test("creates R2 presigned download urls without reading file content", async () => {
+		const { bucket } = createFakeR2Bucket({
+			"project-1/src/readme.md": "hello",
+		});
+
+		const download = await createWorkspaceDownloadUrl(
+			{
+				PROJECT_WORKSPACE_BUCKET_NAME: "test-workspaces",
+				R2_ACCOUNT_ID: "account-id",
+				R2_ACCESS_KEY_ID: "access-key",
+				R2_SECRET_ACCESS_KEY: "secret-key",
+			},
+			bucket,
+			"project-1",
+			"src/readme.md",
+		);
+
+		const url = new URL(download?.downloadUrl ?? "");
+		expect(download).toMatchObject({
+			path: "src/readme.md",
+			method: "GET",
+			size: 5,
+			etag: "etag-project-1/src/readme.md",
+			contentType: "application/octet-stream",
+		});
+		expect(url.hostname).toBe("account-id.r2.cloudflarestorage.com");
+		expect(url.pathname).toBe("/test-workspaces/project-1/src/readme.md");
+		expect(url.searchParams.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
+		expect(url.searchParams.get("X-Amz-Expires")).toBe("300");
+		expect(download?.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000));
+	});
+
+	test("does not create a download url for missing workspace files", async () => {
+		const { bucket } = createFakeR2Bucket();
+
+		await expect(
+			createWorkspaceDownloadUrl(
+				{
+					PROJECT_WORKSPACE_BUCKET_NAME: "test-workspaces",
+					R2_ACCOUNT_ID: "account-id",
+					R2_ACCESS_KEY_ID: "access-key",
+					R2_SECRET_ACCESS_KEY: "secret-key",
+				},
+				bucket,
+				"project-1",
+				"missing.txt",
+			),
+		).resolves.toBeNull();
 	});
 
 	test("rejects presigned upload urls above the file size limit", async () => {

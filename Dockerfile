@@ -26,9 +26,11 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean \
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 	--mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
 	apt-get update && apt-get install -y --no-install-recommends \
+		curl \
 		poppler-utils \
 		python3 \
-		python3-pip
+		python3-pip \
+		wget
 
 RUN --mount=type=cache,target=/root/.cache/pip \
 	pip install uv \

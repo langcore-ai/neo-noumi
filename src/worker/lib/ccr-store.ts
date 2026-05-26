@@ -73,6 +73,15 @@ const subagentTranscriptSubpath = (sessionId: string, agentId: string) =>
 /** sessionStore 中 subagent transcript 的路径前缀。 */
 const subagentTranscriptPrefix = (sessionId: string) => `${sessionId}/subagents/`;
 
+/** internal events fallback 镜像单次最多恢复事件数，避免长会话压垮 Worker 内存。 */
+const INTERNAL_EVENT_RESTORE_MAX_EVENTS = 1_000;
+
+/** internal events fallback 镜像单次最多生成 JSONL 字节数。 */
+const INTERNAL_EVENT_RESTORE_MAX_BYTES = 2 * 1024 * 1024;
+
+/** internal events fallback 估算 JSONL 字节数时复用的编码器。 */
+const internalEventRestoreTextEncoder = new TextEncoder();
+
 /** Project 名称冲突错误。 */
 export class ProjectNameConflictError extends Error {
 	/**
@@ -135,6 +144,34 @@ function newEventId(): string {
 function newAiProxyToken(): string {
 	return `${AI_PROXY_TOKEN_PREFIX}${crypto.randomUUID().replaceAll("-", "")}`;
 }
+
+/** internal event fallback 恢复用 DTO。 */
+type InternalEventRestoreItem = {
+	/** internal event UUID。 */
+	event_id: string;
+	/** internal event 类型。 */
+	event_type: string;
+	/** 原始 CCR payload。 */
+	payload: JsonObject;
+	/** event metadata。 */
+	event_metadata: JsonObject | null;
+	/** 是否为 compaction boundary。 */
+	is_compaction: boolean;
+	/** 创建时间。 */
+	created_at: string;
+	/** subagent ID；foreground 为空。 */
+	agent_id: string | null;
+};
+
+/** internal event fallback 恢复窗口。 */
+type InternalEventRestoreWindow = {
+	/** 被纳入恢复窗口的事件。 */
+	events: InternalEventRestoreItem[];
+	/** 是否因为硬上限截断。 */
+	truncated: boolean;
+	/** 已生成 JSONL 的估算字节数。 */
+	bytes: number;
+};
 
 /**
  * 判断数据库错误是否来自唯一约束冲突。
@@ -1643,11 +1680,10 @@ export class CcrStore {
 		epoch: number,
 		events: WorkerInternalEvent[],
 	): Promise<boolean> {
-		const changed = await this.prisma.$transaction(async (tx) => {
+		const accepted = await this.prisma.$transaction(async (tx) => {
 			if (!(await this.claimActiveWorkerEpoch(tx, sessionId, epoch))) {
-				return null;
+				return false;
 			}
-			let createdAny = false;
 			for (const event of events) {
 				const payload = asCcrPayload(event.payload);
 				// keep_alive 没有审计价值，避免污染 internal event 历史。
@@ -1656,7 +1692,7 @@ export class CcrStore {
 				}
 				const eventId = eventIdFromPayload(payload, newEventId);
 				const eventType = String(payload.type ?? "unknown");
-				const created = await tx.chatInternalEvent.createMany({
+				await tx.chatInternalEvent.createMany({
 					data: {
 						sessionId,
 						eventId,
@@ -1670,17 +1706,10 @@ export class CcrStore {
 					// internal event 也以 eventId 做幂等，重复恢复不应触发无意义镜像重建。
 					skipDuplicates: true,
 				});
-				createdAny ||= created.count > 0;
 			}
-			return createdAny;
+			return true;
 		});
-		if (changed === null) {
-			return false;
-		}
-		if (changed) {
-			await this.syncClaudeSessionStoreFromInternalEvents(sessionId);
-		}
-		return true;
+		return accepted;
 	}
 
 	/**
@@ -1793,21 +1822,17 @@ export class CcrStore {
 	}
 
 	/**
-	 * 拉取完整 internal event 恢复窗口。
+	 * 拉取有硬上限的 internal event 恢复窗口。
 	 * @param sessionId session ID
 	 * @param subagents 是否读取子 agent
 	 * @returns 当前恢复窗口内的 internal events
 	 */
-	private async listAllInternalEventsForRestore(sessionId: string, subagents: boolean) {
-		const events: Array<{
-			event_id: string;
-			event_type: string;
-			payload: JsonObject;
-			event_metadata: JsonObject | null;
-			is_compaction: boolean;
-			created_at: string;
-			agent_id: string | null;
-		}> = [];
+	private async listBoundedInternalEventsForRestore(
+		sessionId: string,
+		subagents: boolean,
+	): Promise<InternalEventRestoreWindow> {
+		const events: InternalEventRestoreItem[] = [];
+		let bytes = 0;
 		let cursor: number | undefined;
 		while (true) {
 			const page = await this.listInternalEvents(sessionId, {
@@ -1815,9 +1840,20 @@ export class CcrStore {
 				cursor,
 				limit: 500,
 			});
-			events.push(...page.data);
+			for (const event of page.data) {
+				const eventBytes =
+					internalEventRestoreTextEncoder.encode(JSON.stringify(event.payload)).byteLength + 1;
+				if (
+					events.length >= INTERNAL_EVENT_RESTORE_MAX_EVENTS ||
+					bytes + eventBytes > INTERNAL_EVENT_RESTORE_MAX_BYTES
+				) {
+					return { events, truncated: true, bytes };
+				}
+				bytes += eventBytes;
+				events.push(event);
+			}
 			if (!page.next_cursor) {
-				return events;
+				return { events, truncated: false, bytes };
 			}
 			// next_cursor 是数据库顺序 ID，和 event_id 的幂等 UUID 语义不同。
 			cursor = Number(page.next_cursor);
@@ -1867,7 +1903,8 @@ export class CcrStore {
 		if (!activeSession) {
 			return;
 		}
-		const foregroundEvents = await this.listAllInternalEventsForRestore(sessionId, false);
+		const foregroundWindow = await this.listBoundedInternalEventsForRestore(sessionId, false);
+		const foregroundEvents = foregroundWindow.events;
 		await this.writeClaudeSessionStoreMirrorFile(
 			sessionId,
 			foregroundTranscriptSubpath(sessionId),
@@ -1877,10 +1914,15 @@ export class CcrStore {
 				source: "ccr_internal_events",
 				transcript_kind: "foreground",
 				event_count: foregroundEvents.length,
+				truncated: foregroundWindow.truncated,
+				restore_bytes: foregroundWindow.bytes,
+				restore_max_events: INTERNAL_EVENT_RESTORE_MAX_EVENTS,
+				restore_max_bytes: INTERNAL_EVENT_RESTORE_MAX_BYTES,
 			},
 		);
 
-		const subagentEvents = await this.listAllInternalEventsForRestore(sessionId, true);
+		const subagentWindow = await this.listBoundedInternalEventsForRestore(sessionId, true);
+		const subagentEvents = subagentWindow.events;
 		const subpaths = new Set<string>();
 		const eventsBySubpath = new Map<string, JsonObject[]>();
 		for (const event of subagentEvents) {
@@ -1905,6 +1947,10 @@ export class CcrStore {
 					source: "ccr_internal_events",
 					transcript_kind: "subagent",
 					event_count: payloads.length,
+					truncated: subagentWindow.truncated,
+					restore_bytes: subagentWindow.bytes,
+					restore_max_events: INTERNAL_EVENT_RESTORE_MAX_EVENTS,
+					restore_max_bytes: INTERNAL_EVENT_RESTORE_MAX_BYTES,
 				},
 			);
 		}

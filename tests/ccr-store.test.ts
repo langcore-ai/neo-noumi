@@ -651,6 +651,124 @@ describe("CcrStore worker lifecycle guards", () => {
 		expect(calls).toEqual(["claim"]);
 	});
 
+	test("does not rebuild sessionStore when inserting internal events", async () => {
+		const calls: string[] = [];
+		const tx = {
+			chatSession: {
+				updateMany: async (args: { where: unknown }) => {
+					calls.push("claim");
+					expect(args.where).toEqual({
+						id: "session-1",
+						workerEpoch: 2,
+						deletedAt: null,
+					});
+					return { count: 1 };
+				},
+			},
+			chatInternalEvent: {
+				createMany: async (args: { data: { eventType: string }; skipDuplicates: boolean }) => {
+					calls.push(`create:${args.data.eventType}`);
+					expect(args.skipDuplicates).toBe(true);
+					return { count: 1 };
+				},
+			},
+		};
+		const store = createStoreFromFakePrisma({
+			$transaction: async (fn: (transaction: unknown) => Promise<unknown>) => fn(tx),
+			chatSession: {
+				findFirst: async () => {
+					throw new Error("insertInternalEvents should not rebuild sessionStore");
+				},
+			},
+			chatSessionStoreFile: {
+				findMany: async () => {
+					throw new Error("insertInternalEvents should not read sessionStore");
+				},
+				upsert: async () => {
+					throw new Error("insertInternalEvents should not write sessionStore");
+				},
+			},
+		});
+
+		await expect(
+			store.insertInternalEvents("session-1", 2, [
+				{
+					payload: {
+						type: "assistant",
+						uuid: "event-1",
+					},
+				},
+			]),
+		).resolves.toBe(true);
+		expect(calls).toEqual(["claim", "create:assistant"]);
+	});
+
+	test("caps internal event fallback sessionStore mirror size", async () => {
+		const totalEvents = 1_200;
+		const upserts: Array<{ create: { content: string; metadata?: Record<string, unknown> } }> = [];
+		const rows = Array.from({ length: totalEvents }, (_, index) => {
+			const id = index + 1;
+			return {
+				id,
+				eventId: `internal-${id}`,
+				eventType: "assistant",
+				payload: { type: "assistant", index: id },
+				eventMetadata: null,
+				isCompaction: false,
+				agentId: null,
+				createdAt: new Date("2026-05-26T00:00:00.000Z"),
+			};
+		});
+		const store = createStoreFromFakePrisma({
+			$transaction: async (fn: (transaction: unknown) => Promise<unknown>) =>
+				fn({
+					chatSession: {
+						updateMany: async () => ({ count: 1 }),
+					},
+					chatSessionStoreFile: {
+						upsert: async (args: { create: { content: string; metadata?: Record<string, unknown> } }) => {
+							upserts.push(args);
+							return {};
+						},
+					},
+				}),
+			chatSession: {
+				findFirst: async () => ({ id: "session-1" }),
+			},
+			chatSessionStoreFile: {
+				findMany: async () => [],
+				findUnique: async () => null,
+			},
+			chatInternalEvent: {
+				findFirst: async (args: { where?: { isCompaction?: boolean } }) =>
+					args.where?.isCompaction ? null : { id: 1 },
+				findMany: async (args: {
+					distinct?: string[];
+					take?: number;
+					where?: { id?: { gt?: number } };
+				}) => {
+					if (args.distinct?.includes("agentId")) {
+						return [];
+					}
+					const afterId = args.where?.id?.gt ?? 0;
+					return rows.filter((row) => row.id > afterId).slice(0, args.take ?? 100);
+				},
+			},
+		});
+
+		await expect(store.ensureClaudeSessionStoreFromInternalEvents("session-1")).resolves.toBe(true);
+
+		const foregroundMirror = upserts[0]?.create;
+		expect(foregroundMirror?.content.trim().split("\n")).toHaveLength(1_000);
+		expect(foregroundMirror?.metadata).toMatchObject({
+			source: "ccr_internal_events",
+			transcript_kind: "foreground",
+			event_count: 1_000,
+			truncated: true,
+			restore_max_events: 1_000,
+		});
+	});
+
 	test("rejects new client events when the session is already deleting", async () => {
 		const calls: string[] = [];
 		const tx = {

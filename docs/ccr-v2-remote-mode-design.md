@@ -21,7 +21,7 @@
 - 数据模型已拆成 `projects`、`chat_sessions`、`user_containers`：一个用户可以有多个 project，session 必须归属某个用户和某个 project。
 - `chat_sessions.userId` 和 `chat_sessions.projectId` 是非空外键，创建 session 前会校验 project 属于当前登录用户，避免跨用户挂载 session。
 - 同一用户的活跃 project 名称通过 PostgreSQL partial unique index 保持唯一，软删除项目不占用名称；这是 `/workspace/{projectName}` 挂载路径不串用的前置约束。
-- Project workspace 已接入 R2 bucket `neo-noumi-workspaces`，对象根目录使用 `{projectId}/...`；文件树支持列表、读写、删除、移动、新建目录以及文件/文件夹直传。所有 `/api/projects/{projectId}/workspace/*` 操作都先校验 project owner，再由后端生成 HMAC 操作签名；上传由后端下发短期 R2 presigned PUT URL，前端直接写入 R2，不经过 Worker 转发文件 body。Sandbox 内 project workspace 挂载为只读，Claude Code 修改 workspace 必须通过 route-side MCP workspace 工具让主服务执行实际 R2 变更。
+- Project workspace 已接入 R2 bucket `neo-noumi-workspaces`，对象根目录使用 `{projectId}/...`；文件树支持列表、读写、删除、移动、新建目录以及文件/文件夹直传。所有 `/api/projects/{projectId}/workspace/*` 操作都先校验 project owner，再由后端生成 HMAC 操作签名；上传由后端下发短期 R2 presigned PUT URL，前端直接写入 R2，不经过 Worker 转发文件 body；文件读取由后端鉴权后 302 到短期 R2 presigned GET URL，Worker 不搬运文件内容。Sandbox 内 project workspace 挂载为只读，Claude Code 修改 workspace 必须通过 route-side MCP workspace 工具让主服务执行实际 R2 变更。
 - `/projects` 是 project 管理页面，基于 `/api/projects` 提供列表、创建、编辑和软删除；删除 project 会同步移除其下未删除 session，并对活跃 session 后台停止 runner，聊天页只展示未删除 project/session。
 - Cloudflare 资源使用 `NeoNoumiSandbox` / `NEO_NOUMI_SANDBOX` / `neo-noumi-sandbox` 命名，用户级 sandbox ID 使用 `neo-noumi-user-{userId}`。
 - Cloudflare outbound interception 的 CCR `--sdk-url` host 使用 `beacon.claude-ai.staging.ant.dev`；`api.anthropic.com` 作为 AI Proxy 劫持入口，由 Worker 校验短期 proxy token 后再转发到用户默认渠道或平台 fallback 渠道，真实上游 API key 不再注入 sandbox。
@@ -300,6 +300,7 @@ Claude Code CLI in Cloudflare Container
 - SSE 稳定性：真实 CLI 曾在 15 秒心跳下约 12 秒空闲断连；route 心跳调整为 5 秒后，复测日志未再出现 `Stream read error` 或 `socket connection was closed unexpectedly`。
 - 业务 chat API：`POST /api/ccr/sessions/{sessionId}/messages` 在 `Accept: text/event-stream` 下会先返回 `session` SSE frame，再写入用户消息、启动真实远程模式 Claude Code CLI，并在同一个请求里持续输出 `timeline` frame；收到 `result` 后返回 `done` 并结束本次前端长连接。所有 SSE 入口必须显式返回 `Content-Type: text/event-stream`、禁用缓存和 `no-transform`，不能只依赖普通 streaming body。
 - 会话详情 API：`GET /api/ccr/sessions/{sessionId}` 默认只返回最近 10 条 `clientEvents` 和最近 10 条 `timeline`，并返回 `history` 游标；Chat 页向上滚动触顶后带 `older=1`、`beforeClientSequence`、`beforeTimelineId` 继续加载更早事件。`internal events` 不再随会话详情返回，恢复链路仍走 worker/internal-events 与 sessionStore 镜像。
+- 全量恢复下载 API：`GET /api/sessions/{sessionId}/internal-events.jsonl` 是独立的登录用户 API，不复用 `CcrStore` 恢复窗口；它直接按 `chat_internal_events.id` 每 50 条分页查询，并把每页拼成短 JSONL chunk 后立即写入响应流。
 - Claude Code 容器内的 `ANTHROPIC_BASE_URL` 固定为 `https://api.anthropic.com`，真实渠道 base URL 只在 Worker AI Proxy 转发时使用；渠道配置如果带 `/v1`，后端会先规范化，避免上游出现 `/v1/v1/messages`。
 - `POST /api/ccr/sessions/{sessionId}/container/stop` 的语义是停止用户级 sandbox 容器，而不是只杀当前 session runner；停止后会把同一用户挂在该 sandbox 上的运行态 session 收敛为 `idle/stopped`，下一次发送消息会重建容器并从数据库恢复 transcript 与 memory。
 - `/worker/events` 写入 terminal `result` 后会停止当前 session runner，并将 session 状态收敛为 `workerStatus=idle`、`containerStatus=stopped`、`runnerProcessId=null`；worker transport 鉴权时会从 token 绑定的 session 回填 owner userId，确保停止的是 `neo-noumi-user-{userId}` 对应的真实 sandbox。这个保底逻辑在后端 worker transport 层执行，不依赖前端 SSE 是否仍然连接，避免旧进程继续写入 `keep_alive`。
@@ -1053,7 +1054,7 @@ Neo Noumi 当前至少会恢复 Claude Code 自己的运行期状态：
 - 后端 API 负责校验 project ownership、规范化相对路径并拒绝 `..` 越权路径。
 - 每次 workspace API 操作都会基于 `WORKSPACE_SIGNING_SECRET` 生成后端 HMAC 签名，签名覆盖操作类型、projectId、路径、请求体摘要和过期时间。
 - 文件树读取只使用 POST JSON body 传递 `prefix`，避免深层目录或长中文路径突破 URL 长度限制。
-- 文件/文件夹上传先由后端校验数量、声明大小和路径，再签发短期 R2 S3 presigned PUT URL，由前端直接 PUT 到 R2；部署时 `PROJECT_WORKSPACE_BUCKET_NAME` 必须和 R2 binding bucket 保持一致，bucket 必须允许前端 origin 对 R2 S3 endpoint 发起 `PUT` 的 CORS 请求。
+- 文件/文件夹上传先由后端校验数量、声明大小和路径，再签发短期 R2 S3 presigned PUT URL，由前端直接 PUT 到 R2；文件读取先由后端校验 project owner 和 workspace 路径，再签发短期 R2 S3 presigned GET URL 并重定向。部署时 `PROJECT_WORKSPACE_BUCKET_NAME` 必须和 R2 binding bucket 保持一致，bucket 必须允许前端 origin 对 R2 S3 endpoint 发起 `PUT` / `GET` 的 CORS 请求。
 - 每次 chat 启动 Claude Code runner 前，A 会校验 session 所属 project 的 workspace 是否已经挂载到 sandbox：目标路径是 `/workspace/{projectName}`，R2 prefix 是 `/{projectId}`；已挂载时跳过，未挂载时通过 `PROJECT_WORKSPACE_BUCKET` binding 执行只读 `mountBucket`。
 - workspace 写入由主服务的 route-side MCP 工具执行，当前工具包括 `workspace_stat`、`workspace_list`、`workspace_read_file`、`workspace_mkdir`、`workspace_create_file`、`workspace_write_file`、`workspace_delete`、`workspace_move` 和 `workspace_copy`。这些工具只接收 workspace 相对路径，project 从当前 CCR session 推导，避免模型传入任意 projectId。
 - MCP 写工具的约束：路径拒绝父级穿越、控制字符和 Windows drive path，写入目标的父级不能是文件；`workspace_read_file` 限制单文件读取大小；`workspace_delete` 删除目录必须显式 `recursive=true`；`workspace_mkdir` 支持 `recursive=true` 的 `mkdir -p` 行为；`workspace_create_file` 不覆盖已有文件；`workspace_write_file` 只做全量写入并支持 `ifMatch` etag 防旧写；`workspace_move` / `workspace_copy` 默认不覆盖目标路径，目录操作限制最大对象数。
@@ -1077,13 +1078,13 @@ A 实现 CCR v2 session service
 B claude --print --sdk-url A
 ```
 
-Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metadata 作为权威恢复源，同时把当前 compact 窗口内的 transcript 镜像到 `sessionStore`：
+Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metadata 作为权威恢复源；`sessionStore` 优先使用 Claude Code 自己通过 `/session-store/write` 写入的 transcript，旧会话缺少 mirror 时才从 internal events 回填当前 compact 窗口：
 
 - `project_key = "claude-code"`。
 - foreground transcript 写入 `{sessionId}.jsonl`。
 - 普通 subagent transcript 写入 `{sessionId}/subagents/agent-{agentId}.jsonl`。
 - 如果 internal event metadata 或 payload 中存在安全的 `agent_transcript_subdir` / `transcript_subdir`，subagent transcript 会写入 `{sessionId}/subagents/{subdir}/agent-{agentId}.jsonl`，用于贴近 `claude-code-reverse` 的 `agentTranscriptSubdirs` 语义。
-- `/session-store/read` 与 `/session-store/list` 在 `project_key = "claude-code"` 且没有文件时，会触发一次从 internal events 到 sessionStore 的旧会话回填。
+- `/session-store/read` 与 `/session-store/list` 在 `project_key = "claude-code"` 且没有文件时，会触发一次从 internal events 到 sessionStore 的旧会话回填；`/worker/internal-events` 写入热路径不再同步重建 sessionStore。
 - internal events 镜像只会覆盖由 `source = "ccr_internal_events"` 生成的 sessionStore 文件；直接通过 sessionStore 写入的文件不会被 internal events 镜像覆盖。
 - sessionStore 写入和删除只接受活跃 session；session 进入删除态后不能再通过 worker token 改写 transcript 镜像。
 - 容器启动前会把 `claude-code` sessionStore 文件恢复到当前 project cwd 对应的 Claude project state 目录下；memory 恢复会读取 foreground 与 subagent JSONL 中已成功执行的 `Write` 工具调用。
@@ -1110,7 +1111,7 @@ Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metada
 - 保存 transcript、compaction、agent_id。
 - 按 foreground/subagent compact 边界返回恢复窗口。
 - 启动前恢复 Claude local transcript 与 memory，并按是否存在历史 transcript 选择 `--session-id` 或 `--resume`。
-- 把 internal events 当前恢复窗口镜像到 `claude-code` sessionStore。
+- 旧会话缺少 `claude-code` sessionStore mirror 时，从 internal events 当前恢复窗口回填一次。
 
 ### 已实现的 route-side MCP 工具
 

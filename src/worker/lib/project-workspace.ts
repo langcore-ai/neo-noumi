@@ -15,6 +15,9 @@ const WORKSPACE_SIGNATURE_TTL_SECONDS = 5 * 60;
 /** R2 直传 URL 默认有效期，单位秒。 */
 export const WORKSPACE_UPLOAD_URL_TTL_SECONDS = 15 * 60;
 
+/** R2 下载 URL 默认有效期，单位秒。 */
+export const WORKSPACE_DOWNLOAD_URL_TTL_SECONDS = 5 * 60;
+
 /** 单次直传签名最大文件数量。 */
 export const WORKSPACE_UPLOAD_MAX_FILES = 500;
 
@@ -121,6 +124,26 @@ export type WorkspaceUploadUrl = {
 	headers: Record<string, string>;
 	/** 签名过期 Unix 秒时间戳。 */
 	expiresAt: number;
+};
+
+/** workspace 下载 URL。 */
+export type WorkspaceDownloadUrl = {
+	/** 文件 workspace 相对路径。 */
+	path: string;
+	/** 前端或容器可直接 GET 的短期签名 URL。 */
+	downloadUrl: string;
+	/** 下载方法。 */
+	method: "GET";
+	/** 签名过期 Unix 秒时间戳。 */
+	expiresAt: number;
+	/** 文件大小，单位字节。 */
+	size: number;
+	/** 文件 etag。 */
+	etag: string;
+	/** 文件内容类型。 */
+	contentType: string;
+	/** R2 上传时间。 */
+	uploaded: string;
 };
 
 /** 已签名 workspace 操作上下文。 */
@@ -271,6 +294,60 @@ function createR2SigningClient(
 function buildR2ObjectUrl(accountId: string, bucketName: string, key: string): string {
 	const encodedPath = encodeR2Path(`${bucketName}/${key}`);
 	return `https://${accountId}.r2.cloudflarestorage.com/${encodedPath}`;
+}
+
+/**
+ * 为 R2 对象生成短期 S3 presigned URL。
+ * @param env R2 签名所需 Worker 绑定
+ * @param input 签名参数
+ * @returns 签名 URL 和过期时间
+ */
+async function createPresignedWorkspaceObjectUrl(
+	env: Pick<
+		ProjectWorkspaceBindings,
+		| "R2_ACCOUNT_ID"
+		| "R2_ACCESS_KEY_ID"
+		| "R2_SECRET_ACCESS_KEY"
+		| "PROJECT_WORKSPACE_BUCKET_NAME"
+	>,
+	input: {
+		/** R2 object key。 */
+		key: string;
+		/** HTTP 方法。 */
+		method: "GET" | "PUT";
+		/** 签名有效期，单位秒。 */
+		expiresInSeconds: number;
+		/** 需要参与签名的请求头。 */
+		headers?: Record<string, string>;
+	},
+) {
+	if (!env.R2_ACCOUNT_ID) {
+		throw new Error("R2_ACCOUNT_ID is required");
+	}
+	if (!env.PROJECT_WORKSPACE_BUCKET_NAME) {
+		throw new Error("PROJECT_WORKSPACE_BUCKET_NAME is required");
+	}
+	const uploadUrl = new URL(
+		buildR2ObjectUrl(
+			env.R2_ACCOUNT_ID,
+			env.PROJECT_WORKSPACE_BUCKET_NAME,
+			input.key,
+		),
+	);
+	uploadUrl.searchParams.set("X-Amz-Expires", String(input.expiresInSeconds));
+	const signed = await createR2SigningClient(env).sign(
+		uploadUrl,
+		{
+			headers: input.headers,
+			method: input.method,
+			// R2 S3 presigned URL 通过 query 参数授权，调用方无需持有密钥。
+			aws: { signQuery: true },
+		},
+	);
+	return {
+		url: signed.url,
+		expiresAt: Math.floor(Date.now() / 1000) + input.expiresInSeconds,
+	};
 }
 
 /**
@@ -599,18 +676,10 @@ export async function createWorkspaceUploadUrls(
 	basePath: string,
 	files: WorkspaceUploadUrlInput[],
 ): Promise<{ basePath: string; files: WorkspaceUploadUrl[] }> {
-	if (!env.R2_ACCOUNT_ID) {
-		throw new Error("R2_ACCOUNT_ID is required");
-	}
-	if (!env.PROJECT_WORKSPACE_BUCKET_NAME) {
-		throw new Error("PROJECT_WORKSPACE_BUCKET_NAME is required");
-	}
 	if (files.length > WORKSPACE_UPLOAD_MAX_FILES) {
 		throw new Error(`Workspace upload cannot exceed ${WORKSPACE_UPLOAD_MAX_FILES} files`);
 	}
 	const normalizedBasePath = normalizeWorkspacePath(basePath, { allowEmpty: true });
-	const signer = createR2SigningClient(env);
-	const expiresAt = Math.floor(Date.now() / 1000) + WORKSPACE_UPLOAD_URL_TTL_SECONDS;
 	const uploadUrls: WorkspaceUploadUrl[] = [];
 	for (const input of files) {
 		const targetPath = buildWorkspaceUploadPath(
@@ -624,37 +693,66 @@ export async function createWorkspaceUploadUrls(
 			throw new Error("Workspace upload file exceeds the maximum size");
 		}
 		const contentType = input.contentType || "application/octet-stream";
-		const uploadUrl = new URL(
-			buildR2ObjectUrl(
-				env.R2_ACCOUNT_ID,
-				env.PROJECT_WORKSPACE_BUCKET_NAME,
-				buildWorkspaceObjectKey(projectId, targetPath),
-			),
-		);
-		uploadUrl.searchParams.set(
-			"X-Amz-Expires",
-			String(WORKSPACE_UPLOAD_URL_TTL_SECONDS),
-		);
-		const signed = await signer.sign(
-			uploadUrl,
-			{
-				headers: { "content-type": contentType },
-				method: "PUT",
-				// R2 S3 presigned URL 通过 query 参数授权，浏览器无需持有密钥。
-				aws: { signQuery: true },
-			},
-		);
+		const signed = await createPresignedWorkspaceObjectUrl(env, {
+			key: buildWorkspaceObjectKey(projectId, targetPath),
+			method: "PUT",
+			expiresInSeconds: WORKSPACE_UPLOAD_URL_TTL_SECONDS,
+			headers: { "content-type": contentType },
+		});
 		uploadUrls.push({
 			path: targetPath,
 			uploadUrl: signed.url,
 			method: "PUT",
 			headers: { "content-type": contentType },
-			expiresAt,
+			expiresAt: signed.expiresAt,
 		});
 	}
 	return {
 		basePath: normalizedBasePath,
 		files: uploadUrls,
+	};
+}
+
+/**
+ * 生成 workspace 文件下载 URL。
+ * @param env R2 签名所需 Worker 绑定
+ * @param bucket R2 bucket
+ * @param projectId Project ID
+ * @param path workspace 相对路径
+ * @returns 下载 URL；文件不存在时返回 null
+ */
+export async function createWorkspaceDownloadUrl(
+	env: Pick<
+		ProjectWorkspaceBindings,
+		| "R2_ACCOUNT_ID"
+		| "R2_ACCESS_KEY_ID"
+		| "R2_SECRET_ACCESS_KEY"
+		| "PROJECT_WORKSPACE_BUCKET_NAME"
+	>,
+	bucket: R2Bucket,
+	projectId: string,
+	path: string,
+): Promise<WorkspaceDownloadUrl | null> {
+	const normalizedPath = normalizeWorkspacePath(path);
+	const objectKey = buildWorkspaceObjectKey(projectId, normalizedPath);
+	const object = await bucket.head(objectKey);
+	if (!object) {
+		return null;
+	}
+	const signed = await createPresignedWorkspaceObjectUrl(env, {
+		key: objectKey,
+		method: "GET",
+		expiresInSeconds: WORKSPACE_DOWNLOAD_URL_TTL_SECONDS,
+	});
+	return {
+		path: normalizedPath,
+		downloadUrl: signed.url,
+		method: "GET",
+		expiresAt: signed.expiresAt,
+		size: object.size,
+		etag: object.etag,
+		contentType: object.httpMetadata?.contentType ?? "application/octet-stream",
+		uploaded: object.uploaded.toISOString(),
 	};
 }
 
