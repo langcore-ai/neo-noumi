@@ -19,7 +19,7 @@ import {
 	Trash2Icon,
 	WrenchIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { WorkspacePanel } from "@/components/chat/workspace-panel";
 import WorkspaceUploadPanel, {
@@ -62,21 +62,26 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { authClient } from "@/lib/auth-client";
 import {
-	buildMessages,
-	type ClientEvent,
-	findPendingToolPermissionRequest,
-	type TimelineEvent,
-	type ToolPermissionRequest,
-} from "@/lib/chat-message-model";
+	DEFAULT_SESSION_TITLE,
+	type ChatSearch,
+	type Project,
+	useChatSessions,
+} from "@/hooks/use-chat-sessions";
+import { useChatBusiness } from "@/hooks/use-chat-business";
+import { readError } from "@/lib/api-error";
 import {
+	addOptimisticWorkspaceDirectory,
 	buildChildDirectoryPath,
 	buildMovedIntoDirectoryPath,
 	buildRenamedPath,
 	type CreateDirectoryTarget,
 	createEmptyWorkspaceTree,
 	createWorkspaceTreeFallbackItem,
+	getWorkspaceParentPath,
 	isPathOrChild,
+	moveOptimisticWorkspaceItem,
 	type OpenFileTab,
+	removeOptimisticWorkspaceItem,
 	type RenameTarget,
 	type UploadTarget,
 	WORKSPACE_ROOT_ID,
@@ -87,65 +92,6 @@ import {
 	workspaceNodeToTreeItem,
 } from "@/lib/workspace-model";
 
-export const Route = createFileRoute("/chat")({
-	validateSearch: (search): ChatSearch => ({
-		projectId: typeof search.projectId === "string" ? search.projectId : undefined,
-		sessionId: typeof search.sessionId === "string" ? search.sessionId : undefined,
-	}),
-	component: ChatPage,
-});
-
-/** Chat 页 URL 查询参数。 */
-interface ChatSearch {
-	/** 初始选中的 project ID；没有 sessionId 时表示打开该 project 的新对话。 */
-	projectId?: string;
-	/** 初始选中的 session ID。 */
-	sessionId?: string;
-}
-
-/** CCR 会话摘要。 */
-interface ChatSession {
-	id: string;
-	title: string | null;
-	projectId: string;
-	workerStatus: string;
-	containerStatus: string;
-	sandboxId: string | null;
-	workerEpoch: number;
-	updatedAt: string;
-}
-
-/** CCR 项目摘要。 */
-interface Project {
-	id: string;
-	name: string;
-	description: string | null;
-	updatedAt: string;
-}
-
-/** 会话详情接口响应。 */
-interface SessionDetailResponse {
-	session: ChatSession;
-	clientEvents?: ClientEvent[];
-	timeline: TimelineEvent[];
-	history?: SessionHistoryState;
-}
-
-/** 会话历史分页状态。 */
-interface SessionHistoryState {
-	/** 是否还有更早的用户事件。 */
-	hasMoreClientEvents: boolean;
-	/** 是否还有更早的 worker timeline。 */
-	hasMoreTimeline: boolean;
-	/** 当前已加载用户事件中的最早 sequence。 */
-	beforeClientSequence: number | null;
-	/** 当前已加载 timeline 中的最早 ID。 */
-	beforeTimelineId: number | null;
-}
-
-/** 默认会话标题，用户直接发送第一条消息时使用。 */
-const DEFAULT_SESSION_TITLE = "新的对话";
-
 /** 空输入占位文案。 */
 const MESSAGE_PLACEHOLDER = "描述你想完成的任务，或者粘贴错误、需求、代码片段。";
 
@@ -155,81 +101,13 @@ const CHAT_BOTTOM_STICK_THRESHOLD = 48;
 /** 触顶加载更早历史的像素阈值。 */
 const CHAT_HISTORY_TOP_THRESHOLD = 24;
 
-/** Chat 页面每次加载的历史事件数量。 */
-const CHAT_HISTORY_PAGE_SIZE = 10;
-
-/** 空历史分页状态。 */
-const EMPTY_SESSION_HISTORY: SessionHistoryState = {
-	hasMoreClientEvents: false,
-	hasMoreTimeline: false,
-	beforeClientSequence: null,
-	beforeTimelineId: null,
-};
-
-/**
- * 从 API 响应中读取错误消息。
- * @param response fetch 响应
- * @returns 错误消息
- */
-async function readError(response: Response): Promise<string> {
-	const body = await response.json().catch(() => ({}));
-	return typeof body.error === "string" ? body.error : response.statusText;
-}
-
-/**
- * 校验响应是否为 SSE。
- * @param response fetch 响应
- */
-function assertSseResponse(response: Response) {
-	const contentType = response.headers.get("content-type") ?? "";
-	// 后端如果退化成普通流或 JSON 200，前端不能继续按 SSE 静默解析。
-	if (!contentType.toLowerCase().startsWith("text/event-stream")) {
-		throw new Error(`Chat stream content-type is invalid: ${contentType || "missing"}`);
-	}
-}
-
-/**
- * 解析一段 SSE frame。
- * @param frame 原始 frame
- * @returns 解析后的事件；注释或空 frame 返回 null
- */
-function parseSseFrame(frame: string): { event: string; data: string; id?: number } | null {
-	const lines = frame.split(/\r?\n/);
-	let event = "message";
-	let id: number | undefined;
-	const data: string[] = [];
-	for (const line of lines) {
-		if (!line || line.startsWith(":")) {
-			continue;
-		}
-		if (line.startsWith("event:")) {
-			event = line.slice("event:".length).trim();
-			continue;
-		}
-		if (line.startsWith("id:")) {
-			const parsed = Number(line.slice("id:".length).trim());
-			id = Number.isNaN(parsed) ? undefined : parsed;
-			continue;
-		}
-		if (line.startsWith("data:")) {
-			data.push(line.slice("data:".length).trimStart());
-		}
-	}
-	return data.length > 0 ? { event, data: data.join("\n"), id } : null;
-}
-
-/**
- * 解析 SSE JSON 负载，并把坏数据转换为可展示的错误。
- * @param data SSE data 文本
- * @returns JSON 对象
- */
-function parseSseJson(data: string): Record<string, unknown> {
-	try {
-		return JSON.parse(data) as Record<string, unknown>;
-	} catch {
-		throw new Error("Timeline stream payload parse failed");
-	}
-}
+export const Route = createFileRoute("/chat")({
+	validateSearch: (search): ChatSearch => ({
+		projectId: typeof search.projectId === "string" ? search.projectId : undefined,
+		sessionId: typeof search.sessionId === "string" ? search.sessionId : undefined,
+	}),
+	component: ChatPage,
+});
 
 /**
  * 产品化 Chat 页面。
@@ -240,31 +118,14 @@ function ChatPage() {
 	const initialSearch = Route.useSearch();
 	const navigate = useNavigate();
 	const bootstrappedUserIdRef = useRef<string | null>(null);
-	const streamAbortRef = useRef<AbortController | null>(null);
-	const timelineIdsRef = useRef<Set<number>>(new Set());
 	const chatViewportRef = useRef<HTMLDivElement | null>(null);
 	const messagesEndRef = useRef<HTMLDivElement | null>(null);
 	const shouldStickToBottomRef = useRef(true);
 	const forceStickToBottomRef = useRef(false);
-	const [session, setSession] = useState<ChatSession | null>(null);
-	const [sessions, setSessions] = useState<ChatSession[]>([]);
 	const [projects, setProjects] = useState<Project[]>([]);
 	const [project, setProject] = useState<Project | null>(null);
-	const [clientEvents, setClientEvents] = useState<ClientEvent[]>([]);
-	const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
-	const [sessionHistory, setSessionHistory] = useState<SessionHistoryState>(
-		EMPTY_SESSION_HISTORY,
-	);
-	const [draft, setDraft] = useState("");
-	const [containerStatus, setContainerStatus] = useState<unknown>(null);
-	const [error, setError] = useState<string | null>(null);
 	const [chatNotFoundMessage, setChatNotFoundMessage] = useState<string | null>(null);
 	const [isBootstrapping, setIsBootstrapping] = useState(true);
-	const [isSending, setIsSending] = useState(false);
-	const [isLoadingHistory, setIsLoadingHistory] = useState(false);
-	const [timelineStreamStatus, setTimelineStreamStatus] = useState<
-		"idle" | "connecting" | "open"
-	>("idle");
 	const [workspaceItems, setWorkspaceItems] = useState<Record<string, WorkspaceTreeItem>>(
 		createEmptyWorkspaceTree,
 	);
@@ -280,11 +141,119 @@ function ChatPage() {
 		useState<CreateDirectoryTarget | null>(null);
 	const [createDirectoryValue, setCreateDirectoryValue] = useState("新建文件夹");
 	const [uploadTarget, setUploadTarget] = useState<UploadTarget | null>(null);
-	const [handledPermissionRequestIds, setHandledPermissionRequestIds] = useState<Set<string>>(
-		() => new Set(),
-	);
-	const [isPermissionSubmitting, setIsPermissionSubmitting] = useState(false);
-	const [permissionError, setPermissionError] = useState<string | null>(null);
+
+	/**
+	 * 同步 chat 页面 URL 查询参数。
+	 * @param search 下一份查询参数
+	 * @param replace 是否替换当前 history 记录
+	 */
+	const updateChatRouteSearch = useCallback((search: ChatSearch, replace = false) => {
+		void navigate({
+			to: "/chat",
+			search,
+			replace,
+		});
+	}, [navigate]);
+
+	const {
+		callContainer,
+		containerStatus,
+		deleteSession: deleteChatSession,
+		isLoadingHistory,
+		loadSession: loadChatSession,
+		loadSessions,
+		resetConversation: resetSessionConversation,
+		session,
+		sessionError,
+		sessions,
+		startNewConversation: startSessionConversation,
+		loadOlderSessionHistory,
+		...chatSessionState
+	} = useChatSessions({
+		onRequestScrollToBottom: () => {
+			forceStickToBottomRef.current = true;
+			shouldStickToBottomRef.current = true;
+		},
+		project,
+		setProject,
+		updateChatRouteSearch,
+	});
+	const {
+		closeTimelineStream,
+		draft,
+		error,
+		isPermissionSubmitting,
+		isSending,
+		messages,
+		pendingPermissionRequest,
+		permissionError,
+		resetChatRuntime,
+		sendMessage,
+		setDraft,
+		setError,
+		submitToolPermissionDecision,
+		timelineStreamStatus,
+	} = useChatBusiness({
+		...chatSessionState,
+		loadSessions,
+		onRequestScrollToBottom: () => {
+			forceStickToBottomRef.current = true;
+			shouldStickToBottomRef.current = true;
+		},
+		session,
+	});
+	const latestSessionTitle = session?.title || DEFAULT_SESSION_TITLE;
+	const displayError = error ?? sessionError;
+
+	/**
+	 * 重置完整对话上下文。
+	 */
+	function resetConversation() {
+		closeTimelineStream();
+		resetChatRuntime();
+		resetSessionConversation();
+	}
+
+	/**
+	 * 加载会话前先结束旧 stream，避免旧 session 的增量继续写入当前页面。
+	 * @param sessionId session ID
+	 * @param options 加载选项
+	 * @returns 已加载的 session
+	 */
+	async function loadSession(
+		sessionId: string,
+		options: { syncRoute?: boolean } = {},
+	) {
+		closeTimelineStream();
+		return loadChatSession(sessionId, options);
+	}
+
+	/**
+	 * 创建新的空白对话。
+	 */
+	function startNewConversation() {
+		closeTimelineStream();
+		resetChatRuntime();
+		startSessionConversation();
+		setDraft("");
+		setError(null);
+	}
+
+	/**
+	 * 删除指定会话。
+	 * @param sessionId session ID
+	 */
+	async function deleteSession(sessionId: string) {
+		if (session?.id === sessionId) {
+			closeTimelineStream();
+			resetChatRuntime();
+		}
+		try {
+			await deleteChatSession(sessionId);
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+		}
+	}
 
 	const workspaceTree = useTree<WorkspaceTreeItem>({
 		dataLoader: {
@@ -308,47 +277,12 @@ function ChatPage() {
 		workspaceTree.rebuildTree();
 	}, [workspaceItems, workspaceTree]);
 
-	const messages = useMemo(() => {
-		return buildMessages(clientEvents, timeline);
-	}, [clientEvents, timeline]);
-
-	const pendingPermissionRequest = useMemo(() => {
-		return findPendingToolPermissionRequest(
-			timeline,
-			clientEvents,
-			handledPermissionRequestIds,
-		);
-	}, [clientEvents, handledPermissionRequestIds, timeline]);
-
-	const latestSessionTitle = session?.title || DEFAULT_SESSION_TITLE;
 	const activeFileTab = openFileTabs.find((tab) => tab.path === activeFilePath) ?? null;
 	const hasPreviewPanel = Boolean(activeFileTab);
 	const authUserId = authSession.data?.user.id;
 	const truncatedWorkspaceItems = Object.values(workspaceItems).filter(
 		(item) => item.type === "directory" && item.isTruncated,
 	);
-
-	/**
-	 * 同步 chat 页面 URL 查询参数。
-	 * @param search 下一份查询参数
-	 * @param replace 是否替换当前 history 记录
-	 */
-	function updateChatRouteSearch(search: ChatSearch, replace = false) {
-		void navigate({
-			to: "/chat",
-			search,
-			replace,
-		});
-	}
-
-	/**
-	 * 关闭当前 chat stream。
-	 */
-	function closeTimelineStream() {
-		streamAbortRef.current?.abort();
-		streamAbortRef.current = null;
-		setTimelineStreamStatus("idle");
-	}
 
 	/**
 	 * 计算 chat viewport 距离底部的距离。
@@ -382,13 +316,24 @@ function ChatPage() {
 	/**
 	 * 处理 chat viewport 滚动。
 	 */
-	function handleChatViewportScroll() {
+	async function handleChatViewportScroll() {
 		updateChatStickState();
 		const viewport = chatViewportRef.current;
 		if (!viewport || viewport.scrollTop > CHAT_HISTORY_TOP_THRESHOLD) {
 			return;
 		}
-		void loadOlderSessionHistory();
+		const previousScrollHeight = viewport.scrollHeight;
+		const previousScrollTop = viewport.scrollTop;
+		await loadOlderSessionHistory();
+		requestAnimationFrame(() => {
+			const nextViewport = chatViewportRef.current;
+			if (!nextViewport) {
+				return;
+			}
+			// prepend 历史后补偿高度差，避免用户视角跳到更早内容顶部。
+			nextViewport.scrollTop =
+				nextViewport.scrollHeight - previousScrollHeight + previousScrollTop;
+		});
 	}
 
 	/**
@@ -402,66 +347,6 @@ function ChatPage() {
 		}
 		messagesEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
 	}, []);
-
-	/**
-	 * 重置当前会话详情。
-	 */
-	function resetConversation() {
-		closeTimelineStream();
-		setSession(null);
-		setClientEvents([]);
-		setTimeline([]);
-		setSessionHistory(EMPTY_SESSION_HISTORY);
-		setContainerStatus(null);
-		setHandledPermissionRequestIds(new Set());
-		setPermissionError(null);
-		timelineIdsRef.current = new Set();
-		shouldStickToBottomRef.current = true;
-		forceStickToBottomRef.current = false;
-	}
-
-	/**
-	 * 合并 timeline 事件，避免 SSE 重连或快照返回造成重复展示。
-	 * @param event 新 timeline 事件
-	 */
-	function appendTimelineEvent(event: TimelineEvent) {
-		if (timelineIdsRef.current.has(event.id)) {
-			return;
-		}
-		timelineIdsRef.current.add(event.id);
-		setTimeline((current) => {
-			return [...current, event].sort((a, b) => a.id - b.id);
-		});
-	}
-
-	/**
-	 * 合并并排序 client events，避免历史分页和乐观事件重复展示。
-	 * @param current 当前 events
-	 * @param next 新 events
-	 * @returns 合并后的 events
-	 */
-	function mergeClientEvents(current: ClientEvent[], next: ClientEvent[]) {
-		const byEventId = new Map(current.map((event) => [event.event_id, event]));
-		for (const event of next) {
-			byEventId.set(event.event_id, event);
-		}
-		return [...byEventId.values()].sort((a, b) => a.sequence_num - b.sequence_num);
-	}
-
-	/**
-	 * 合并并排序 timeline events，避免历史分页和 SSE 重连重复展示。
-	 * @param current 当前 events
-	 * @param next 新 events
-	 * @returns 合并后的 events
-	 */
-	function mergeTimelineEvents(current: TimelineEvent[], next: TimelineEvent[]) {
-		const byId = new Map(current.map((event) => [event.id, event]));
-		for (const event of next) {
-			byId.set(event.id, event);
-			timelineIdsRef.current.add(event.id);
-		}
-		return [...byId.values()].sort((a, b) => a.id - b.id);
-	}
 
 	/**
 	 * 加载项目列表。
@@ -478,30 +363,24 @@ function ChatPage() {
 	}
 
 	/**
-	 * 加载指定项目下的会话。
-	 * @param projectId 项目 ID
-	 */
-	async function loadSessions(projectId?: string) {
-		const url = projectId
-			? `/api/projects/${projectId}/sessions`
-			: "/api/ccr/sessions";
-		const response = await fetch(url);
-		if (!response.ok) {
-			throw new Error(await readError(response));
-		}
-		const body = (await response.json()) as { sessions: ChatSession[] };
-		setSessions(body.sessions);
-		return body.sessions;
-	}
-
-	/**
 	 * 加载指定目录下的 workspace 文件树节点。
 	 * @param projectId 项目 ID
 	 * @param prefix workspace 目录路径
+	 * @param options 加载选项
 	 */
-	async function loadWorkspaceTree(projectId: string, prefix = "") {
-		setWorkspaceError(null);
-		setIsWorkspaceLoading(true);
+	async function loadWorkspaceTree(
+		projectId: string,
+		prefix = "",
+		options: { clearError?: boolean; showLoading?: boolean } = {},
+	) {
+		const clearError = options.clearError ?? true;
+		const showLoading = options.showLoading ?? true;
+		if (clearError) {
+			setWorkspaceError(null);
+		}
+		if (showLoading) {
+			setIsWorkspaceLoading(true);
+		}
 		try {
 			const response = await fetch(`/api/projects/${projectId}/workspace/tree`, {
 				body: JSON.stringify({ prefix }),
@@ -539,18 +418,40 @@ function ChatPage() {
 		} catch (err) {
 			setWorkspaceError(err instanceof Error ? err.message : "加载文件树失败");
 		} finally {
-			setIsWorkspaceLoading(false);
+			if (showLoading) {
+				setIsWorkspaceLoading(false);
+			}
 		}
 	}
 
 	/**
 	 * 刷新当前 project 的 workspace 文件树。
+	 * @param prefixes 指定要刷新的目录；省略时刷新所有已加载目录
 	 */
-	async function refreshWorkspaceTree() {
+	async function refreshWorkspaceTree(prefixes?: string[]) {
 		if (!project) {
 			return;
 		}
-		await loadWorkspaceTree(project.id);
+		const loadedPrefixes = Object.values(workspaceItems)
+			.filter((item) => item.type === "directory" && item.isLoaded)
+			.map((item) => item.path);
+		const refreshPrefixes = Array.from(new Set(prefixes ?? loadedPrefixes));
+		if (!refreshPrefixes.includes("")) {
+			// 根目录是文件树入口，刷新任意子目录前都保持根目录 children 与 R2 对齐。
+			refreshPrefixes.unshift("");
+		}
+		setIsWorkspaceLoading(true);
+		setWorkspaceError(null);
+		try {
+			for (const prefix of refreshPrefixes) {
+				await loadWorkspaceTree(project.id, prefix, {
+					clearError: false,
+					showLoading: false,
+				});
+			}
+		} finally {
+			setIsWorkspaceLoading(false);
+		}
 	}
 
 	/**
@@ -610,8 +511,10 @@ function ChatPage() {
 		if (!project || item.path === "") {
 			return;
 		}
+		const previousWorkspaceItems = workspaceItems;
 		setIsWorkspaceMutating(true);
 		setWorkspaceError(null);
+		setWorkspaceItems((current) => removeOptimisticWorkspaceItem(current, item.path));
 		try {
 			const response = await fetch(`/api/projects/${project.id}/workspace/file`, {
 				method: "DELETE",
@@ -627,8 +530,9 @@ function ChatPage() {
 			if (activeFilePath && isPathOrChild(activeFilePath, item.path)) {
 				setActiveFilePath(null);
 			}
-			await refreshWorkspaceTree();
+			await refreshWorkspaceTree([getWorkspaceParentPath(item.path)]);
 		} catch (err) {
+			setWorkspaceItems(previousWorkspaceItems);
 			setWorkspaceError(err instanceof Error ? err.message : "删除失败");
 		} finally {
 			setIsWorkspaceMutating(false);
@@ -733,8 +637,10 @@ function ChatPage() {
 			return;
 		}
 		const path = buildChildDirectoryPath(createDirectoryTarget.parentPath, nextName);
+		const previousWorkspaceItems = workspaceItems;
 		setIsWorkspaceMutating(true);
 		setWorkspaceError(null);
+		setWorkspaceItems((current) => addOptimisticWorkspaceDirectory(current, path));
 		try {
 			const response = await fetch(`/api/projects/${project.id}/workspace/directory`, {
 				method: "POST",
@@ -747,6 +653,7 @@ function ChatPage() {
 			setCreateDirectoryTarget(null);
 			await loadWorkspaceTree(project.id, createDirectoryTarget.parentPath);
 		} catch (err) {
+			setWorkspaceItems(previousWorkspaceItems);
 			setWorkspaceError(err instanceof Error ? err.message : "新建文件夹失败");
 		} finally {
 			setIsWorkspaceMutating(false);
@@ -765,8 +672,12 @@ function ChatPage() {
 			return;
 		}
 		const nextPath = buildRenamedPath(renamingTarget.path, nextName);
+		const previousWorkspaceItems = workspaceItems;
 		setIsWorkspaceMutating(true);
 		setWorkspaceError(null);
+		setWorkspaceItems((current) =>
+			moveOptimisticWorkspaceItem(current, renamingTarget.path, nextPath),
+		);
 		try {
 			const response = await fetch(`/api/projects/${project.id}/workspace/move`, {
 				method: "POST",
@@ -797,8 +708,12 @@ function ChatPage() {
 				setActiveFilePath(`${nextPath}${suffix}`);
 			}
 			setRenamingTarget(null);
-			await refreshWorkspaceTree();
+			await refreshWorkspaceTree([
+				getWorkspaceParentPath(renamingTarget.path),
+				getWorkspaceParentPath(nextPath),
+			]);
 		} catch (err) {
+			setWorkspaceItems(previousWorkspaceItems);
 			setWorkspaceError(err instanceof Error ? err.message : "重命名失败");
 		} finally {
 			setIsWorkspaceMutating(false);
@@ -828,8 +743,12 @@ function ChatPage() {
 		if (nextPath === source.path) {
 			return;
 		}
+		const previousWorkspaceItems = workspaceItems;
 		setIsWorkspaceMutating(true);
 		setWorkspaceError(null);
+		setWorkspaceItems((current) =>
+			moveOptimisticWorkspaceItem(current, source.path, nextPath),
+		);
 		try {
 			const response = await fetch(`/api/projects/${project.id}/workspace/move`, {
 				method: "POST",
@@ -859,399 +778,15 @@ function ChatPage() {
 				const suffix = activeFilePath.slice(source.path.length);
 				setActiveFilePath(`${nextPath}${suffix}`);
 			}
-			await refreshWorkspaceTree();
+			await refreshWorkspaceTree([
+				getWorkspaceParentPath(source.path),
+				targetDirectory.path,
+			]);
 		} catch (err) {
+			setWorkspaceItems(previousWorkspaceItems);
 			setWorkspaceError(err instanceof Error ? err.message : "移动失败");
 		} finally {
 			setIsWorkspaceMutating(false);
-		}
-	}
-
-	/**
-	 * 加载会话详情和历史消息。
-	 * @param sessionId session ID
-	 * @param options 加载选项
-	 * @returns 已加载的 session
-	 */
-	async function loadSession(
-		sessionId: string,
-		options: { syncRoute?: boolean } = {},
-	): Promise<ChatSession> {
-		closeTimelineStream();
-		const response = await fetch(
-			`/api/ccr/sessions/${sessionId}?limit=${CHAT_HISTORY_PAGE_SIZE}`,
-		);
-		if (!response.ok) {
-			throw new Error(await readError(response));
-		}
-		const body = (await response.json()) as SessionDetailResponse;
-		// 切换历史会话时主动定位到底部，后续由用户滚动状态决定是否继续跟随。
-		forceStickToBottomRef.current = true;
-		shouldStickToBottomRef.current = true;
-		setSession(body.session);
-		setClientEvents(body.clientEvents ?? []);
-		timelineIdsRef.current = new Set(body.timeline.map((event) => event.id));
-		setTimeline(body.timeline);
-		setSessionHistory(body.history ?? EMPTY_SESSION_HISTORY);
-		if (options.syncRoute ?? true) {
-			updateChatRouteSearch({
-				projectId: body.session.projectId,
-				sessionId: body.session.id,
-			});
-		}
-		return body.session;
-	}
-
-	/**
-	 * 向上滚动触顶时加载更早的会话历史。
-	 */
-	async function loadOlderSessionHistory() {
-		if (
-			!session ||
-			isLoadingHistory ||
-			(!sessionHistory.hasMoreClientEvents && !sessionHistory.hasMoreTimeline)
-		) {
-			return;
-		}
-		const viewport = chatViewportRef.current;
-		const previousScrollHeight = viewport?.scrollHeight ?? 0;
-		const previousScrollTop = viewport?.scrollTop ?? 0;
-		const params = new URLSearchParams({
-			older: "1",
-			limit: String(CHAT_HISTORY_PAGE_SIZE),
-		});
-		if (sessionHistory.hasMoreClientEvents && sessionHistory.beforeClientSequence) {
-			params.set(
-				"beforeClientSequence",
-				String(sessionHistory.beforeClientSequence),
-			);
-		}
-		if (sessionHistory.hasMoreTimeline && sessionHistory.beforeTimelineId) {
-			params.set("beforeTimelineId", String(sessionHistory.beforeTimelineId));
-		}
-		setIsLoadingHistory(true);
-		setError(null);
-		try {
-			const response = await fetch(`/api/ccr/sessions/${session.id}?${params}`);
-			if (!response.ok) {
-				throw new Error(await readError(response));
-			}
-			const body = (await response.json()) as SessionDetailResponse;
-			setClientEvents((current) => mergeClientEvents(body.clientEvents ?? [], current));
-			setTimeline((current) => mergeTimelineEvents(body.timeline, current));
-			setSessionHistory(body.history ?? EMPTY_SESSION_HISTORY);
-			requestAnimationFrame(() => {
-				const nextViewport = chatViewportRef.current;
-				if (!nextViewport) {
-					return;
-				}
-				// prepend 历史后补偿高度差，避免用户视角跳到更早内容顶部。
-				nextViewport.scrollTop =
-					nextViewport.scrollHeight - previousScrollHeight + previousScrollTop;
-			});
-		} catch (err) {
-			setError(err instanceof Error ? err.message : "加载历史消息失败");
-		} finally {
-			setIsLoadingHistory(false);
-		}
-	}
-
-	/**
-	 * 提交 Claude Code 工具权限决策。
-	 * @param request 权限申请
-	 * @param decision 用户决策
-	 */
-	async function submitToolPermissionDecision(
-		request: ToolPermissionRequest,
-		decision: "allow" | "deny",
-	) {
-		if (!session) {
-			return;
-		}
-		setIsPermissionSubmitting(true);
-		setPermissionError(null);
-		try {
-			const response = await fetch(`/api/ccr/sessions/${session.id}/tool-permission`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					requestId: request.requestId,
-					decision,
-				}),
-			});
-			if (!response.ok) {
-				throw new Error(await readError(response));
-			}
-			const body = (await response.json()) as { event?: ClientEvent };
-			setHandledPermissionRequestIds((current) => {
-				const next = new Set(current);
-				// 响应已写入 client event 队列，本地先标记避免弹窗重复阻塞。
-				next.add(request.requestId);
-				return next;
-			});
-			if (body.event) {
-				setClientEvents((current) => [...current, body.event as ClientEvent]);
-			}
-		} catch (err) {
-			setPermissionError(err instanceof Error ? err.message : "权限响应提交失败");
-		} finally {
-			setIsPermissionSubmitting(false);
-		}
-	}
-
-	/**
-	 * 自动确保有可发送消息的会话。
-	 * @param firstMessage 第一条消息内容，用作会话标题
-	 * @returns session
-	 */
-	async function ensureSession(firstMessage: string): Promise<ChatSession> {
-		if (session) {
-			return session;
-		}
-		const response = await fetch(
-			project ? `/api/projects/${project.id}/sessions` : "/api/ccr/sessions",
-			{
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					title: firstMessage.slice(0, 48) || DEFAULT_SESSION_TITLE,
-				}),
-			},
-		);
-		if (!response.ok) {
-			throw new Error(await readError(response));
-		}
-		const body = (await response.json()) as {
-			session: ChatSession;
-			project?: Project;
-		};
-		if (body.project) {
-			setProject(body.project);
-		}
-		setSession(body.session);
-		timelineIdsRef.current = new Set();
-		setTimeline([]);
-		setSessionHistory(EMPTY_SESSION_HISTORY);
-		updateChatRouteSearch({
-			projectId: body.session.projectId,
-			sessionId: body.session.id,
-		});
-		await loadSessions(body.session.projectId);
-		return body.session;
-	}
-
-	/**
-	 * 处理 chat SSE frame。
-	 * @param frame 原始 frame
-	 * @param sessionId session ID
-	 * @returns 是否收到结束事件
-	 */
-	function handleChatStreamFrame(frame: string, sessionId: string): boolean {
-		const parsed = parseSseFrame(frame);
-		if (!parsed) {
-			return false;
-		}
-		if (parsed.event === "session") {
-			const body = parseSseJson(parsed.data) as { session: ChatSession | null };
-			if (body.session) {
-				setSession(body.session);
-			}
-			return false;
-		}
-		if (parsed.event === "timeline") {
-			const body = parseSseJson(parsed.data) as {
-				session_id: string;
-				event: TimelineEvent;
-			};
-			if (body.session_id === sessionId) {
-				appendTimelineEvent(body.event);
-			}
-			return false;
-		}
-		if (parsed.event === "error") {
-			const body = parseSseJson(parsed.data);
-			throw new Error(typeof body.error === "string" ? body.error : "Chat stream failed");
-		}
-		return parsed.event === "done";
-	}
-
-	/**
-	 * 通过 chat API 发送消息并读取同一请求返回的 SSE。
-	 * @param sessionId session ID
-	 * @param content 用户消息
-	 * @param cursor timeline 游标
-	 */
-	async function streamMessage(sessionId: string, content: string, cursor: number) {
-		closeTimelineStream();
-		const controller = new AbortController();
-		streamAbortRef.current = controller;
-		setTimelineStreamStatus("connecting");
-		const response = await fetch(
-			`/api/ccr/sessions/${sessionId}/messages?cursor=${cursor}`,
-			{
-				method: "POST",
-				headers: {
-					accept: "text/event-stream",
-					"content-type": "application/json",
-				},
-				body: JSON.stringify({ message: content }),
-				signal: controller.signal,
-			},
-		);
-		if (!response.ok) {
-			throw new Error(await readError(response));
-		}
-		assertSseResponse(response);
-		if (!response.body) {
-			throw new Error("Chat stream response body is empty");
-		}
-		setTimelineStreamStatus("open");
-		const reader = response.body.getReader();
-		const decoder = new TextDecoder();
-		let buffer = "";
-		try {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) {
-					break;
-				}
-				buffer += decoder.decode(value, { stream: true });
-				const frames = buffer.split(/\n\n/);
-				buffer = frames.pop() ?? "";
-				for (const frame of frames) {
-					if (handleChatStreamFrame(frame, sessionId)) {
-						return;
-					}
-				}
-			}
-			if (buffer && handleChatStreamFrame(buffer, sessionId)) {
-				return;
-			}
-		} catch (err) {
-			// 用户切换会话或离开页面时主动 abort，不应该展示为操作失败。
-			if (err instanceof DOMException && err.name === "AbortError") {
-				return;
-			}
-			throw err;
-		} finally {
-			if (streamAbortRef.current === controller) {
-				streamAbortRef.current = null;
-				setTimelineStreamStatus("idle");
-			}
-		}
-	}
-
-	/**
-	 * 发送当前输入。
-	 */
-	async function sendMessage() {
-		const content = draft.trim();
-		if (!content || isSending) {
-			return;
-		}
-		setError(null);
-		setIsSending(true);
-		setDraft("");
-		// 用户主动发送消息时，应立即恢复对本轮输出的底部跟随。
-		forceStickToBottomRef.current = true;
-		shouldStickToBottomRef.current = true;
-		const optimisticEvent: ClientEvent = {
-			event_id: crypto.randomUUID(),
-			sequence_num: Date.now(),
-			event_type: "user",
-			source: "browser",
-			payload: {
-				message: {
-					role: "user",
-					content,
-				},
-			},
-			created_at: new Date().toISOString(),
-		};
-		setClientEvents((current) => [...current, optimisticEvent]);
-		try {
-			const activeSession = await ensureSession(content);
-			const cursor = timeline.reduce((maxId, event) => Math.max(maxId, event.id), 0);
-			await streamMessage(activeSession.id, content, cursor);
-			await loadSessions(activeSession.projectId);
-		} catch (err) {
-			setError(err instanceof Error ? err.message : String(err));
-			setClientEvents((current) => {
-				return current.map((event) => {
-					return event.event_id === optimisticEvent.event_id
-						? {
-								...event,
-								payload: {
-									...event.payload,
-									error: "send_failed",
-								},
-							}
-						: event;
-				});
-			});
-			setDraft(content);
-		} finally {
-			setIsSending(false);
-		}
-	}
-
-	/**
-	 * 新建空白对话。
-	 */
-	function startNewConversation() {
-		resetConversation();
-		setDraft("");
-		setError(null);
-		updateChatRouteSearch(project ? { projectId: project.id } : {});
-	}
-
-	/**
-	 * 删除指定会话。
-	 * @param sessionId session ID
-	 */
-	async function deleteSession(sessionId: string) {
-		const previousSessions = sessions;
-		setError(null);
-		// 先做乐观删除，避免后台容器清理影响列表交互。
-		setSessions((current) => current.filter((item) => item.id !== sessionId));
-		try {
-			const response = await fetch(`/api/ccr/sessions/${sessionId}`, {
-				method: "DELETE",
-			});
-			if (!response.ok) {
-				throw new Error(await readError(response));
-			}
-			if (session?.id === sessionId) {
-				resetConversation();
-				updateChatRouteSearch(project ? { projectId: project.id } : {});
-			}
-		} catch (err) {
-			setSessions(previousSessions);
-			setError(err instanceof Error ? err.message : String(err));
-		}
-	}
-
-	/**
-	 * 查询或控制当前 session 对应容器。
-	 * @param action 操作类型
-	 */
-	async function callContainer(action: "status" | "stop") {
-		if (!session) {
-			return;
-		}
-		setError(null);
-		try {
-			const response = await fetch(
-				`/api/ccr/sessions/${session.id}/container/${action}`,
-				{ method: action === "status" ? "GET" : "POST" },
-			);
-			if (!response.ok) {
-				throw new Error(await readError(response));
-			}
-			setContainerStatus(await response.json());
-			await loadSession(session.id);
-		} catch (err) {
-			setError(err instanceof Error ? err.message : String(err));
 		}
 	}
 
@@ -1355,7 +890,14 @@ function ChatPage() {
 		void loadSessions(project?.id).catch((err) => {
 			setError(err instanceof Error ? err.message : String(err));
 		});
-	}, [project?.id, isBootstrapping, authSession.isPending, authUserId]);
+	}, [
+		project?.id,
+		isBootstrapping,
+		authSession.isPending,
+		authUserId,
+		loadSessions,
+		setError,
+	]);
 
 	useEffect(() => {
 		if (!forceStickToBottomRef.current && !shouldStickToBottomRef.current) {
@@ -1571,10 +1113,10 @@ function ChatPage() {
 							onViewportScroll={handleChatViewportScroll}
 						>
 							<div className="mx-auto flex max-w-4xl flex-col gap-4 px-4 py-6">
-								{error ? (
+								{displayError ? (
 									<Alert variant="destructive">
 										<AlertTitle>操作失败</AlertTitle>
-										<AlertDescription>{error}</AlertDescription>
+										<AlertDescription>{displayError}</AlertDescription>
 									</Alert>
 								) : null}
 

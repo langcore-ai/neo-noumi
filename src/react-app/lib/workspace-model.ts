@@ -90,7 +90,7 @@ function getFileExtension(name: string): string | undefined {
  * @param path workspace 相对路径
  * @returns 父目录路径；根目录返回空字符串
  */
-function getParentPath(path: string): string {
+export function getWorkspaceParentPath(path: string): string {
 	const index = path.lastIndexOf("/");
 	return index === -1 ? "" : path.slice(0, index);
 }
@@ -102,7 +102,7 @@ function getParentPath(path: string): string {
  * @returns 新路径
  */
 export function buildRenamedPath(path: string, nextName: string): string {
-	const parentPath = getParentPath(path);
+	const parentPath = getWorkspaceParentPath(path);
 	return parentPath ? `${parentPath}/${nextName}` : nextName;
 }
 
@@ -130,6 +130,15 @@ export function buildMovedIntoDirectoryPath(
 }
 
 /**
+ * 读取 workspace 路径最后一段名称。
+ * @param path workspace 相对路径
+ * @returns 路径名称
+ */
+export function getWorkspacePathName(path: string): string {
+	return path.split("/").pop() || path;
+}
+
+/**
  * 判断一个路径是否命中目标路径或其子路径。
  * @param path 待判断路径
  * @param target 目标路径
@@ -137,6 +146,177 @@ export function buildMovedIntoDirectoryPath(
  */
 export function isPathOrChild(path: string, target: string): boolean {
 	return path === target || path.startsWith(`${target}/`);
+}
+
+/**
+ * 判断 workspace 节点是否允许移动到目标目录。
+ * @param source 被移动节点
+ * @param targetDirectory 目标目录
+ * @returns 是否允许移动
+ */
+export function canMoveWorkspaceItemIntoDirectory(
+	source: WorkspaceTreeItem | undefined,
+	targetDirectory: WorkspaceTreeItem | undefined,
+): boolean {
+	if (!source || !targetDirectory || targetDirectory.type !== "directory") {
+		return false;
+	}
+	if (source.path === targetDirectory.path) {
+		return false;
+	}
+	if (source.type === "directory" && isPathOrChild(targetDirectory.path, source.path)) {
+		return false;
+	}
+	return getWorkspaceParentPath(source.path) !== targetDirectory.path;
+}
+
+/**
+ * 按文件树展示规则排序子节点。
+ * @param items 当前文件树项索引
+ * @param childIds 子节点 ID 列表
+ * @returns 排序后的去重子节点 ID 列表
+ */
+function sortWorkspaceChildIds(
+	items: Record<string, WorkspaceTreeItem>,
+	childIds: string[],
+): string[] {
+	return Array.from(new Set(childIds)).sort((leftId, rightId) => {
+		const left = items[leftId] ?? createWorkspaceTreeFallbackItem(leftId);
+		const right = items[rightId] ?? createWorkspaceTreeFallbackItem(rightId);
+		if (left.type !== right.type) {
+			return left.type === "directory" ? -1 : 1;
+		}
+		return left.name.localeCompare(right.name);
+	});
+}
+
+/**
+ * 计算路径前缀替换后的新路径。
+ * @param path 原始路径
+ * @param fromPath 旧路径前缀
+ * @param toPath 新路径前缀
+ * @returns 替换后的路径
+ */
+function replaceWorkspacePathPrefix(
+	path: string,
+	fromPath: string,
+	toPath: string,
+): string {
+	return path === fromPath ? toPath : `${toPath}${path.slice(fromPath.length)}`;
+}
+
+/**
+ * 乐观移除文件树节点及其子节点。
+ * @param current 当前文件树项索引
+ * @param path 要删除的路径
+ * @returns 更新后的文件树项索引
+ */
+export function removeOptimisticWorkspaceItem(
+	current: Record<string, WorkspaceTreeItem>,
+	path: string,
+): Record<string, WorkspaceTreeItem> {
+	const nextItems = { ...current };
+	const parentId = getWorkspaceParentPath(path) || WORKSPACE_ROOT_ID;
+	const parent = nextItems[parentId];
+	if (parent?.children) {
+		nextItems[parentId] = {
+			...parent,
+			children: parent.children.filter((childId) => childId !== path),
+		};
+	}
+	for (const item of Object.values(current)) {
+		if (item.path && isPathOrChild(item.path, path)) {
+			delete nextItems[item.path];
+		}
+	}
+	return nextItems;
+}
+
+/**
+ * 乐观新增目录节点。
+ * @param current 当前文件树项索引
+ * @param path 目录路径
+ * @returns 更新后的文件树项索引
+ */
+export function addOptimisticWorkspaceDirectory(
+	current: Record<string, WorkspaceTreeItem>,
+	path: string,
+): Record<string, WorkspaceTreeItem> {
+	const nextItems = { ...current };
+	const parentId = getWorkspaceParentPath(path) || WORKSPACE_ROOT_ID;
+	nextItems[path] = {
+		name: getWorkspacePathName(path),
+		path,
+		type: "directory",
+		children: [],
+		isLoaded: true,
+	};
+	const parent = nextItems[parentId];
+	if (parent?.children) {
+		const childIds = parent.children.includes(path)
+			? parent.children
+			: [...parent.children, path];
+		nextItems[parentId] = {
+			...parent,
+			children: sortWorkspaceChildIds(nextItems, childIds),
+		};
+	}
+	return nextItems;
+}
+
+/**
+ * 乐观移动或重命名文件树节点及其子节点。
+ * @param current 当前文件树项索引
+ * @param fromPath 源路径
+ * @param toPath 目标路径
+ * @returns 更新后的文件树项索引
+ */
+export function moveOptimisticWorkspaceItem(
+	current: Record<string, WorkspaceTreeItem>,
+	fromPath: string,
+	toPath: string,
+): Record<string, WorkspaceTreeItem> {
+	const nextItems = { ...current };
+	const movedItems = Object.values(current).filter((item) =>
+		isPathOrChild(item.path, fromPath),
+	);
+	if (movedItems.length === 0) {
+		return current;
+	}
+
+	for (const item of movedItems) {
+		delete nextItems[item.path];
+	}
+	for (const item of movedItems) {
+		const nextPath = replaceWorkspacePathPrefix(item.path, fromPath, toPath);
+		const nextChildren = item.children?.map((childId) =>
+			replaceWorkspacePathPrefix(childId, fromPath, toPath),
+		);
+		nextItems[nextPath] = {
+			...item,
+			name: item.path === fromPath ? getWorkspacePathName(toPath) : item.name,
+			path: nextPath,
+			children: nextChildren,
+		};
+	}
+
+	const sourceParentId = getWorkspaceParentPath(fromPath) || WORKSPACE_ROOT_ID;
+	const targetParentId = getWorkspaceParentPath(toPath) || WORKSPACE_ROOT_ID;
+	const sourceParent = nextItems[sourceParentId];
+	if (sourceParent?.children) {
+		nextItems[sourceParentId] = {
+			...sourceParent,
+			children: sourceParent.children.filter((childId) => childId !== fromPath),
+		};
+	}
+	const targetParent = nextItems[targetParentId];
+	if (targetParent?.children) {
+		nextItems[targetParentId] = {
+			...targetParent,
+			children: sortWorkspaceChildIds(nextItems, [...targetParent.children, toPath]),
+		};
+	}
+	return nextItems;
 }
 
 /**

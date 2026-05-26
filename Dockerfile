@@ -1,11 +1,12 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.7
 
-FROM docker.io/oven/bun:1 AS observer-builder
+FROM docker.io/oven/bun:1.3.14 AS observer-builder
 
 WORKDIR /build
 
 COPY code-sandbox/package.json code-sandbox/bun.lock ./
-RUN bun install --frozen-lockfile --production
+RUN --mount=type=cache,target=/root/.bun/install/cache \
+	bun install --frozen-lockfile --production
 
 COPY code-sandbox/main.ts ./main.ts
 RUN bun build ./main.ts \
@@ -17,13 +18,23 @@ FROM docker.io/cloudflare/sandbox:0.10.2
 # 固定 Claude Code 版本，避免 latest 变化导致 CCR 行为不可复现。
 ARG CLAUDE_CODE_VERSION=2.1.148
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-	python3 \
-	python3-pip \
-	&& rm -rf /var/lib/apt/lists/* && pip install uv
+# 让 BuildKit 缓存 apt 下载包；Docker 官方基础镜像默认会清理 apt cache。
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+	&& echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
+		> /etc/apt/apt.conf.d/keep-cache
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+	--mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+	apt-get update && apt-get install -y --no-install-recommends \
+		python3 \
+		python3-pip
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+	pip install uv
 
 # CCR 的真实执行进程运行在沙盒容器内，因此镜像需要内置 Claude Code CLI。
-RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+RUN --mount=type=cache,target=/root/.npm \
+	npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 	&& claude --version
 
 # 将仓库内置 skill 打入 Claude Code 默认 skill 目录。

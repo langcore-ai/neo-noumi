@@ -41,7 +41,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
 	type OpenFileTab,
 	type UploadTarget,
-	isPathOrChild,
+	canMoveWorkspaceItemIntoDirectory,
 	WORKSPACE_ROOT_ID,
 	WORKSPACE_TREE_INDENT,
 	type WorkspaceTreeItem,
@@ -152,32 +152,10 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 	} = props;
 	const [draggingPath, setDraggingPath] = useState<string | null>(null);
 	const [dragOverDirectoryPath, setDragOverDirectoryPath] = useState<string | null>(null);
-
-	/**
-	 * 判断拖拽源是否能放入目标目录。
-	 * @param source 拖拽源节点
-	 * @param targetDirectory 目标目录节点
-	 * @returns 是否允许 drop
-	 */
-	function canDropIntoDirectory(
-		source: WorkspaceTreeItem | undefined,
-		targetDirectory: WorkspaceTreeItem,
-	) {
-		if (!source || targetDirectory.type !== "directory") {
-			return false;
-		}
-		if (source.path === targetDirectory.path) {
-			return false;
-		}
-		if (source.type === "directory" && isPathOrChild(targetDirectory.path, source.path)) {
-			return false;
-		}
-		const currentParentPath =
-			source.path === source.name
-				? ""
-				: source.path.slice(0, source.path.length - source.name.length - 1);
-		return currentParentPath !== targetDirectory.path;
-	}
+	const rootItem = workspaceItems[WORKSPACE_ROOT_ID];
+	const draggingItem = draggingPath ? workspaceItems[draggingPath] : undefined;
+	const canDropToRoot = canMoveWorkspaceItemIntoDirectory(draggingItem, rootItem);
+	const isRootDropTarget = canDropToRoot && dragOverDirectoryPath === "";
 
 	return (
 		<>
@@ -271,7 +249,42 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 					<ContextMenu>
 						<ContextMenuTrigger className="min-h-0 flex-1">
 							<ScrollArea className="h-full">
-								<div className="flex min-h-full flex-col gap-3 p-3">
+								<div
+									className={cn(
+										"flex min-h-full flex-col gap-3 p-3 transition-colors",
+										isRootDropTarget &&
+											"bg-primary/5 ring-2 ring-inset ring-primary/30",
+									)}
+									onDragEnter={(event) => {
+										if (!canDropToRoot) {
+											return;
+										}
+										event.preventDefault();
+										setDragOverDirectoryPath("");
+									}}
+									onDragOver={(event) => {
+										if (!canDropToRoot) {
+											return;
+										}
+										event.preventDefault();
+										event.dataTransfer.dropEffect = "move";
+										setDragOverDirectoryPath("");
+									}}
+									onDragLeave={() => {
+										if (dragOverDirectoryPath === "") {
+											setDragOverDirectoryPath(null);
+										}
+									}}
+									onDrop={(event) => {
+										if (!canDropToRoot || !draggingItem || !rootItem) {
+											return;
+										}
+										event.preventDefault();
+										setDraggingPath(null);
+										setDragOverDirectoryPath(null);
+										onMoveWorkspaceItemIntoDirectory(draggingItem, rootItem);
+									}}
+								>
 									{workspaceError ? (
 										<Alert variant="destructive">
 											<AlertTitle>文件树加载失败</AlertTitle>
@@ -309,10 +322,10 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 													return null;
 												}
 												const isActive = activeFilePath === data.path;
-												const draggingItem = draggingPath
-													? workspaceItems[draggingPath]
-													: undefined;
-												const canDrop = canDropIntoDirectory(draggingItem, data);
+												const canDrop = canMoveWorkspaceItemIntoDirectory(
+													draggingItem,
+													data,
+												);
 												const isDropTarget =
 													canDrop && dragOverDirectoryPath === data.path;
 												return (
@@ -343,6 +356,7 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 																			"bg-primary/10 text-primary ring-2 ring-primary/40",
 																	)}
 																	onDragEnter={(event) => {
+																		event.stopPropagation();
 																		if (!canDrop) {
 																			return;
 																		}
@@ -350,6 +364,7 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 																		setDragOverDirectoryPath(data.path);
 																	}}
 																	onDragOver={(event) => {
+																		event.stopPropagation();
 																		if (!canDrop) {
 																			return;
 																		}
@@ -357,12 +372,14 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 																		event.dataTransfer.dropEffect = "move";
 																		setDragOverDirectoryPath(data.path);
 																	}}
-																	onDragLeave={() => {
+																	onDragLeave={(event) => {
+																		event.stopPropagation();
 																		if (dragOverDirectoryPath === data.path) {
 																			setDragOverDirectoryPath(null);
 																		}
 																	}}
 																	onDrop={(event) => {
+																		event.stopPropagation();
 																		if (!canDrop || !draggingItem) {
 																			return;
 																		}
