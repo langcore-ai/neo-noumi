@@ -26,11 +26,13 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean \
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 	--mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
 	apt-get update && apt-get install -y --no-install-recommends \
+		poppler-utils \
 		python3 \
 		python3-pip
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-	pip install uv
+	pip install uv \
+	&& uv pip install --system reportlab pdfplumber pypdf
 
 # CCR 的真实执行进程运行在沙盒容器内，因此镜像需要内置 Claude Code CLI。
 RUN --mount=type=cache,target=/root/.npm \

@@ -184,15 +184,17 @@ function ChatPage() {
 		error,
 		isPermissionSubmitting,
 		isSending,
+		isStopping,
 		messages,
 		pendingPermissionRequest,
 		permissionError,
 		resetChatRuntime,
+		running,
 		sendMessage,
 		setDraft,
 		setError,
+		stopMessage,
 		submitToolPermissionDecision,
-		timelineStreamStatus,
 	} = useChatBusiness({
 		...chatSessionState,
 		loadSessions,
@@ -1065,7 +1067,7 @@ function ChatPage() {
 											) : null}
 										</DropdownMenuContent>
 									</DropdownMenu>
-									{timelineStreamStatus === "open" || isSending ? (
+									{running ? (
 										<Badge variant="secondary">
 											<Loader2Icon data-icon="inline-start" />
 											运行中
@@ -1098,11 +1100,15 @@ function ChatPage() {
 								<Button
 									variant="outline"
 									size="sm"
-									disabled={!session}
-									onClick={() => void callContainer("stop")}
+									disabled={!session || !running || isStopping}
+									onClick={() => void stopMessage()}
 								>
-									<SquareIcon data-icon="inline-start" />
-									停止容器
+									{isStopping ? (
+										<Loader2Icon data-icon="inline-start" className="animate-spin" />
+									) : (
+										<SquareIcon data-icon="inline-start" />
+									)}
+									停止回复
 								</Button>
 							</div>
 						</header>
@@ -1186,10 +1192,10 @@ function ChatPage() {
 									))
 								)}
 
-								{isSending ? (
+								{running ? (
 									<div className="flex items-center gap-3 text-sm text-muted-foreground">
 										<Loader2Icon className="animate-spin" />
-										正在等待回复...
+										{isStopping ? "正在停止回复..." : "正在等待回复..."}
 									</div>
 								) : null}
 								<div ref={messagesEndRef} />
@@ -1201,7 +1207,7 @@ function ChatPage() {
 								<div className="rounded-xl border bg-card p-2 shadow-sm">
 									<Textarea
 										value={draft}
-										disabled={isSending}
+										disabled={running}
 										className="min-h-24 resize-none border-0 bg-transparent shadow-none focus-visible:ring-0"
 										placeholder={MESSAGE_PLACEHOLDER}
 										onChange={(event) => setDraft(event.target.value)}
@@ -1214,8 +1220,8 @@ function ChatPage() {
 									/>
 									<div className="flex items-center justify-between gap-3 px-1 pb-1">
 										<p className="text-xs text-muted-foreground">按 Cmd/Ctrl + Enter 发送</p>
-										<Button disabled={!draft.trim() || isSending} onClick={sendMessage}>
-											{isSending ? (
+										<Button disabled={!draft.trim() || running} onClick={sendMessage}>
+											{running ? (
 												<Loader2Icon data-icon="inline-start" className="animate-spin" />
 											) : (
 												<SendIcon data-icon="inline-start" />

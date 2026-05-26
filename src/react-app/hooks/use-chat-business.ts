@@ -46,6 +46,28 @@ function assertSseResponse(response: Response) {
 }
 
 /**
+ * 判断错误是否由主动取消请求触发。
+ * @param err 捕获到的错误对象
+ * @returns 是否为 AbortError
+ */
+function isAbortError(err: unknown): boolean {
+	return err instanceof DOMException && err.name === "AbortError";
+}
+
+/**
+ * 判断后端会话是否仍有活跃 worker。
+ * @param session 当前 CCR 会话
+ * @returns 是否仍应视为运行中
+ */
+function isActiveWorkerSession(session: ChatSession | null): boolean {
+	// requires_action 仍然占用当前 runner，只是暂停在权限确认点。
+	return session?.workerStatus === "running" || session?.workerStatus === "requires_action";
+}
+
+/** Chat SSE frame 处理结果。 */
+type ChatStreamFrameResult = "continue" | "done" | "terminal";
+
+/**
  * 解析一段 SSE frame。
  * @param frame 原始 frame
  * @returns 解析后的事件；注释或空 frame 返回 null
@@ -113,6 +135,7 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 	const [draft, setDraft] = useState("");
 	const [error, setError] = useState<string | null>(null);
 	const [isSending, setIsSending] = useState(false);
+	const [isStopping, setIsStopping] = useState(false);
 	const [timelineStreamStatus, setTimelineStreamStatus] = useState<
 		"idle" | "connecting" | "open"
 	>("idle");
@@ -125,6 +148,8 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 	const messages = useMemo(() => {
 		return buildMessages(clientEvents, timeline);
 	}, [clientEvents, timeline]);
+	const running =
+		isSending || isStopping || timelineStreamStatus !== "idle" || isActiveWorkerSession(session);
 
 	const pendingPermissionRequest = useMemo(() => {
 		return findPendingToolPermissionRequest(
@@ -201,17 +226,17 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 	 * @param sessionId session ID
 	 * @returns 是否收到结束事件
 	 */
-	function handleChatStreamFrame(frame: string, sessionId: string): boolean {
+	function handleChatStreamFrame(frame: string, sessionId: string): ChatStreamFrameResult {
 		const parsed = parseSseFrame(frame);
 		if (!parsed) {
-			return false;
+			return "continue";
 		}
 		if (parsed.event === "session") {
 			const body = parseSseJson(parsed.data) as { session: ChatSession | null };
 			if (body.session) {
 				setSession(body.session);
 			}
-			return false;
+			return "continue";
 		}
 		if (parsed.event === "timeline") {
 			const body = parseSseJson(parsed.data) as {
@@ -220,14 +245,17 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 			};
 			if (body.session_id === sessionId) {
 				appendTimelineEvent(body.event);
+				if (body.event.event_type === "result" || body.event.payload.type === "result") {
+					return "terminal";
+				}
 			}
-			return false;
+			return "continue";
 		}
 		if (parsed.event === "error") {
 			const body = parseSseJson(parsed.data);
 			throw new Error(typeof body.error === "string" ? body.error : "Chat stream failed");
 		}
-		return parsed.event === "done";
+		return parsed.event === "done" ? "done" : "continue";
 	}
 
 	/**
@@ -236,35 +264,39 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 	 * @param content 用户消息
 	 * @param cursor timeline 游标
 	 */
-	async function streamMessage(sessionId: string, content: string, cursor: number) {
+	async function streamMessage(
+		sessionId: string,
+		content: string,
+		cursor: number,
+	): Promise<ChatStreamFrameResult> {
 		closeTimelineStream();
 		const controller = new AbortController();
 		streamAbortRef.current = controller;
 		setTimelineStreamStatus("connecting");
-		const response = await fetch(
-			`/api/ccr/sessions/${sessionId}/messages?cursor=${cursor}`,
-			{
-				method: "POST",
-				headers: {
-					accept: "text/event-stream",
-					"content-type": "application/json",
-				},
-				body: JSON.stringify({ message: content }),
-				signal: controller.signal,
-			},
-		);
-		if (!response.ok) {
-			throw new Error(await readError(response));
-		}
-		assertSseResponse(response);
-		if (!response.body) {
-			throw new Error("Chat stream response body is empty");
-		}
-		setTimelineStreamStatus("open");
-		const reader = response.body.getReader();
-		const decoder = new TextDecoder();
-		let buffer = "";
 		try {
+			const response = await fetch(
+				`/api/ccr/sessions/${sessionId}/messages?cursor=${cursor}`,
+				{
+					method: "POST",
+					headers: {
+						accept: "text/event-stream",
+						"content-type": "application/json",
+					},
+					body: JSON.stringify({ message: content }),
+					signal: controller.signal,
+				},
+			);
+			if (!response.ok) {
+				throw new Error(await readError(response));
+			}
+			assertSseResponse(response);
+			if (!response.body) {
+				throw new Error("Chat stream response body is empty");
+			}
+			setTimelineStreamStatus("open");
+			const reader = response.body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = "";
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) {
@@ -274,18 +306,23 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 				const frames = buffer.split(/\n\n/);
 				buffer = frames.pop() ?? "";
 				for (const frame of frames) {
-					if (handleChatStreamFrame(frame, sessionId)) {
-						return;
+					const result = handleChatStreamFrame(frame, sessionId);
+					if (result !== "continue") {
+						return result;
 					}
 				}
 			}
-			if (buffer && handleChatStreamFrame(buffer, sessionId)) {
-				return;
+			if (buffer) {
+				const result = handleChatStreamFrame(buffer, sessionId);
+				if (result !== "continue") {
+					return result;
+				}
 			}
+			return "done";
 		} catch (err) {
-			// 用户切换会话或离开页面时主动 abort，不应该展示为操作失败。
-			if (err instanceof DOMException && err.name === "AbortError") {
-				return;
+			// 用户切换会话、离开页面或停止回复时主动 abort，不应该展示为操作失败。
+			if (isAbortError(err)) {
+				return "done";
 			}
 			throw err;
 		} finally {
@@ -297,11 +334,73 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 	}
 
 	/**
+	 * 把当前会话摘要本地标记为空闲。
+	 * @param sessionId session ID
+	 */
+	function markSessionIdle(sessionId: string) {
+		if (!session || session.id !== sessionId) {
+			return;
+		}
+		// terminal timeline 先于 waitUntil 清理落库时，前端先结束本轮运行态。
+		setSession({ ...session, workerStatus: "idle" });
+	}
+
+	/**
+	 * 只刷新当前会话摘要，避免完整加载会话历史时裁剪已分页加载的消息。
+	 * @param sessionId session ID
+	 * @param projectId project ID
+	 * @param options 刷新选项
+	 */
+	async function refreshSessionSummary(
+		sessionId: string,
+		projectId: string,
+		options: { preserveIdle?: boolean } = {},
+	) {
+		const sessions = await loadSessions(projectId);
+		const nextSession = sessions.find((item) => item.id === sessionId);
+		if (nextSession) {
+			if (options.preserveIdle && isActiveWorkerSession(nextSession)) {
+				return;
+			}
+			// SSE timeline 已经负责消息增量，这里只同步 workerStatus/containerStatus 等摘要字段。
+			setSession(nextSession);
+		}
+	}
+
+	/**
+	 * 停止当前会话正在运行的 Claude Code 回复。
+	 */
+	async function stopMessage() {
+		if (!session || isStopping) {
+			return;
+		}
+		setError(null);
+		setIsStopping(true);
+		const activeSession = session;
+		try {
+			const response = await fetch(`/api/ccr/sessions/${activeSession.id}/runner/stop`, {
+				method: "POST",
+			});
+			if (!response.ok) {
+				throw new Error(await readError(response));
+			}
+			// 后端确认 runner 已停后再断开本地 SSE；失败时保留原流继续展示输出。
+			closeTimelineStream();
+			await refreshSessionSummary(activeSession.id, activeSession.projectId);
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+		} finally {
+			setIsStopping(false);
+			setIsSending(false);
+		}
+	}
+
+	/**
 	 * 发送当前输入。
 	 */
 	async function sendMessage() {
 		const content = draft.trim();
-		if (!content || isSending) {
+		if (!content || running) {
 			return;
 		}
 		setError(null);
@@ -326,8 +425,13 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 		try {
 			const activeSession = await ensureSession(content);
 			const cursor = timeline.reduce((maxId, event) => Math.max(maxId, event.id), 0);
-			await streamMessage(activeSession.id, content, cursor);
-			await loadSessions(activeSession.projectId);
+			const streamResult = await streamMessage(activeSession.id, content, cursor);
+			if (streamResult === "terminal") {
+				markSessionIdle(activeSession.id);
+			}
+			await refreshSessionSummary(activeSession.id, activeSession.projectId, {
+				preserveIdle: streamResult === "terminal",
+			});
 		} catch (err) {
 			setError(err instanceof Error ? err.message : String(err));
 			updateClientEvent(optimisticEvent.event_id, (event) => ({
@@ -349,13 +453,16 @@ export function useChatBusiness(options: UseChatBusinessOptions) {
 		error,
 		isPermissionSubmitting,
 		isSending,
+		isStopping,
 		messages,
 		pendingPermissionRequest,
 		permissionError,
 		resetChatRuntime,
+		running,
 		sendMessage,
 		setDraft,
 		setError,
+		stopMessage,
 		submitToolPermissionDecision,
 		timelineStreamStatus,
 	};
