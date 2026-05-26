@@ -74,6 +74,7 @@ import {
 	buildRenamedPath,
 	type CreateDirectoryTarget,
 	createEmptyWorkspaceTree,
+	createWorkspaceTreeFallbackItem,
 	isPathOrChild,
 	type OpenFileTab,
 	type RenameTarget,
@@ -288,7 +289,8 @@ function ChatPage() {
 	const workspaceTree = useTree<WorkspaceTreeItem>({
 		dataLoader: {
 			getChildren: (itemId) => workspaceItems[itemId]?.children ?? [],
-			getItem: (itemId) => workspaceItems[itemId],
+			getItem: (itemId) =>
+				workspaceItems[itemId] ?? createWorkspaceTreeFallbackItem(itemId),
 		},
 		features: [syncDataLoaderFeature, selectionFeature, hotkeysCoreFeature],
 		getItemName: (item) => item.getItemData()?.name ?? "Unknown",
@@ -512,7 +514,8 @@ function ChatPage() {
 			const body = (await response.json()) as WorkspaceTreeResponse;
 			setWorkspaceItems((current) => {
 				const parentId = prefix || WORKSPACE_ROOT_ID;
-				const nextItems = prefix ? { ...current } : createEmptyWorkspaceTree();
+				// Headless Tree 会缓存展开节点；刷新根目录时也保留旧 item，避免同步读取到 undefined。
+				const nextItems = { ...current };
 				const childIds = body.workspace.nodes.map((node) => node.path);
 				for (const node of body.workspace.nodes) {
 					const previous = nextItems[node.path];
@@ -523,11 +526,9 @@ function ChatPage() {
 					};
 				}
 				nextItems[parentId] = {
-					...(nextItems[parentId] ?? {
-						name: prefix ? prefix.split("/").pop() ?? prefix : "workspace",
-						path: prefix,
-						type: "directory",
-					}),
+					...(nextItems[parentId] ?? createWorkspaceTreeFallbackItem(parentId)),
+					path: prefix,
+					type: "directory",
 					children: childIds,
 					isLoaded: true,
 					isTruncated: body.workspace.truncated,

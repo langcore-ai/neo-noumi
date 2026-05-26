@@ -158,6 +158,31 @@ export function workspaceNodeToTreeItem(node: WorkspaceTreeNode): WorkspaceTreeI
 }
 
 /**
+ * 构造 Headless Tree 同步读取时使用的兜底节点。
+ * @param itemId 文件树节点 ID
+ * @returns 不可展开的文件树数据项
+ */
+export function createWorkspaceTreeFallbackItem(itemId: string): WorkspaceTreeItem {
+	if (itemId === WORKSPACE_ROOT_ID) {
+		return {
+			name: "workspace",
+			path: "",
+			type: "directory",
+			children: [],
+			isLoaded: true,
+		};
+	}
+
+	const fallbackName = itemId.split("/").pop() || itemId;
+	return {
+		name: fallbackName,
+		path: itemId,
+		type: "file",
+		isLoaded: true,
+	};
+}
+
+/**
  * 构造初始 workspace 文件树。
  * @returns 文件树数据
  */
