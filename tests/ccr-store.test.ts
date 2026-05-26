@@ -226,6 +226,70 @@ describe("CcrStore project name uniqueness", () => {
 });
 
 describe("CcrStore worker lifecycle guards", () => {
+	test("lists recent client events without loading the whole session history", async () => {
+		const calls: unknown[] = [];
+		const createdAt = new Date("2026-05-26T00:00:00.000Z");
+		const rows = [3, 2, 1].map((sequenceNum) => ({
+			eventId: `event-${sequenceNum}`,
+			sequenceNum,
+			eventType: "user",
+			source: "chat-api",
+			payload: { type: "user" },
+			createdAt,
+		}));
+		const store = createStoreFromFakePrisma({
+			chatClientEvent: {
+				findMany: async (args: unknown) => {
+					calls.push(args);
+					return rows;
+				},
+			},
+		});
+
+		const events = await store.listRecentClientEvents("session-1", 3);
+
+		expect(calls).toEqual([
+			{
+				where: { sessionId: "session-1" },
+				orderBy: { sequenceNum: "desc" },
+				take: 3,
+			},
+		]);
+		expect(events.map((event) => event.sequence_num)).toEqual([1, 2, 3]);
+	});
+
+	test("lists older timeline events before the current first id", async () => {
+		const calls: unknown[] = [];
+		const createdAt = new Date("2026-05-26T00:00:00.000Z");
+		const rows = [12, 11, 10].map((id) => ({
+			id,
+			eventId: `timeline-${id}`,
+			eventType: "assistant",
+			payload: { type: "assistant" },
+			ephemeral: false,
+			createdAt,
+		}));
+		const store = createStoreFromFakePrisma({
+			chatWorkerEvent: {
+				findMany: async (args: unknown) => {
+					calls.push(args);
+					return rows;
+				},
+			},
+		});
+
+		const events = await store.listChatTimelineBefore("session-1", 13, 3);
+
+		expect(calls).toEqual([
+			{
+				where: { sessionId: "session-1", id: { lt: 13 } },
+				orderBy: { id: "desc" },
+				take: 3,
+			},
+		]);
+		expect(events.map((event) => event.id)).toEqual([10, 11, 12]);
+	});
+
 	test("returns empty Claude Code config when the user has no stored config", async () => {
 		const store = createStoreFromFakePrisma({
 			userClaudeCodeConfig: {

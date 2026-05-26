@@ -1415,15 +1415,51 @@ export class CcrStore {
 	 * 查询 client events。
 	 * @param sessionId session ID
 	 * @param fromSequence 起始序号
+	 * @param limit 数量
 	 * @returns events
 	 */
-	async listClientEvents(sessionId: string, fromSequence: number) {
+	async listClientEvents(sessionId: string, fromSequence: number, limit = DEFAULT_PAGE_SIZE) {
 		const rows = await this.prisma.chatClientEvent.findMany({
 			where: { sessionId, sequenceNum: { gt: fromSequence } },
 			orderBy: { sequenceNum: "asc" },
-			take: DEFAULT_PAGE_SIZE,
+			take: Math.min(Math.max(limit, 1), 500),
 		});
 		return rows.map((row) => this.toClientEventDto(row));
+	}
+
+	/**
+	 * 查询最新 client events，并保持返回顺序为从旧到新。
+	 * @param sessionId session ID
+	 * @param limit 数量
+	 * @returns events
+	 */
+	async listRecentClientEvents(sessionId: string, limit = DEFAULT_PAGE_SIZE) {
+		const rows = await this.prisma.chatClientEvent.findMany({
+			where: { sessionId },
+			orderBy: { sequenceNum: "desc" },
+			take: Math.min(Math.max(limit, 1), 500),
+		});
+		return rows.reverse().map((row) => this.toClientEventDto(row));
+	}
+
+	/**
+	 * 查询指定 sequence 之前的 client events，并保持返回顺序为从旧到新。
+	 * @param sessionId session ID
+	 * @param beforeSequence 当前已加载的最小 sequence
+	 * @param limit 数量
+	 * @returns events
+	 */
+	async listClientEventsBefore(
+		sessionId: string,
+		beforeSequence: number,
+		limit = DEFAULT_PAGE_SIZE,
+	) {
+		const rows = await this.prisma.chatClientEvent.findMany({
+			where: { sessionId, sequenceNum: { lt: beforeSequence } },
+			orderBy: { sequenceNum: "desc" },
+			take: Math.min(Math.max(limit, 1), 500),
+		});
+		return rows.reverse().map((row) => this.toClientEventDto(row));
 	}
 
 	/**
@@ -1934,6 +1970,51 @@ export class CcrStore {
 			take: Math.min(Math.max(limit, 1), 500),
 		});
 		return rows.map((row) => ({
+			id: row.id,
+			event_id: row.eventId,
+			event_type: row.eventType,
+			payload: asJsonObject(row.payload),
+			ephemeral: row.ephemeral,
+			created_at: row.createdAt.toISOString(),
+		}));
+	}
+
+	/**
+	 * 查询最新 chat timeline，并保持返回顺序为从旧到新。
+	 * @param sessionId session ID
+	 * @param limit 数量
+	 * @returns timeline events
+	 */
+	async listRecentChatTimeline(sessionId: string, limit = 200) {
+		const rows = await this.prisma.chatWorkerEvent.findMany({
+			where: { sessionId },
+			orderBy: { id: "desc" },
+			take: Math.min(Math.max(limit, 1), 500),
+		});
+		return rows.reverse().map((row) => ({
+			id: row.id,
+			event_id: row.eventId,
+			event_type: row.eventType,
+			payload: asJsonObject(row.payload),
+			ephemeral: row.ephemeral,
+			created_at: row.createdAt.toISOString(),
+		}));
+	}
+
+	/**
+	 * 查询指定 timeline ID 之前的 chat timeline，并保持返回顺序为从旧到新。
+	 * @param sessionId session ID
+	 * @param beforeId 当前已加载的最小 timeline ID
+	 * @param limit 数量
+	 * @returns timeline events
+	 */
+	async listChatTimelineBefore(sessionId: string, beforeId: number, limit = 200) {
+		const rows = await this.prisma.chatWorkerEvent.findMany({
+			where: { sessionId, id: { lt: beforeId } },
+			orderBy: { id: "desc" },
+			take: Math.min(Math.max(limit, 1), 500),
+		});
+		return rows.reverse().map((row) => ({
 			id: row.id,
 			event_id: row.eventId,
 			event_type: row.eventType,

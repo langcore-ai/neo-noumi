@@ -299,7 +299,7 @@ Claude Code CLI in Cloudflare Container
 - subagent：Claude Code 调用 Task/Agent 后，route 能记录 `task_started`、`task_notification`、tool result，以及带 `agent_id` 的 subagent internal events。
 - SSE 稳定性：真实 CLI 曾在 15 秒心跳下约 12 秒空闲断连；route 心跳调整为 5 秒后，复测日志未再出现 `Stream read error` 或 `socket connection was closed unexpectedly`。
 - 业务 chat API：`POST /api/ccr/sessions/{sessionId}/messages` 在 `Accept: text/event-stream` 下会先返回 `session` SSE frame，再写入用户消息、启动真实远程模式 Claude Code CLI，并在同一个请求里持续输出 `timeline` frame；收到 `result` 后返回 `done` 并结束本次前端长连接。所有 SSE 入口必须显式返回 `Content-Type: text/event-stream`、禁用缓存和 `no-transform`，不能只依赖普通 streaming body。
-- 会话详情 API：`GET /api/ccr/sessions/{sessionId}` 返回 `session`、`clientEvents`、`timeline` 和 `internal`。route 会分页拉全这些事件；前端用 `clientEvents` 恢复用户已发送消息，用 `timeline` 恢复 worker 可见事件，刷新页面后仍能重建完整对话流。
+- 会话详情 API：`GET /api/ccr/sessions/{sessionId}` 默认只返回最近 10 条 `clientEvents` 和最近 10 条 `timeline`，并返回 `history` 游标；Chat 页向上滚动触顶后带 `older=1`、`beforeClientSequence`、`beforeTimelineId` 继续加载更早事件。`internal events` 不再随会话详情返回，恢复链路仍走 worker/internal-events 与 sessionStore 镜像。
 - Claude Code 容器内的 `ANTHROPIC_BASE_URL` 固定为 `https://api.anthropic.com`，真实渠道 base URL 只在 Worker AI Proxy 转发时使用；渠道配置如果带 `/v1`，后端会先规范化，避免上游出现 `/v1/v1/messages`。
 - `POST /api/ccr/sessions/{sessionId}/container/stop` 的语义是停止用户级 sandbox 容器，而不是只杀当前 session runner；停止后会把同一用户挂在该 sandbox 上的运行态 session 收敛为 `idle/stopped`，下一次发送消息会重建容器并从数据库恢复 transcript 与 memory。
 - `/worker/events` 写入 terminal `result` 后会停止当前 session runner，并将 session 状态收敛为 `workerStatus=idle`、`containerStatus=stopped`、`runnerProcessId=null`；worker transport 鉴权时会从 token 绑定的 session 回填 owner userId，确保停止的是 `neo-noumi-user-{userId}` 对应的真实 sandbox。这个保底逻辑在后端 worker transport 层执行，不依赖前端 SSE 是否仍然连接，避免旧进程继续写入 `keep_alive`。

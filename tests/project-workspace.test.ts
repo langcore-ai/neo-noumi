@@ -6,6 +6,7 @@ import {
 	deleteWorkspacePath,
 	listWorkspaceTree,
 	moveWorkspaceFile,
+	moveWorkspacePath,
 	normalizeWorkspacePath,
 	readWorkspaceFile,
 	signWorkspaceOperation,
@@ -151,6 +152,46 @@ describe("workspace R2 operations", () => {
 		).resolves.toMatchObject({ path: "src/b.txt", size: 5 });
 		expect(objects.has("project-1/src/a.txt")).toBe(false);
 		expect(objects.has("project-1/src/b.txt")).toBe(true);
+	});
+
+	test("moves directories by copying all objects under the source prefix", async () => {
+		const { bucket, objects } = createFakeR2Bucket({
+			"project-1/src/.keep": "",
+			"project-1/src/index.ts": "code",
+			"project-1/src/nested/a.ts": "nested",
+			"project-1/src-other/file.ts": "sibling",
+		});
+
+		await expect(
+			moveWorkspacePath(bucket, "project-1", "src", "archive/src", "directory"),
+		).resolves.toMatchObject({
+			path: "archive/src",
+			movedObjectCount: 3,
+		});
+
+		expect(objects.has("project-1/src/.keep")).toBe(false);
+		expect(objects.has("project-1/src/index.ts")).toBe(false);
+		expect(objects.has("project-1/src/nested/a.ts")).toBe(false);
+		expect(objects.get("project-1/archive/src/index.ts")?.content).toBe("code");
+		expect(objects.get("project-1/archive/src/nested/a.ts")?.content).toBe("nested");
+		expect(objects.has("project-1/src-other/file.ts")).toBe(true);
+	});
+
+	test("allows moving a file into a directory whose path starts with the file path", async () => {
+		const { bucket, objects } = createFakeR2Bucket({
+			"project-1/src": "file",
+			"project-1/src-archive/.keep": "",
+		});
+
+		await expect(
+			moveWorkspacePath(bucket, "project-1", "src", "src-archive/src", "file"),
+		).resolves.toMatchObject({
+			path: "src-archive/src",
+			movedObjectCount: 1,
+		});
+
+		expect(objects.has("project-1/src")).toBe(false);
+		expect(objects.get("project-1/src-archive/src")?.content).toBe("file");
 	});
 
 	test("deletes a single file without touching sibling paths", async () => {

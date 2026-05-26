@@ -26,7 +26,7 @@ import {
 	createWorkspaceDirectory,
 	deleteWorkspacePath,
 	listWorkspaceTree,
-	moveWorkspaceFile,
+	moveWorkspacePath,
 	normalizeWorkspacePath,
 	readWorkspaceFile,
 	signWorkspaceOperation,
@@ -35,6 +35,7 @@ import {
 	WORKSPACE_UPLOAD_MAX_FILES,
 	writeWorkspaceFile,
 	type ProjectWorkspaceBindings,
+	type WorkspaceMoveSourceType,
 	type WorkspaceUploadUrlInput,
 } from "./project-workspace";
 import type { ChatMessageInput, WorkerInternalEvent, WorkerVisibleEvent } from "./ccr-types";
@@ -143,6 +144,26 @@ function readSseCursor(lastEventId: string | null | undefined, cursorQuery: stri
 }
 
 /**
+ * 读取历史消息分页大小。
+ * @param limitQuery limit query
+ * @returns 限制在安全范围内的分页大小
+ */
+function readHistoryLimit(limitQuery: string | undefined): number {
+	const limit = Number(limitQuery ?? 10);
+	return Math.min(Math.max(Number.isFinite(limit) ? Math.trunc(limit) : 10, 1), 50);
+}
+
+/**
+ * 读取正整数 query。
+ * @param value query 值
+ * @returns 正整数；非法时返回 null
+ */
+function readPositiveIntegerQuery(value: string | undefined): number | null {
+	const parsed = Number(value);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+/**
  * 判断 timeline event 是否表示本轮对话结束。
  * @param event timeline event
  * @returns 是否结束
@@ -161,67 +182,62 @@ function isTerminalWorkerEvent(event: WorkerVisibleEvent): boolean {
 	return isTerminalWorkerPayload(payload);
 }
 
-/**
- * 拉取 session 详情所需的全部 client events。
- * @param store CCR store
- * @param sessionId session ID
- * @returns 完整 client events
- */
-async function listAllClientEvents(store: CcrStore, sessionId: string) {
-	const events: Awaited<ReturnType<CcrStore["listClientEvents"]>> = [];
-	let fromSequence = 0;
-	while (true) {
-		const page = await store.listClientEvents(sessionId, fromSequence);
-		if (page.length === 0) {
-			return events;
-		}
-		events.push(...page);
-		// sequence_num 单调递增，用最后一条作为下一页游标。
-		fromSequence = page[page.length - 1]?.sequence_num ?? fromSequence;
-	}
-}
+/** Session 历史分页结果。 */
+type SessionHistoryPage = {
+	/** client events 当前页。 */
+	clientEvents: Awaited<ReturnType<CcrStore["listClientEvents"]>>;
+	/** timeline 当前页。 */
+	timeline: Awaited<ReturnType<CcrStore["listChatTimeline"]>>;
+	/** 是否还有更早的 client events。 */
+	hasMoreClientEvents: boolean;
+	/** 是否还有更早的 timeline。 */
+	hasMoreTimeline: boolean;
+	/** 当前页最早 client sequence，用于下一次向上翻页。 */
+	beforeClientSequence: number | null;
+	/** 当前页最早 timeline ID，用于下一次向上翻页。 */
+	beforeTimelineId: number | null;
+};
 
 /**
- * 拉取 session 详情所需的全部 timeline events。
+ * 查询 session 历史分页。
  * @param store CCR store
  * @param sessionId session ID
- * @returns 完整 timeline events
+ * @param input 分页参数
+ * @returns 历史分页
  */
-async function listAllChatTimeline(store: CcrStore, sessionId: string) {
-	const events: Awaited<ReturnType<CcrStore["listChatTimeline"]>> = [];
-	let cursor = 0;
-	while (true) {
-		const page = await store.listChatTimeline(sessionId, cursor, 500);
-		if (page.length === 0) {
-			return events;
-		}
-		events.push(...page);
-		// id 单调递增，用最后一条作为下一页游标。
-		cursor = page[page.length - 1]?.id ?? cursor;
-	}
-}
-
-/**
- * 拉取 session 详情所需的全部 foreground internal events。
- * @param store CCR store
- * @param sessionId session ID
- * @returns 完整 internal events
- */
-async function listAllForegroundInternalEvents(store: CcrStore, sessionId: string) {
-	const events: Awaited<ReturnType<CcrStore["listInternalEvents"]>>["data"] = [];
-	let cursor: number | undefined;
-	while (true) {
-		const page = await store.listInternalEvents(sessionId, {
-			subagents: false,
-			cursor,
-			limit: 500,
-		});
-		events.push(...page.data);
-		if (!page.next_cursor) {
-			return events;
-		}
-		cursor = Number(page.next_cursor);
-	}
+async function listSessionHistoryPage(
+	store: CcrStore,
+	sessionId: string,
+	input: {
+		limit: number;
+		older: boolean;
+		beforeClientSequence: number | null;
+		beforeTimelineId: number | null;
+	},
+): Promise<SessionHistoryPage> {
+	const take = input.limit + 1;
+	const [rawClientEvents, rawTimeline] = await Promise.all([
+		input.older
+			? input.beforeClientSequence
+				? store.listClientEventsBefore(sessionId, input.beforeClientSequence, take)
+				: Promise.resolve([])
+			: store.listRecentClientEvents(sessionId, take),
+		input.older
+			? input.beforeTimelineId
+				? store.listChatTimelineBefore(sessionId, input.beforeTimelineId, take)
+				: Promise.resolve([])
+			: store.listRecentChatTimeline(sessionId, take),
+	]);
+	const clientEvents = rawClientEvents.slice(-input.limit);
+	const timeline = rawTimeline.slice(-input.limit);
+	return {
+		clientEvents,
+		timeline,
+		hasMoreClientEvents: rawClientEvents.length > input.limit,
+		hasMoreTimeline: rawTimeline.length > input.limit,
+		beforeClientSequence: clientEvents[0]?.sequence_num ?? null,
+		beforeTimelineId: timeline[0]?.id ?? null,
+	};
 }
 
 /**
@@ -819,9 +835,14 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		}
 		const fromPath = getStringField(body, "fromPath");
 		const toPath = getStringField(body, "toPath");
+		const sourceType = getStringField(body, "sourceType");
 		if (!fromPath || !toPath) {
 			return c.json({ error: "fromPath and toPath are required" }, 400);
 		}
+		if (sourceType && sourceType !== "file" && sourceType !== "directory") {
+			return c.json({ error: "sourceType must be file or directory" }, 400);
+		}
+		const moveSourceType = sourceType as WorkspaceMoveSourceType | undefined;
 		const fromPathResult = readWorkspaceRoutePath(fromPath);
 		if ("error" in fromPathResult) {
 			return c.json({ error: fromPathResult.error }, 400);
@@ -836,17 +857,18 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			path: fromPathResult.path,
 			body: JSON.stringify({ toPath: toPathResult.path }),
 		});
-		const file = await moveWorkspaceFile(
+		const item = await moveWorkspacePath(
 			c.env.PROJECT_WORKSPACE_BUCKET,
 			projectId,
 			fromPathResult.path,
 			toPathResult.path,
+			moveSourceType,
 		);
-		if (!file) {
-			return c.json({ error: "Workspace file not found" }, 404);
+		if (!item) {
+			return c.json({ error: "Workspace path not found" }, 404);
 		}
 		return c.json({
-			file,
+			item,
 			signature,
 		});
 	});
@@ -879,16 +901,24 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		if (!session) {
 			return c.json({ error: "Session not found" }, 404);
 		}
-		const [clientEvents, timeline, internal] = await Promise.all([
-			listAllClientEvents(store, sessionId),
-			listAllChatTimeline(store, sessionId),
-			listAllForegroundInternalEvents(store, sessionId),
-		]);
+		const history = await listSessionHistoryPage(store, sessionId, {
+			limit: readHistoryLimit(c.req.query("limit")),
+			older: c.req.query("older") === "1",
+			beforeClientSequence: readPositiveIntegerQuery(
+				c.req.query("beforeClientSequence"),
+			),
+			beforeTimelineId: readPositiveIntegerQuery(c.req.query("beforeTimelineId")),
+		});
 		return c.json({
 			session,
-			clientEvents,
-			timeline,
-			internal,
+			clientEvents: history.clientEvents,
+			timeline: history.timeline,
+			history: {
+				hasMoreClientEvents: history.hasMoreClientEvents,
+				hasMoreTimeline: history.hasMoreTimeline,
+				beforeClientSequence: history.beforeClientSequence,
+				beforeTimelineId: history.beforeTimelineId,
+			},
 		});
 	});
 

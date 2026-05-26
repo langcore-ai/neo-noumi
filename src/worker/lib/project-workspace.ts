@@ -581,6 +581,107 @@ export async function createWorkspaceDirectory(
 	return { path: normalizedPath };
 }
 
+/** workspace 移动结果。 */
+export type WorkspaceMoveResult = {
+	/** 移动后的 workspace 路径。 */
+	path: string;
+	/** 被移动的对象数量。 */
+	movedObjectCount: number;
+	/** 单文件移动后的文件大小；目录移动时为空。 */
+	size?: number;
+	/** 单文件移动后的 etag；目录移动时为空。 */
+	etag?: string;
+	/** 单文件移动后的上传时间；目录移动时为空。 */
+	uploaded?: string;
+};
+
+/** workspace 移动源类型。 */
+export type WorkspaceMoveSourceType = "file" | "directory";
+
+/**
+ * 移动 workspace 文件或目录。
+ * @param bucket R2 bucket
+ * @param projectId Project ID
+ * @param fromPath 源路径
+ * @param toPath 目标路径
+ * @param sourceType 源节点类型；省略时优先按精确文件移动
+ * @returns 移动后的路径摘要；源路径不存在时返回 null
+ */
+export async function moveWorkspacePath(
+	bucket: R2Bucket,
+	projectId: string,
+	fromPath: string,
+	toPath: string,
+	sourceType?: WorkspaceMoveSourceType,
+): Promise<WorkspaceMoveResult | null> {
+	const sourcePath = normalizeWorkspacePath(fromPath);
+	const targetPath = normalizeWorkspacePath(toPath);
+	if (sourcePath === targetPath) {
+		return null;
+	}
+	const sourceKey = buildWorkspaceObjectKey(projectId, sourcePath);
+	const targetKey = buildWorkspaceObjectKey(projectId, targetPath);
+	const object = sourceType === "directory" ? null : await bucket.get(sourceKey);
+	if (object && sourceType !== "directory") {
+		const moved = await bucket.put(targetKey, object.body, {
+			httpMetadata: object.httpMetadata,
+			customMetadata: object.customMetadata,
+		});
+		await bucket.delete(sourceKey);
+		return {
+			path: targetPath,
+			movedObjectCount: 1,
+			size: moved.size,
+			etag: moved.etag,
+			uploaded: moved.uploaded.toISOString(),
+		};
+	}
+	if (targetPath.startsWith(`${sourcePath}/`)) {
+		throw new Error("Workspace directory cannot be moved into itself");
+	}
+
+	const sourcePrefix = `${sourceKey}/`;
+	const targetPrefix = `${targetKey}/`;
+	const sourceObjects: R2Object[] = [];
+	let cursor: string | undefined;
+	do {
+		// R2 目录是 prefix 语义，目录移动需要逐个复制并删除所有子对象。
+		const listed = await bucket.list({
+			prefix: sourcePrefix,
+			limit: WORKSPACE_LIST_LIMIT,
+			cursor,
+		});
+		sourceObjects.push(...listed.objects);
+		cursor = listed.truncated ? listed.cursor : undefined;
+	} while (cursor);
+
+	if (sourceObjects.length === 0) {
+		return null;
+	}
+
+	const movedKeys: string[] = [];
+	for (const sourceObject of sourceObjects) {
+		const childObject = await bucket.get(sourceObject.key);
+		if (!childObject) {
+			continue;
+		}
+		const targetChildKey = `${targetPrefix}${sourceObject.key.slice(sourcePrefix.length)}`;
+		await bucket.put(targetChildKey, childObject.body, {
+			httpMetadata: childObject.httpMetadata,
+			customMetadata: childObject.customMetadata,
+		});
+		movedKeys.push(sourceObject.key);
+	}
+	for (let index = 0; index < movedKeys.length; index += WORKSPACE_DELETE_BATCH_SIZE) {
+		// 复制全部成功后再批量删除源对象，避免中途失败造成源目录部分丢失。
+		await bucket.delete(movedKeys.slice(index, index + WORKSPACE_DELETE_BATCH_SIZE));
+	}
+	return {
+		path: targetPath,
+		movedObjectCount: movedKeys.length,
+	};
+}
+
 /**
  * 移动 workspace 文件。
  * @param bucket R2 bucket
