@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { createKvSecondaryStorage } from "../src/worker/lib/auth";
+import {
+	createKvSecondaryStorage,
+	generateBetterAuthDatabaseId,
+	readTrustedOrigins,
+} from "../src/worker/lib/auth";
 
 /** 测试用 KV 写入记录。 */
 type KvPutRecord = {
@@ -121,5 +125,35 @@ describe("createKvSecondaryStorage", () => {
 				options: {},
 			},
 		]);
+	});
+});
+
+describe("readTrustedOrigins", () => {
+	test("allows the next Vite dev port when localhost base URL is configured", () => {
+		expect(readTrustedOrigins("http://localhost:5173")).toContain(
+			"http://localhost:5174",
+		);
+	});
+
+	test("does not expand trusted origins for production URLs", () => {
+		expect(readTrustedOrigins("https://neo-noumi.example.com")).toEqual([
+			"https://neo-noumi.example.com",
+		]);
+	});
+});
+
+describe("generateBetterAuthDatabaseId", () => {
+	test("generates lowercase alphanumeric ids for new auth records", () => {
+		const id = generateBetterAuthDatabaseId({ model: "user" });
+
+		expect(id).toHaveLength(32);
+		expect(id).toMatch(/^[0-9a-z]+$/);
+	});
+
+	test("honors Better Auth requested id size", () => {
+		const id = generateBetterAuthDatabaseId({ model: "session", size: 12 });
+
+		expect(id).toHaveLength(12);
+		expect(id).toMatch(/^[0-9a-z]+$/);
 	});
 });

@@ -3,6 +3,11 @@ import type { Context, Hono } from "hono";
 import { createPrismaClient } from "./prisma";
 import { createAuth } from "./auth";
 import {
+	buildCanUseToolDecisionResponse,
+	handleControlRequest,
+	type ToolPermissionDecision,
+} from "./ccr-control";
+import {
 	CLAUDE_SESSION_STORE_PROJECT_KEY,
 	CcrStore,
 	ProjectNameConflictError,
@@ -909,6 +914,39 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		return c.json({ ok: true, deleted: true });
 	});
 
+	app.post("/api/ccr/sessions/:sessionId/tool-permission", async (c) => {
+		const body = await readJsonObject(c.req.raw);
+		const store = createStore(c.env);
+		const sessionId = c.req.param("sessionId");
+		const session = await store.findUserSessionSummary(c.get("userId"), sessionId);
+		if (!session || session.deletedAt) {
+			return c.json({ error: "Session not found" }, 404);
+		}
+		const requestId = getStringField(body, "requestId");
+		const rawDecision = getStringField(body, "decision");
+		if (!requestId || (rawDecision !== "allow" && rawDecision !== "deny")) {
+			return c.json({ error: "requestId and decision are required" }, 400);
+		}
+		const decision: ToolPermissionDecision = rawDecision;
+		const request = await store.findToolPermissionRequest(sessionId, requestId);
+		if (!request) {
+			return c.json({ error: "Tool permission request not found" }, 404);
+		}
+		if (await store.hasToolPermissionResponse(sessionId, requestId)) {
+			return c.json({ error: "Tool permission request already answered" }, 409);
+		}
+		const response = buildCanUseToolDecisionResponse(
+			requestId,
+			request,
+			decision,
+		);
+		const event = await store.enqueueClientEvent(sessionId, response, {
+			eventType: "control_response",
+			source: "user-permission",
+		});
+		return c.json({ ok: true, event });
+	});
+
 	app.post("/api/ccr/sessions/:sessionId/messages", async (c) => {
 		const body = await readJsonObject(c.req.raw);
 		const store = createStore(c.env);
@@ -1133,6 +1171,19 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		const accepted = await store.insertWorkerEvents(sessionId, workerEpoch, events);
 		if (!accepted) {
 			return c.json({ error: "worker_epoch mismatch" }, 409);
+		}
+		for (const event of events) {
+			const payload = isJsonObject(event.payload) ? event.payload : {};
+			if (payload.type !== "control_request") {
+				continue;
+			}
+			const response = await handleControlRequest(payload, { sessionId });
+			if (response) {
+				await store.enqueueClientEvent(sessionId, response, {
+					eventType: "control_response",
+					source: "route-control",
+				});
+			}
 		}
 		if (events.some(isTerminalWorkerEvent)) {
 			// result 是 Claude Code 本轮终止信号；销毁 runner 必须由后端兜底，不能依赖前端 SSE 是否在线。

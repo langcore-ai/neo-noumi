@@ -12,6 +12,7 @@ import {
 	buildClaudeProjectStateDir,
 	buildProjectWorkspaceMountPrefix,
 	buildProjectWorkspaceMountPath,
+	shouldSkipWorkspaceMount,
 } from "./ccr-workspace-mount";
 
 /** Sandbox 内 CCR runner 脚本路径 */
@@ -39,9 +40,6 @@ const TRANSCRIPT_RESTORE_PAGE_SIZE = 500;
 
 /** Claude Code 默认模型；固定到网关可识别的 Sonnet 模型，避免 CLI 选择 Opus 后缀模型。 */
 const CLAUDE_MODEL = "claude-sonnet-4-6";
-
-/** Cloudflare R2 S3 API hostname 通配，用于 Sandbox s3fs 出网挂载。 */
-const R2_S3_API_HOST_PATTERN = "*.r2.cloudflarestorage.com";
 
 /** Project workspace 挂载信息。 */
 type ProjectWorkspaceMount = {
@@ -85,19 +83,17 @@ export interface NeoNoumiSandboxBindings extends AiProxyBindings {
 	R2_SECRET_ACCESS_KEY?: string;
 	/** Project workspace R2 bucket 名称，用于 Sandbox s3fs 挂载。 */
 	PROJECT_WORKSPACE_BUCKET_NAME?: string;
+	/** 本地开发禁用 R2/s3fs workspace 挂载，避免 Docker 缺少 /dev/fuse 阻断 chat 链路。 */
+	NEO_NOUMI_DISABLE_WORKSPACE_MOUNT?: string;
 }
 
 /** Cloudflare Sandbox，用于运行 Neo Noumi chat worker。 */
 export class NeoNoumiSandbox extends Sandbox {
 	/** 容器空闲 3 分钟后进入休眠，降低旧 runner 和挂载资源占用。 */
 	sleepAfter = "3m";
-	enableInternet = false;
+	/** 默认允许普通出站请求；只有 outboundByHost 命中的少数 host 会被 Worker 接管。 */
+	enableInternet = true;
 	interceptHttps = true;
-	allowedHosts = [
-		CCR_SDK_APPROVED_HOST,
-		ANTHROPIC_API_HOST,
-		R2_S3_API_HOST_PATTERN,
-	];
 }
 
 NeoNoumiSandbox.outboundByHost = {
@@ -609,6 +605,25 @@ async function ensureProjectWorkspaceMounted(
 	await sandbox.exec(`mkdir -p ${shellQuote(mountPath)}`, {
 		origin: "internal",
 	});
+	if (shouldSkipWorkspaceMount(env.NEO_NOUMI_DISABLE_WORKSPACE_MOUNT)) {
+		await store.recordOperation(sessionId, {
+			direction: "route_internal",
+			category: "sandbox_workspace_mount_checked",
+			payload: {
+				mount_path: mountPath,
+				project_id: context.projectId,
+				project_name: context.project.name,
+				mounted: false,
+				reason: "workspace_mount_disabled",
+			},
+		});
+		return {
+			mountPath,
+			mounted: false,
+			projectId: context.projectId,
+			projectName: context.project.name,
+		};
+	}
 	const mountConfig = readWorkspaceMountConfig(env);
 	await sandbox.mountBucket(mountConfig.bucketName, mountPath, {
 		credentials: mountConfig.credentials,

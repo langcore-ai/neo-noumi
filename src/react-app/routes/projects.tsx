@@ -32,14 +32,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
-import {
-	Table,
-	TableBody,
-	TableCell,
-	TableHead,
-	TableHeader,
-	TableRow,
-} from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { authClient } from "@/lib/auth-client";
 
@@ -54,10 +46,24 @@ interface ProjectSummary {
 	description: string | null;
 	createdAt: string;
 	updatedAt: string;
+	/** 最近更新的会话列表。 */
+	sessions?: ProjectSessionSummary[];
 	_count?: {
 		/** 未软删除会话数量。 */
 		sessions: number;
 	};
+}
+
+/** Project 卡片中展示的会话摘要。 */
+interface ProjectSessionSummary {
+	/** Session ID。 */
+	id: string;
+	/** Session 标题。 */
+	title: string | null;
+	/** 所属 Project ID。 */
+	projectId: string;
+	/** 更新时间。 */
+	updatedAt: string;
 }
 
 /** Project 表单状态。 */
@@ -328,53 +334,64 @@ function ProjectsPage() {
 					</Alert>
 				) : null}
 
-				<Card>
-					<CardHeader>
-						<CardTitle>项目列表</CardTitle>
-						<CardDescription>删除项目会同步移除它下面的聊天会话。</CardDescription>
-					</CardHeader>
-					<CardContent>
-						{isLoading ? (
-							<div className="flex flex-col gap-2">
-								<Skeleton className="h-10" />
-								<Skeleton className="h-10" />
-								<Skeleton className="h-10" />
-							</div>
-						) : projects.length === 0 ? (
-							<div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">
-								还没有项目，先新建一个项目。
-							</div>
-						) : (
-							<Table>
-								<TableHeader>
-									<TableRow>
-										<TableHead>名称</TableHead>
-										<TableHead>描述</TableHead>
-										<TableHead>会话</TableHead>
-										<TableHead>更新时间</TableHead>
-										<TableHead className="text-right">操作</TableHead>
-									</TableRow>
-								</TableHeader>
-								<TableBody>
-									{projects.map((project) => (
-										<TableRow key={project.id}>
-											<TableCell className="max-w-48">
-												<div className="flex min-w-0 flex-col gap-1">
-													<span className="truncate font-medium">{project.name}</span>
-													<span className="truncate text-xs text-muted-foreground">
-														{project.id}
-													</span>
+				<section className="flex flex-col gap-4">
+					<div className="flex flex-col gap-1">
+						<h2 className="text-xl font-semibold">项目列表</h2>
+						<p className="text-sm text-muted-foreground">
+							删除项目会同步移除它下面的聊天会话。
+						</p>
+					</div>
+					{isLoading ? (
+						<div className="flex flex-col gap-2">
+							<Skeleton className="h-10" />
+							<Skeleton className="h-10" />
+							<Skeleton className="h-10" />
+						</div>
+					) : projects.length === 0 ? (
+						<div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">
+							还没有项目，先新建一个项目。
+						</div>
+					) : (
+						<div className="grid gap-4 md:grid-cols-2">
+							{projects.map((project) => {
+								const sessions = project.sessions ?? [];
+								const remainingSessions = Math.max(
+									(project._count?.sessions ?? 0) - sessions.length,
+									0,
+								);
+
+								return (
+									<Card key={project.id} className="overflow-hidden">
+										<Link
+											to="/chat"
+											search={{ projectId: project.id }}
+											className="block p-5 transition-colors hover:bg-muted/50"
+										>
+											<div className="flex items-start justify-between gap-4">
+												<div className="min-w-0">
+													<h3 className="truncate text-lg font-semibold">
+														{project.name}
+													</h3>
+													<p className="mt-2 line-clamp-2 text-sm text-muted-foreground">
+														{project.description || "无描述"}
+													</p>
 												</div>
-											</TableCell>
-											<TableCell className="max-w-72">
-												<span className="block truncate text-muted-foreground">
-													{project.description || "无描述"}
+												<ArrowRightIcon className="mt-1 shrink-0 text-muted-foreground" />
+											</div>
+											<div className="mt-4 flex flex-wrap items-center gap-2">
+												<Badge variant="secondary">
+													{project._count?.sessions ?? 0} 个会话
+												</Badge>
+												<span className="text-xs text-muted-foreground">
+													更新于 {formatDateTime(project.updatedAt)}
 												</span>
-											</TableCell>
-											<TableCell>{project._count?.sessions ?? 0}</TableCell>
-											<TableCell>{formatDateTime(project.updatedAt)}</TableCell>
-											<TableCell>
-												<div className="flex justify-end gap-2">
+											</div>
+										</Link>
+
+										<div className="border-t px-5 py-4">
+											<div className="mb-3 flex items-center justify-between gap-3">
+												<p className="text-sm font-medium">会话列表</p>
+												<div className="flex gap-2">
 													<Button
 														variant="outline"
 														size="sm"
@@ -392,14 +409,45 @@ function ProjectsPage() {
 														删除
 													</Button>
 												</div>
-											</TableCell>
-										</TableRow>
-									))}
-								</TableBody>
-							</Table>
-						)}
-					</CardContent>
-				</Card>
+											</div>
+											{sessions.length === 0 ? (
+												<div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
+													暂无会话，点击项目可进入新建会话。
+												</div>
+											) : (
+												<div className="flex flex-col gap-2">
+													{sessions.map((session) => (
+														<Link
+															key={session.id}
+															to="/chat"
+															search={{
+																projectId: project.id,
+																sessionId: session.id,
+															}}
+															className="flex items-center justify-between gap-3 rounded-md border px-3 py-2 text-sm transition-colors hover:bg-accent hover:text-accent-foreground"
+														>
+															<span className="min-w-0 truncate">
+																{session.title || "新的对话"}
+															</span>
+															<span className="shrink-0 text-xs text-muted-foreground">
+																{formatDateTime(session.updatedAt)}
+															</span>
+														</Link>
+													))}
+													{remainingSessions > 0 ? (
+														<p className="text-xs text-muted-foreground">
+															还有 {remainingSessions} 个更早的会话，可进入 Chat 查看。
+														</p>
+													) : null}
+												</div>
+											)}
+										</div>
+									</Card>
+								);
+							})}
+						</div>
+					)}
+				</section>
 			</section>
 
 			<Dialog open={isFormOpen} onOpenChange={setIsFormOpen}>

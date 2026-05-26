@@ -74,6 +74,7 @@
 		"prisma:migrate": "prisma migrate dev",
 		"prisma:db:pull": "prisma db pull",
 		"prisma:studio": "prisma studio",
+		"test:ccr-remote-tool": "bun run scripts/ccr-remote-tool-test.ts",
 		"test": "bun test"
 	},
 	"type": "module"

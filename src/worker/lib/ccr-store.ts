@@ -1,5 +1,6 @@
 import { Prisma, type PrismaClient } from "../../generated/prisma/client";
-import { isJsonObject, mergeJsonObject, toJsonValue } from "./ccr-json";
+import { getStringField, isJsonObject, mergeJsonObject, toJsonValue } from "./ccr-json";
+import { buildRouteMcpInitializeRequest } from "./ccr-control";
 import {
 	CLIENT_EVENT_STATUS_FAILED,
 	CLIENT_EVENT_STATUS_QUEUED,
@@ -590,6 +591,12 @@ export class CcrStore {
 			orderBy: { updatedAt: "desc" },
 			take: 50,
 			include: {
+				sessions: {
+					where: { deletedAt: null },
+					orderBy: { updatedAt: "desc" },
+					take: 10,
+					select: chatSessionSummarySelect,
+				},
 				_count: {
 					select: {
 						// 管理页只统计未软删除会话，避免已删除会话影响当前项目概览。
@@ -1314,6 +1321,12 @@ export class CcrStore {
 	 */
 	async enqueueChatInput(sessionId: string, messages: ChatMessageInput[]) {
 		const events: Array<Awaited<ReturnType<CcrStore["enqueueClientEvent"]>>> = [];
+		events.push(
+			await this.enqueueClientEvent(sessionId, buildRouteMcpInitializeRequest(), {
+				eventType: "control_request",
+				source: "chat-api",
+			}),
+		);
 		for (const message of messages) {
 			events.push(
 				await this.enqueueClientEvent(
@@ -1411,6 +1424,54 @@ export class CcrStore {
 			take: DEFAULT_PAGE_SIZE,
 		});
 		return rows.map((row) => this.toClientEventDto(row));
+	}
+
+	/**
+	 * 查找指定的工具权限申请。
+	 * @param sessionId session ID
+	 * @param requestId control request ID
+	 * @returns can_use_tool 内层 request；不存在时返回 null
+	 */
+	async findToolPermissionRequest(sessionId: string, requestId: string): Promise<JsonObject | null> {
+		const row = await this.prisma.chatWorkerEvent.findFirst({
+			where: {
+				sessionId,
+				eventType: "control_request",
+				// 只按 request_id 定位候选事件，避免边缘 Worker 全量拉取长会话 timeline。
+				payload: { path: ["request_id"], equals: requestId },
+			},
+			orderBy: { id: "desc" },
+			select: { payload: true },
+		});
+		const payload = row ? asJsonObject(row.payload) : {};
+		const request = isJsonObject(payload.request) ? payload.request : {};
+		if (
+			payload.type === "control_request" &&
+			getStringField(payload, "request_id") === requestId &&
+			getStringField(request, "subtype") === "can_use_tool"
+		) {
+			return request;
+		}
+		return null;
+	}
+
+	/**
+	 * 判断指定工具权限申请是否已经响应过。
+	 * @param sessionId session ID
+	 * @param requestId control request ID
+	 * @returns 是否已有 control_response client event
+	 */
+	async hasToolPermissionResponse(sessionId: string, requestId: string): Promise<boolean> {
+		const row = await this.prisma.chatClientEvent.findFirst({
+			where: {
+				sessionId,
+				eventType: "control_response",
+				// response.request_id 是 CCR control_response 和原 request 关联的稳定键。
+				payload: { path: ["response", "request_id"], equals: requestId },
+			},
+			select: { id: true },
+		});
+		return Boolean(row);
 	}
 
 	/**

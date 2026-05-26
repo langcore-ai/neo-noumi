@@ -11,9 +11,19 @@ export const CLAUDE_PROJECT_STATE_ROOT = "/root/.claude/projects";
  * @returns 可拼接到 /workspace 下的路径段
  */
 function normalizeProjectMountName(projectName: string, projectId: string): string {
-	const segment = projectName
-		.trim()
-		.replaceAll(/[\/\\\s\u0000-\u001f\u007f]/g, "-")
+	const segment = [...projectName.trim()]
+		.map((char) => {
+			const code = char.charCodeAt(0);
+			// s3fs 挂载点只需要规避路径分隔符、空白和控制字符，其他项目名字符保留。
+			return char === "/" ||
+				char === "\\" ||
+				/\s/u.test(char) ||
+				code <= 0x1f ||
+				code === 0x7f
+				? "-"
+				: char;
+		})
+		.join("")
 		.slice(0, 80);
 	// 空名称和特殊路径段都不能直接作为挂载点。
 	return segment && segment !== "." && segment !== ".." ? segment : projectId;
@@ -39,6 +49,15 @@ export function buildProjectWorkspaceMountPath(
  */
 export function buildProjectWorkspaceMountPrefix(projectId: string): string {
 	return `/${projectId}/`;
+}
+
+/**
+ * 判断是否跳过 workspace R2 挂载。
+ * @param value 环境变量值
+ * @returns 是否跳过 s3fs 挂载
+ */
+export function shouldSkipWorkspaceMount(value: string | undefined): boolean {
+	return value === "1";
 }
 
 /**

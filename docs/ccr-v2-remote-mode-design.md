@@ -201,7 +201,7 @@ Claude Code CLI in Cloudflare Container
 
 - 容器类需要 `interceptHttps = true`，否则 HTTPS 请求默认不会进入 outbound handler。
 - Worker entrypoint 必须 `export { ContainerProxy }`，否则 outbound interception 不生效。
-- 如果设置 `allowedHosts`，必须把 `beacon.claude-ai.staging.ant.dev` 放入 allowlist；`allowedHosts` 会先于 handler 判定。
+- 不要设置 `allowedHosts` 作为默认策略；`allowedHosts` 非空时会先于 handler 判定，未匹配 host 会被 520 拒绝。当前产品语义是默认放行互联网出站，只通过 `outboundByHost` 接管 `beacon.claude-ai.staging.ant.dev` 和 `api.anthropic.com` 等少量 host。
 - HTTPS 拦截启用后，Cloudflare 会在运行时注入 `/etc/cloudflare/certs/cloudflare-containers-ca.crt`，容器 entrypoint 需要把它加入系统 trust store，或通过 `NODE_EXTRA_CA_CERTS` 让 Node/Claude Code 信任它。
 - outbound handler 只拦截 HTTP/HTTPS；非 80/443 流量不会进入 handler。
 - 容器磁盘是 ephemeral，实例休眠后会从镜像 fresh disk 重启；workspace、Claude transcript、`.claude/skills`、settings 等持久化不能依赖容器本地盘。
@@ -215,9 +215,8 @@ export { ContainerProxy }
 
 export class ClaudeWorkerContainer extends Container {
   defaultPort = 8080
-  enableInternet = false
+  enableInternet = true
   interceptHttps = true
-  allowedHosts = ['beacon.claude-ai.staging.ant.dev']
 
   entrypoint = [
     'sh',
@@ -233,6 +232,9 @@ export class ClaudeWorkerContainer extends Container {
   static outboundByHost = {
     'beacon.claude-ai.staging.ant.dev': async (request, env) => {
       return env.CCR_ROUTE.fetch(request)
+    },
+    'api.anthropic.com': async (request, env) => {
+      return env.AI_PROXY.fetch(request)
     },
   }
 }
@@ -292,7 +294,7 @@ Claude Code CLI in Cloudflare Container
 
 - 基础会话：route 下发 user event，worker 写回 system/user/assistant/result/internal events，最终 result 成功落库。
 - route 侧 MCP 工具：route 先通过 `control_request.initialize` 注入 `sdkMcpServers: ["ccr-route"]`，Claude Code 随后通过 `mcp_message` 完成 `initialize`、`tools/list`、`tools/call`，route 在本进程执行 `ccr_echo` 并返回 `route-ok`。
-- 用户问询：Claude Code 调用 `AskUserQuestion` 时会先发出 `can_use_tool`，route 自动 allow 时必须返回 `updatedInput`，否则 Claude Code `2.1.120` 会因权限 schema 校验失败而拒绝工具调用。
+- 用户问询：Claude Code 调用受控工具时会先发出 `can_use_tool`；route 只负责持久化该请求，前端弹出权限申请，用户允许后通过 `POST /api/ccr/sessions/{sessionId}/tool-permission` 入队 `control_response`。allow 响应必须返回 `updatedInput`，否则 Claude Code `2.1.120` 会因权限 schema 校验失败而拒绝工具调用。
 - subagent：Claude Code 调用 Task/Agent 后，route 能记录 `task_started`、`task_notification`、tool result，以及带 `agent_id` 的 subagent internal events。
 - SSE 稳定性：真实 CLI 曾在 15 秒心跳下约 12 秒空闲断连；route 心跳调整为 5 秒后，复测日志未再出现 `Stream read error` 或 `socket connection was closed unexpectedly`。
 - 业务 chat API：`POST /api/ccr/sessions/{sessionId}/messages` 在 `Accept: text/event-stream` 下会先返回 `session` SSE frame，再写入用户消息、启动真实远程模式 Claude Code CLI，并在同一个请求里持续输出 `timeline` frame；收到 `result` 后返回 `done` 并结束本次前端长连接。所有 SSE 入口必须显式返回 `Content-Type: text/event-stream`、禁用缓存和 `no-transform`，不能只依赖普通 streaming body。
@@ -899,6 +901,14 @@ AgentTool / subagent
 - A 回填结果时应使用 `control_response`、tool result message，还是专用外部工具响应。
 - 回填后 `/worker/internal-events` 是否需要同步写入，避免 resume 丢失。
 
+现有 route-side MCP 测试工具：
+
+- Chat 输入入队时会先下发 `control_request.initialize`，声明 `sdkMcpServers: ["ccr-route"]`，让 Claude Code 初始化 route-side MCP server。
+- route 已实现最小 MCP JSON-RPC 处理器，支持 `initialize`、`tools/list`、`notifications/initialized` 和 `tools/call`。
+- 当前暴露给 Claude Code 的测试工具是 `AExternalToolTest`，它在 Worker route 进程内执行，返回一段包含 `ok`、`tool`、`sessionId` 和输入 `message` 的 JSON 文本。
+- `can_use_tool` 不做 route 侧自动授权；用户在 Chat 页选择允许或拒绝后，后端按原始 timeline 中的 request 构造 `control_response` 并投递给容器中的 Claude Code。
+- `bun run test:ccr-remote-tool -- --session-id <session-id> --base-url <origin>` 仍保留为低层协议测试脚本：它绕过 Claude，直接写入一条 assistant `tool_use` visible event、一条对应 internal event，并把 `/worker` 状态置为 `requires_action`，用于验证 route 侧 pending action 持久化。
+
 ## 会话和进程模型
 
 当前 remote-control 实现可以近似理解为：
@@ -1099,13 +1109,12 @@ Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metada
 - 启动前恢复 Claude local transcript 与 memory，并按是否存在历史 transcript 选择 `--session-id` 或 `--resume`。
 - 把 internal events 当前恢复窗口镜像到 `claude-code` sessionStore。
 
-### 尚未闭环的 A-side 外部工具
+### 已实现的 route-side MCP 测试工具
 
-- 定义一个 A-side mock tool。
-- 让 B 产生可等待的外部工具请求。
-- A 记录 request registry。
-- A 执行工具并通过 CCR stream 回填。
-- 验证 B 能继续当前 turn，且状态和 internal events 一致。
+- 通过 `control_request.initialize` 注入 `ccr-route` MCP server。
+- 处理 Claude Code 发出的 `mcp_message`，支持 `tools/list` 和 `tools/call`。
+- 暴露 `AExternalToolTest`，在 route 进程内执行并通过 `control_response` 回填结果。
+- `scripts/ccr-remote-tool-test.ts` 仍保留为 pending action 持久化的低层协议测试脚本。
 
 ## 风险
 

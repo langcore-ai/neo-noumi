@@ -1,0 +1,93 @@
+import { isJsonObject } from "./ccr-json";
+import type { JsonObject } from "./ccr-types";
+
+/** route 侧 MCP server 名称，必须和初始化注入的 sdkMcpServers 保持一致。 */
+export const ROUTE_MCP_SERVER_NAME = "ccr-route";
+
+/** Claude Code 可见的测试工具名。 */
+export const A_EXTERNAL_TOOL_TEST_NAME = "AExternalToolTest";
+
+/** route 侧工具执行上下文。 */
+export interface RouteToolContext {
+	/** 当前 CCR session ID。 */
+	sessionId: string;
+}
+
+/** route 侧工具定义。 */
+interface RouteToolDefinition {
+	/** 工具名，对外暴露给 MCP tools/list。 */
+	name: string;
+	/** 工具描述。 */
+	description: string;
+	/** MCP inputSchema。 */
+	inputSchema: JsonObject;
+	/** 工具执行函数。 */
+	call: (input: JsonObject, context: RouteToolContext) => Promise<string>;
+}
+
+/** route 侧内置工具列表。 */
+const ROUTE_TOOLS: RouteToolDefinition[] = [
+	{
+		name: A_EXTERNAL_TOOL_TEST_NAME,
+		description:
+			"Test route-side remote tool. Echoes a small message from the Neo Noumi CCR route process.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				message: { type: "string" },
+			},
+		},
+		async call(input, context) {
+			// 测试工具只回显输入和 session，避免默认 route-side 工具具备高风险能力。
+			return JSON.stringify({
+				ok: true,
+				tool: A_EXTERNAL_TOOL_TEST_NAME,
+				sessionId: context.sessionId,
+				message: typeof input.message === "string" ? input.message : "ccr remote tool ping",
+			});
+		},
+	},
+];
+
+/**
+ * 列出 route 侧 MCP 工具。
+ * @returns MCP tool definition 列表
+ */
+export function listRouteTools(): JsonObject[] {
+	return ROUTE_TOOLS.map((tool) => ({
+		name: tool.name,
+		description: tool.description,
+		inputSchema: tool.inputSchema,
+	}));
+}
+
+/**
+ * 执行 route 侧 MCP 工具。
+ * @param name 工具名
+ * @param input 工具输入
+ * @param context 执行上下文
+ * @returns MCP CallToolResult
+ */
+export async function callRouteTool(
+	name: string,
+	input: unknown,
+	context: RouteToolContext,
+): Promise<JsonObject> {
+	const tool = ROUTE_TOOLS.find((item) => item.name === name);
+	if (!tool) {
+		return {
+			content: [{ type: "text", text: `Unknown route tool: ${name}` }],
+			isError: true,
+		};
+	}
+
+	try {
+		const text = await tool.call(isJsonObject(input) ? input : {}, context);
+		return { content: [{ type: "text", text }] };
+	} catch (error) {
+		return {
+			content: [{ type: "text", text: `Route tool failed: ${String(error)}` }],
+			isError: true,
+		};
+	}
+}

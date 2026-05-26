@@ -101,6 +101,75 @@ describe("mergeJsonObject", () => {
 	});
 });
 
+describe("CcrStore tool permission lookup", () => {
+	test("finds can_use_tool request with targeted JSON path query", async () => {
+		const calls: unknown[] = [];
+		const store = createStoreFromFakePrisma({
+			chatWorkerEvent: {
+				findFirst: async (args: unknown) => {
+					calls.push(args);
+					return {
+						payload: {
+							type: "control_request",
+							request_id: "request-1",
+							request: {
+								subtype: "can_use_tool",
+								tool_name: "Bash",
+								input: { command: "pwd" },
+							},
+						},
+					};
+				},
+			},
+		});
+
+		await expect(
+			store.findToolPermissionRequest("session-1", "request-1"),
+		).resolves.toEqual({
+			subtype: "can_use_tool",
+			tool_name: "Bash",
+			input: { command: "pwd" },
+		});
+		expect(calls).toEqual([
+			{
+				where: {
+					sessionId: "session-1",
+					eventType: "control_request",
+					payload: { path: ["request_id"], equals: "request-1" },
+				},
+				orderBy: { id: "desc" },
+				select: { payload: true },
+			},
+		]);
+	});
+
+	test("checks existing permission response with targeted JSON path query", async () => {
+		const calls: unknown[] = [];
+		const store = createStoreFromFakePrisma({
+			chatClientEvent: {
+				findFirst: async (args: unknown) => {
+					calls.push(args);
+					return { id: 1 };
+				},
+			},
+		});
+
+		await expect(
+			store.hasToolPermissionResponse("session-1", "request-1"),
+		).resolves.toBe(true);
+		expect(calls).toEqual([
+			{
+				where: {
+					sessionId: "session-1",
+					eventType: "control_response",
+					payload: { path: ["response", "request_id"], equals: "request-1" },
+				},
+				select: { id: true },
+			},
+		]);
+	});
+});
+
 describe("normalizeAiProxyCredentialInput", () => {
 	test("normalizes AI proxy credential defaults and /v1 base URL", () => {
 		expect(

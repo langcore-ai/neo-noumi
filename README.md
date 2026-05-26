@@ -45,13 +45,35 @@ A live deployment of this template is available at:
 Install dependencies:
 
 ```bash
-npm install
+bun install
 ```
+
+Start the local PostgreSQL database:
+
+```bash
+docker run --name neo-noumi-postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=neo_noumi \
+  -p 5432:5432 \
+  -v neo-noumi-postgres-data:/var/lib/postgresql \
+  -d postgres:18-alpine
+```
+
+Run database migrations:
+
+```bash
+bun run prisma:migrate
+```
+
+For local Docker sandbox development, keep `NEO_NOUMI_DISABLE_WORKSPACE_MOUNT="1"` in `.env`.
+The Cloudflare sandbox container used by `bun dev` does not expose `/dev/fuse`, so local chat
+uses a plain workspace directory instead of the production R2/s3fs mount.
 
 Start the development server with:
 
 ```bash
-npm run dev
+bun run dev
 ```
 
 Your application will be available at [http://localhost:5173](http://localhost:5173).

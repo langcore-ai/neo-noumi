@@ -85,8 +85,20 @@ import { authClient } from "@/lib/auth-client";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/chat")({
+	validateSearch: (search): ChatSearch => ({
+		projectId: typeof search.projectId === "string" ? search.projectId : undefined,
+		sessionId: typeof search.sessionId === "string" ? search.sessionId : undefined,
+	}),
 	component: ChatPage,
 });
+
+/** Chat 页 URL 查询参数。 */
+interface ChatSearch {
+	/** 初始选中的 project ID；没有 sessionId 时表示打开该 project 的新对话。 */
+	projectId?: string;
+	/** 初始选中的 session ID。 */
+	sessionId?: string;
+}
 
 /** CCR 会话摘要。 */
 interface ChatSession {
@@ -137,6 +149,22 @@ interface ChatMessage {
 	status?: "pending" | "streaming" | "done" | "error";
 	meta?: string;
 	raw?: unknown;
+}
+
+/** Claude Code 工具权限申请。 */
+interface ToolPermissionRequest {
+	/** control request ID。 */
+	requestId: string;
+	/** Claude Code 申请调用的工具名。 */
+	toolName: string;
+	/** Claude Code tool_use ID。 */
+	toolUseId: string;
+	/** 工具入参。 */
+	input: Record<string, unknown>;
+	/** 对应 timeline 事件 ID。 */
+	eventId: number;
+	/** 申请创建时间。 */
+	createdAt: string;
 }
 
 /** 会话详情接口响应。 */
@@ -346,6 +374,78 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * 从 timeline 事件中提取工具权限申请。
+ * @param event timeline 事件
+ * @returns 工具权限申请；非 can_use_tool 时返回 null
+ */
+function readToolPermissionRequest(event: TimelineEvent): ToolPermissionRequest | null {
+	const payload = isRecord(event.payload) ? event.payload : null;
+	const request = isRecord(payload?.request) ? payload.request : null;
+	if (
+		payload?.type !== "control_request" ||
+		request?.subtype !== "can_use_tool" ||
+		typeof payload.request_id !== "string"
+	) {
+		return null;
+	}
+	return {
+		requestId: payload.request_id,
+		toolName: typeof request.tool_name === "string" ? request.tool_name : "unknown",
+		toolUseId: typeof request.tool_use_id === "string" ? request.tool_use_id : "",
+		input: isRecord(request.input) ? request.input : {},
+		eventId: event.id,
+		createdAt: event.created_at,
+	};
+}
+
+/**
+ * 判断指定权限申请是否已经有用户响应。
+ * @param clientEvents client events
+ * @param requestId control request ID
+ * @returns 是否已经响应
+ */
+function hasToolPermissionResponse(
+	clientEvents: ClientEvent[],
+	requestId: string,
+): boolean {
+	return clientEvents.some((event) => {
+		const payload = isRecord(event.payload) ? event.payload : null;
+		const response = isRecord(payload?.response) ? payload.response : null;
+		return (
+			payload?.type === "control_response" &&
+			typeof response?.request_id === "string" &&
+			response.request_id === requestId
+		);
+	});
+}
+
+/**
+ * 查找当前仍待用户决策的工具权限申请。
+ * @param timeline worker timeline
+ * @param clientEvents client events
+ * @param handledRequestIds 当前页面已提交的 request ID
+ * @returns 最新的待处理权限申请
+ */
+function findPendingToolPermissionRequest(
+	timeline: TimelineEvent[],
+	clientEvents: ClientEvent[],
+	handledRequestIds: Set<string>,
+): ToolPermissionRequest | null {
+	const requests = timeline
+		.map(readToolPermissionRequest)
+		.filter((request): request is ToolPermissionRequest => Boolean(request))
+		.sort((a, b) => b.eventId - a.eventId);
+	return (
+		requests.find((request) => {
+			return (
+				!handledRequestIds.has(request.requestId) &&
+				!hasToolPermissionResponse(clientEvents, request.requestId)
+			);
+		}) ?? null
+	);
+}
+
+/**
  * 把未知内容转成适合消息气泡展示的文本。
  * @param value 原始内容
  * @returns 展示文本
@@ -471,6 +571,8 @@ function clientEventToMessage(event: ClientEvent): ChatMessage | null {
 function isSupportTimelineEvent(event: TimelineEvent): boolean {
 	return [
 		"system",
+		"control_request",
+		"control_response",
 		"tool_use",
 		"tool_result",
 		"thinking",
@@ -497,6 +599,29 @@ function timelineEventToMessage(event: TimelineEvent): ChatMessage {
 		meta: displayType,
 		raw: event.payload,
 	};
+}
+
+/**
+ * 生成控制事件的折叠摘要。
+ * @param raw 原始 timeline payload
+ * @param meta 控制事件类型
+ * @returns 控制事件摘要
+ */
+function getControlEventSummary(raw: unknown, meta: string | undefined): string {
+	if (!isRecord(raw)) {
+		return meta === "control_response" ? "控制响应" : "控制请求";
+	}
+	if (meta === "control_response") {
+		const response = isRecord(raw.response) ? raw.response : null;
+		const subtype = typeof response?.subtype === "string" ? response.subtype : "unknown";
+		const requestId =
+			typeof response?.request_id === "string" ? ` · ${response.request_id}` : "";
+		return `控制响应：${subtype}${requestId}`;
+	}
+	const request = isRecord(raw.request) ? raw.request : null;
+	const subtype = typeof request?.subtype === "string" ? request.subtype : "unknown";
+	const requestId = typeof raw.request_id === "string" ? ` · ${raw.request_id}` : "";
+	return `控制请求：${subtype}${requestId}`;
 }
 
 /**
@@ -536,7 +661,7 @@ function buildMessages(
 		const message = clientEventToMessage(event);
 		return message ? [message] : [];
 	});
-		// 用户消息由 client events 恢复，timeline 中的 user 回显不再重复展示。
+	// 用户消息由 client events 恢复，timeline 中的 user 回显不再重复展示。
 	const workerMessages = timeline
 		.filter((event) => event.event_type !== "user")
 		.map(timelineEventToMessage);
@@ -606,6 +731,8 @@ function parseSseJson(data: string): Record<string, unknown> {
  */
 function ChatPage() {
 	const authSession = authClient.useSession();
+	const initialSearch = Route.useSearch();
+	const bootstrappedUserIdRef = useRef<string | null>(null);
 	const streamAbortRef = useRef<AbortController | null>(null);
 	const timelineIdsRef = useRef<Set<number>>(new Set());
 	const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -627,6 +754,7 @@ function ChatPage() {
 		createEmptyWorkspaceTree,
 	);
 	const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+	const [hasLoadedWorkspaceTree, setHasLoadedWorkspaceTree] = useState(false);
 	const [isWorkspaceLoading, setIsWorkspaceLoading] = useState(false);
 	const [isWorkspaceMutating, setIsWorkspaceMutating] = useState(false);
 	const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
@@ -637,6 +765,11 @@ function ChatPage() {
 		useState<CreateDirectoryTarget | null>(null);
 	const [createDirectoryValue, setCreateDirectoryValue] = useState("新建文件夹");
 	const [uploadTarget, setUploadTarget] = useState<UploadTarget | null>(null);
+	const [handledPermissionRequestIds, setHandledPermissionRequestIds] = useState<Set<string>>(
+		() => new Set(),
+	);
+	const [isPermissionSubmitting, setIsPermissionSubmitting] = useState(false);
+	const [permissionError, setPermissionError] = useState<string | null>(null);
 
 	const workspaceTree = useTree<WorkspaceTreeItem>({
 		dataLoader: {
@@ -663,9 +796,18 @@ function ChatPage() {
 		return buildMessages(clientEvents, timeline);
 	}, [clientEvents, timeline]);
 
+	const pendingPermissionRequest = useMemo(() => {
+		return findPendingToolPermissionRequest(
+			timeline,
+			clientEvents,
+			handledPermissionRequestIds,
+		);
+	}, [clientEvents, handledPermissionRequestIds, timeline]);
+
 	const latestSessionTitle = session?.title || DEFAULT_SESSION_TITLE;
 	const activeFileTab = openFileTabs.find((tab) => tab.path === activeFilePath) ?? null;
 	const hasPreviewPanel = Boolean(activeFileTab);
+	const authUserId = authSession.data?.user.id;
 	const truncatedWorkspaceItems = Object.values(workspaceItems).filter(
 		(item) => item.type === "directory" && item.isTruncated,
 	);
@@ -688,6 +830,8 @@ function ChatPage() {
 		setClientEvents([]);
 		setTimeline([]);
 		setContainerStatus(null);
+		setHandledPermissionRequestIds(new Set());
+		setPermissionError(null);
 		timelineIdsRef.current = new Set();
 	}
 
@@ -766,18 +910,19 @@ function ChatPage() {
 						isLoaded: node.type === "file" ? true : (previous?.isLoaded ?? false),
 					};
 				}
-					nextItems[parentId] = {
-						...(nextItems[parentId] ?? {
-							name: prefix ? prefix.split("/").pop() ?? prefix : "workspace",
-							path: prefix,
-							type: "directory",
-						}),
-						children: childIds,
-						isLoaded: true,
-						isTruncated: body.workspace.truncated,
-					};
-					return nextItems;
-				});
+				nextItems[parentId] = {
+					...(nextItems[parentId] ?? {
+						name: prefix ? prefix.split("/").pop() ?? prefix : "workspace",
+						path: prefix,
+						type: "directory",
+					}),
+					children: childIds,
+					isLoaded: true,
+					isTruncated: body.workspace.truncated,
+				};
+				return nextItems;
+			});
+			setHasLoadedWorkspaceTree(true);
 		} catch (err) {
 			setWorkspaceError(err instanceof Error ? err.message : "加载文件树失败");
 		} finally {
@@ -803,6 +948,7 @@ function ChatPage() {
 		setProject(nextProject);
 		resetConversation();
 		setWorkspaceItems(createEmptyWorkspaceTree());
+		setHasLoadedWorkspaceTree(false);
 		setOpenFileTabs([]);
 		setActiveFilePath(null);
 		setWorkspaceError(null);
@@ -1062,6 +1208,49 @@ function ChatPage() {
 	}
 
 	/**
+	 * 提交 Claude Code 工具权限决策。
+	 * @param request 权限申请
+	 * @param decision 用户决策
+	 */
+	async function submitToolPermissionDecision(
+		request: ToolPermissionRequest,
+		decision: "allow" | "deny",
+	) {
+		if (!session) {
+			return;
+		}
+		setIsPermissionSubmitting(true);
+		setPermissionError(null);
+		try {
+			const response = await fetch(`/api/ccr/sessions/${session.id}/tool-permission`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					requestId: request.requestId,
+					decision,
+				}),
+			});
+			if (!response.ok) {
+				throw new Error(await readError(response));
+			}
+			const body = (await response.json()) as { event?: ClientEvent };
+			setHandledPermissionRequestIds((current) => {
+				const next = new Set(current);
+				// 响应已写入 client event 队列，本地先标记避免弹窗重复阻塞。
+				next.add(request.requestId);
+				return next;
+			});
+			if (body.event) {
+				setClientEvents((current) => [...current, body.event as ClientEvent]);
+			}
+		} catch (err) {
+			setPermissionError(err instanceof Error ? err.message : "权限响应提交失败");
+		} finally {
+			setIsPermissionSubmitting(false);
+		}
+	}
+
+	/**
 	 * 自动确保有可发送消息的会话。
 	 * @param firstMessage 第一条消息内容，用作会话标题
 	 * @returns session
@@ -1308,20 +1497,38 @@ function ChatPage() {
 	}
 
 	useEffect(() => {
-		if (authSession.isPending || !authSession.data) {
+		if (authSession.isPending || !authUserId) {
+			if (!authSession.isPending) {
+				bootstrappedUserIdRef.current = null;
+				setIsBootstrapping(false);
+			}
 			return;
 		}
+		if (bootstrappedUserIdRef.current === authUserId) {
+			return;
+		}
+		bootstrappedUserIdRef.current = authUserId;
+		setIsBootstrapping(true);
 		void (async () => {
 			try {
 				const loadedProjects = await loadProjects();
-				const firstProject = loadedProjects[0];
-				const loadedSessions = await loadSessions(firstProject?.id);
-				if (firstProject) {
-					setProject(firstProject);
-					await loadWorkspaceTree(firstProject.id);
+				const selectedProject =
+					loadedProjects.find((item) => item.id === initialSearch.projectId) ??
+					loadedProjects[0];
+				const loadedSessions = await loadSessions(selectedProject?.id);
+				if (selectedProject) {
+					setProject(selectedProject);
+					setWorkspaceItems(createEmptyWorkspaceTree());
+					setHasLoadedWorkspaceTree(false);
+					// 初始化选定 project 后加载根目录；后续目录展开仍按需加载子目录。
+					await loadWorkspaceTree(selectedProject.id);
 				}
-				if (loadedSessions[0]) {
+				if (initialSearch.sessionId) {
+					await loadSession(initialSearch.sessionId);
+				} else if (!initialSearch.projectId && loadedSessions[0]) {
 					await loadSession(loadedSessions[0].id);
+				} else {
+					resetConversation();
 				}
 			} catch (err) {
 				setError(err instanceof Error ? err.message : String(err));
@@ -1330,18 +1537,18 @@ function ChatPage() {
 			}
 		})();
 		return () => closeTimelineStream();
-		// 初始化流程只应执行一次；loader 使用当前闭包避免重复选择首个会话。
+		// 初始化按 userId 去重；loader 使用当前闭包避免重复选择首个会话。
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [authSession.isPending, authSession.data]);
+	}, [authSession.isPending, authUserId]);
 
 	useEffect(() => {
-		if (isBootstrapping || authSession.isPending || !authSession.data) {
+		if (isBootstrapping || authSession.isPending || !authUserId) {
 			return;
 		}
 		void loadSessions(project?.id).catch((err) => {
 			setError(err instanceof Error ? err.message : String(err));
 		});
-	}, [project?.id, isBootstrapping, authSession.isPending, authSession.data]);
+	}, [project?.id, isBootstrapping, authSession.isPending, authUserId]);
 
 	useEffect(() => {
 		messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -1596,14 +1803,16 @@ function ChatPage() {
 												</ContextMenu>
 											);
 										})}
-								</Tree>
-								{!isWorkspaceLoading &&
-								!workspaceError &&
-								workspaceItems[WORKSPACE_ROOT_ID]?.children?.length === 0 ? (
-									<div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-										当前工作区还没有文件。
-									</div>
-								) : null}
+									</Tree>
+									{!isWorkspaceLoading &&
+									!workspaceError &&
+									workspaceItems[WORKSPACE_ROOT_ID]?.children?.length === 0 ? (
+										<div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+											{hasLoadedWorkspaceTree
+												? "当前工作区还没有文件。"
+												: "点击刷新加载工作区文件。"}
+										</div>
+									) : null}
 										</div>
 									</ScrollArea>
 								</ContextMenuTrigger>
@@ -1913,6 +2122,62 @@ function ChatPage() {
 				</ResizablePanel>
 			</ResizablePanelGroup>
 
+			<Dialog open={Boolean(pendingPermissionRequest)} onOpenChange={() => undefined}>
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle>允许 Claude Code 调用工具？</DialogTitle>
+						<DialogDescription>
+							{pendingPermissionRequest?.toolName ?? "unknown"}
+						</DialogDescription>
+					</DialogHeader>
+					{permissionError ? (
+						<Alert variant="destructive">
+							<AlertTitle>提交失败</AlertTitle>
+							<AlertDescription>{permissionError}</AlertDescription>
+						</Alert>
+					) : null}
+					<div className="grid gap-2">
+						<div className="flex items-center justify-between gap-3 text-sm">
+							<span className="text-muted-foreground">Tool Use ID</span>
+							<span className="truncate font-mono">
+								{pendingPermissionRequest?.toolUseId || "-"}
+							</span>
+						</div>
+						<pre className="max-h-64 overflow-auto rounded-lg bg-muted p-3 text-xs">
+							{JSON.stringify(pendingPermissionRequest?.input ?? {}, null, 2)}
+						</pre>
+					</div>
+					<DialogFooter>
+						<Button
+							variant="outline"
+							disabled={isPermissionSubmitting || !pendingPermissionRequest}
+							onClick={() => {
+								if (pendingPermissionRequest) {
+									void submitToolPermissionDecision(pendingPermissionRequest, "deny");
+								}
+							}}
+						>
+							拒绝
+						</Button>
+						<Button
+							disabled={isPermissionSubmitting || !pendingPermissionRequest}
+							onClick={() => {
+								if (pendingPermissionRequest) {
+									void submitToolPermissionDecision(pendingPermissionRequest, "allow");
+								}
+							}}
+						>
+							{isPermissionSubmitting ? (
+								<Loader2Icon data-icon="inline-start" className="animate-spin" />
+							) : (
+								<CheckCircle2Icon data-icon="inline-start" />
+							)}
+							允许
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
 			<Dialog
 				open={Boolean(renamingTarget)}
 				onOpenChange={(open) => {
@@ -2058,8 +2323,13 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 	const isTool = message.role === "tool";
 	const isThinking = message.meta === "thinking";
 	const isToolUse = message.meta === "tool_use";
+	const isControlEvent =
+		message.meta === "control_request" || message.meta === "control_response";
 	const isCollapsedRawEvent =
-		isTool && ["system", "result", "thinking", "tool_use"].includes(message.meta ?? "");
+		isTool &&
+		["system", "result", "thinking", "tool_use", "control_request", "control_response"].includes(
+			message.meta ?? "",
+		);
 	return (
 		<article
 			className={cn(
@@ -2095,7 +2365,9 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 							? message.content
 							: isToolUse
 								? getToolUseSummary(message.raw)
-								: `原始事件状态：${message.status ?? "done"}`}
+								: isControlEvent
+									? getControlEventSummary(message.raw, message.meta)
+									: `原始事件状态：${message.status ?? "done"}`}
 					</p>
 				) : (
 					<p className="whitespace-pre-wrap break-words leading-6">{message.content}</p>

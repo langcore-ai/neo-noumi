@@ -5,6 +5,7 @@ import {
 	CheckCircle2Icon,
 	CloudIcon,
 	FolderKanbanIcon,
+	HomeIcon,
 	MessageSquareIcon,
 	RefreshCwIcon,
 	ShieldIcon,
@@ -70,6 +71,12 @@ const STACK_ITEMS = [
 	{ label: "Cloudflare Worker", value: "通过 API 按钮验证" },
 ];
 
+/** 首页顶部主导航。 */
+const NAV_ITEMS = [
+	{ label: "首页", to: "/", icon: HomeIcon },
+	{ label: "Project", to: "/projects", icon: FolderKanbanIcon },
+] as const;
+
 /**
  * 测试首页。
  * @returns 测试入口聚合页面
@@ -107,7 +114,36 @@ function App() {
 
 	return (
 		<main className="min-h-screen bg-background text-foreground">
-			<section className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6 py-8 md:py-12">
+			<section className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6 py-6 md:py-8">
+				<nav className="flex min-h-14 flex-col gap-3 border-b pb-4 md:flex-row md:items-center md:justify-between">
+					<Link to="/" className="flex w-fit items-center gap-2 font-semibold">
+						<CloudIcon className="size-5" />
+						Neo Noumi
+					</Link>
+					<div className="flex flex-wrap items-center gap-2">
+						{NAV_ITEMS.map((item) => {
+							const Icon = item.icon;
+
+							return (
+								<Link
+									key={item.to}
+									to={item.to}
+									activeOptions={{ exact: item.to === "/" }}
+									activeProps={{
+										className: "bg-primary text-primary-foreground",
+									}}
+									inactiveProps={{
+										className: "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+									}}
+									className="inline-flex h-9 items-center gap-2 rounded-md px-3 text-sm font-medium transition-colors"
+								>
+									<Icon className="size-4" />
+									{item.label}
+								</Link>
+							);
+						})}
+					</div>
+				</nav>
 				<header className="flex flex-col gap-6 rounded-xl border bg-card p-6 text-card-foreground shadow-sm md:p-8">
 					<div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
 						<div className="flex max-w-3xl flex-col gap-4">

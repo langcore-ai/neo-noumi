@@ -7,6 +7,20 @@ import { createPrismaClient } from "./prisma";
 /** Better Auth session 缓存在 AUTH_KV 下使用的目录。 */
 const BETTER_AUTH_CACHE_KEY_PREFIX = ["auth", "session"] as const;
 
+/** Better Auth 数据库 ID 允许的字符集；保持小写以兼容 Sandbox hostname。 */
+const BETTER_AUTH_ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+/** Better Auth 数据库 ID 默认长度；32 位 base36 具备足够的碰撞安全余量。 */
+const BETTER_AUTH_ID_SIZE = 32;
+
+/** Vite 本地开发常用 origin，避免端口漂移后注册和登录被 Better Auth 拦截。 */
+const LOCAL_DEV_TRUSTED_ORIGINS = [
+	"http://localhost:5173",
+	"http://localhost:5174",
+	"http://127.0.0.1:5173",
+	"http://127.0.0.1:5174",
+];
+
 /**
  * 生成 Better Auth session cache key。
  * @param key Better Auth secondary storage 传入的原始 key
@@ -59,6 +73,46 @@ function getDatabaseUrl(env: AuthBindings): string {
 }
 
 /**
+ * 读取 Better Auth 可信 origin。
+ * @param baseUrl Better Auth 对外 URL
+ * @returns 去重后的可信 origin 列表
+ */
+export function readTrustedOrigins(baseUrl: string): string[] {
+	const origins = new Set([baseUrl]);
+	const url = new URL(baseUrl);
+	if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
+		// 本地 Vite 会在端口占用时自动递增端口，认证 origin 也要允许同机开发端口。
+		for (const origin of LOCAL_DEV_TRUSTED_ORIGINS) {
+			origins.add(origin);
+		}
+	}
+	return [...origins];
+}
+
+/**
+ * 生成 Better Auth 数据库记录 ID。
+ * @param options Better Auth 传入的模型名和可选长度
+ * @returns 仅包含数字和小写字母的随机 ID
+ */
+export function generateBetterAuthDatabaseId(options: {
+	/** Better Auth 模型名，用于未来按模型分流；当前所有模型统一使用小写 ID。 */
+	model: string;
+	/** Better Auth 指定的 ID 长度；未指定时使用项目默认长度。 */
+	size?: number;
+}): string {
+	const size = options.size ?? BETTER_AUTH_ID_SIZE;
+	const bytes = new Uint8Array(size);
+	crypto.getRandomValues(bytes);
+
+	let id = "";
+	for (const byte of bytes) {
+		// 使用取模映射到 base36 字符集，确保不会产生大写字母或符号。
+		id += BETTER_AUTH_ID_ALPHABET[byte % BETTER_AUTH_ID_ALPHABET.length];
+	}
+	return id;
+}
+
+/**
  * 创建 Cloudflare KV secondary storage。
  * @param kv Cloudflare KV namespace
  * @returns Better Auth secondary storage 实现
@@ -103,8 +157,13 @@ export function createAuth(env: AuthBindings) {
 		emailAndPassword: {
 			enabled: true,
 		},
+		advanced: {
+			database: {
+				generateId: generateBetterAuthDatabaseId,
+			},
+		},
 		secondaryStorage: createKvSecondaryStorage(env.AUTH_KV),
 		plugins: [username()],
-		trustedOrigins: [env.BETTER_AUTH_URL],
+		trustedOrigins: readTrustedOrigins(env.BETTER_AUTH_URL),
 	});
 }

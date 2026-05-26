@@ -3,6 +3,7 @@ import {
 	buildClaudeProjectStateDir,
 	buildProjectWorkspaceMountPrefix,
 	buildProjectWorkspaceMountPath,
+	shouldSkipWorkspaceMount,
 } from "../src/worker/lib/ccr-workspace-mount";
 
 describe("buildProjectWorkspaceMountPath", () => {
@@ -40,5 +41,13 @@ describe("buildClaudeProjectStateDir", () => {
 		expect(buildClaudeProjectStateDir("/workspace/A")).toBe(
 			"/root/.claude/projects/-workspace-A",
 		);
+	});
+});
+
+describe("shouldSkipWorkspaceMount", () => {
+	test("only skips R2 workspace mounting when local override is explicit", () => {
+		expect(shouldSkipWorkspaceMount("1")).toBe(true);
+		expect(shouldSkipWorkspaceMount("0")).toBe(false);
+		expect(shouldSkipWorkspaceMount(undefined)).toBe(false);
 	});
 });
