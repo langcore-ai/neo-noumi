@@ -9,18 +9,12 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as ShadcnRouteImport } from './routes/shadcn'
 import { Route as RegisterRouteImport } from './routes/register'
 import { Route as ProjectsRouteImport } from './routes/projects'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as ChatRouteImport } from './routes/chat'
 import { Route as IndexRouteImport } from './routes/index'
 
-const ShadcnRoute = ShadcnRouteImport.update({
-  id: '/shadcn',
-  path: '/shadcn',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const RegisterRoute = RegisterRouteImport.update({
   id: '/register',
   path: '/register',
@@ -53,7 +47,6 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/projects': typeof ProjectsRoute
   '/register': typeof RegisterRoute
-  '/shadcn': typeof ShadcnRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -61,7 +54,6 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/projects': typeof ProjectsRoute
   '/register': typeof RegisterRoute
-  '/shadcn': typeof ShadcnRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -70,21 +62,13 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/projects': typeof ProjectsRoute
   '/register': typeof RegisterRoute
-  '/shadcn': typeof ShadcnRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/chat' | '/login' | '/projects' | '/register' | '/shadcn'
+  fullPaths: '/' | '/chat' | '/login' | '/projects' | '/register'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/chat' | '/login' | '/projects' | '/register' | '/shadcn'
-  id:
-    | '__root__'
-    | '/'
-    | '/chat'
-    | '/login'
-    | '/projects'
-    | '/register'
-    | '/shadcn'
+  to: '/' | '/chat' | '/login' | '/projects' | '/register'
+  id: '__root__' | '/' | '/chat' | '/login' | '/projects' | '/register'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -93,18 +77,10 @@ export interface RootRouteChildren {
   LoginRoute: typeof LoginRoute
   ProjectsRoute: typeof ProjectsRoute
   RegisterRoute: typeof RegisterRoute
-  ShadcnRoute: typeof ShadcnRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/shadcn': {
-      id: '/shadcn'
-      path: '/shadcn'
-      fullPath: '/shadcn'
-      preLoaderRoute: typeof ShadcnRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/register': {
       id: '/register'
       path: '/register'
@@ -149,7 +125,6 @@ const rootRouteChildren: RootRouteChildren = {
   LoginRoute: LoginRoute,
   ProjectsRoute: ProjectsRoute,
   RegisterRoute: RegisterRoute,
-  ShadcnRoute: ShadcnRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

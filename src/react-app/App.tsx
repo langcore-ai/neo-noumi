@@ -9,7 +9,6 @@ import {
 	MessageSquareIcon,
 	RefreshCwIcon,
 	ShieldIcon,
-	SparklesIcon,
 	UserPlusIcon,
 } from "lucide-react";
 import { useState } from "react";
@@ -40,13 +39,6 @@ const FEATURE_LINKS = [
 		to: "/register",
 		icon: UserPlusIcon,
 		variant: "default" as const,
-	},
-	{
-		title: "组件示例",
-		description: "查看 shadcn 组件在当前主题下的表现。",
-		to: "/shadcn",
-		icon: SparklesIcon,
-		variant: "outline" as const,
 	},
 	{
 		title: "CCR Chat",
