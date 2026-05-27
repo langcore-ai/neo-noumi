@@ -1063,12 +1063,18 @@ function ChatPage() {
 	]);
 
 	useEffect(() => {
+		if (isBootstrapping) {
+			return;
+		}
 		if (!forceStickToBottomRef.current && !shouldStickToBottomRef.current) {
 			return;
 		}
-		scrollChatToBottom();
-		forceStickToBottomRef.current = false;
-	}, [messages.length, isSending, scrollChatToBottom]);
+		const animationFrame = requestAnimationFrame(() => {
+			scrollChatToBottom();
+			forceStickToBottomRef.current = false;
+		});
+		return () => cancelAnimationFrame(animationFrame);
+	}, [messages.length, isSending, isBootstrapping, scrollChatToBottom]);
 
 	if (authSession.isPending) {
 		return (
