@@ -1,5 +1,5 @@
 import { getSandbox, type Sandbox } from "@cloudflare/sandbox";
-import { buildUserContainerSandboxId } from "./container-identity";
+import { buildUserContainerId } from "./container-identity";
 
 /** 用户级 Sandbox Durable Object 绑定。 */
 export type UserContainerSandboxBindings = {
@@ -8,16 +8,16 @@ export type UserContainerSandboxBindings = {
 };
 
 /**
- * 获取用户级容器的 Sandbox client。
+ * 获取用户级容器对象。
  * @param namespace Sandbox Durable Object namespace
  * @param userId 登录用户 ID
  * @returns 可执行容器操作的 Sandbox client
  */
-export function getUserContainerSandbox<TSandbox extends Sandbox<unknown>>(
+export function getUserContainer<TSandbox extends Sandbox<unknown>>(
 	namespace: DurableObjectNamespace<TSandbox>,
 	userId: string,
 ) {
-	return getSandbox(namespace, buildUserContainerSandboxId(userId));
+	return getSandbox(namespace, buildUserContainerId(userId));
 }
 
 /**
@@ -30,8 +30,8 @@ export async function destroyUserContainerSandbox<TSandbox extends Sandbox<unkno
 	namespace: DurableObjectNamespace<TSandbox>,
 	userId: string,
 ): Promise<string> {
-	const sandboxId = buildUserContainerSandboxId(userId);
-	const sandbox = getUserContainerSandbox(namespace, userId);
+	const sandboxId = buildUserContainerId(userId);
+	const sandbox = getUserContainer(namespace, userId);
 	// destroy 是容器基础能力，业务层负责清理自己的数据库状态。
 	await sandbox.destroy();
 	return sandboxId;

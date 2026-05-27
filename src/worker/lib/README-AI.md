@@ -9,8 +9,8 @@
 ## 模块结构
 
 - 通用容器能力：
-  - `container-identity.ts` 负责用户级 sandbox ID 规则。
-  - `container-sandbox.ts` 负责 Sandbox client 获取、用户级容器销毁等容器基础操作。
+  - `container-identity.ts` 负责用户级 container ID 规则。
+  - `container-sandbox.ts` 负责根据用户 ID 获取容器对象、用户级容器销毁等容器基础操作。
   - `container-terminal.ts` 只负责终端 session ID 默认值和校验。
   - `container-routes.ts` 是通用容器管理 API 入口，不能依赖 `ccr-sandbox.ts`。
 - 通用 JSON 和请求能力：
@@ -45,6 +45,6 @@
 
 - 新增的通用模块是否没有 import `ccr-*`。
 - 新增的 `ccr-*` 代码是否只组合通用能力和 CCR 业务规则。
-- 是否存在重复拼接 `neo-noumi-user-{userId}`；应统一调用 `buildUserContainerSandboxId()`。
+- 是否存在重复拼接 `{namespace}-{userId}`；应统一调用 `buildUserContainerId()`。
 - 是否把 JSON、路径、容器等基础工具错误放进了 CCR 命名文件。
 - 删除或移动模块后，使用 `rg "旧模块名|from \"./ccr"` 检查残留反向依赖。

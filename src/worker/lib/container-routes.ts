@@ -1,7 +1,7 @@
 import type { Context, Hono } from "hono";
 import { createAuth, type AuthBindings } from "./auth";
 import {
-	getUserContainerSandbox,
+	getUserContainer,
 	type UserContainerSandboxBindings,
 } from "./container-sandbox";
 import { readTerminalSessionId } from "./container-terminal";
@@ -64,7 +64,7 @@ async function handleContainerTerminal(
 		);
 	}
 
-	const sandbox = getUserContainerSandbox(c.env.NEO_NOUMI_SANDBOX, c.get("userId"));
+	const sandbox = getUserContainer(c.env.NEO_NOUMI_SANDBOX, c.get("userId"));
 	const session = await sandbox.getSession(sessionId);
 	// terminal() 只在 WebSocket 建立时触达容器，页面静态打开不会唤醒 sandbox。
 	return session.terminal(c.req.raw);

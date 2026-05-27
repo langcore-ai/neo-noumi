@@ -3,10 +3,10 @@ import type { OutboundHandlerContext } from "@cloudflare/containers";
 import { CLAUDE_SESSION_STORE_PROJECT_KEY, type CcrStore } from "./ccr-store";
 import { isJsonObject, toJsonValue, type JsonObject } from "./json";
 import { CCR_SDK_APPROVED_HOST } from "./ccr-protocol";
-import { buildUserContainerSandboxId } from "./container-identity";
+import { buildUserContainerId } from "./container-identity";
 import {
 	destroyUserContainerSandbox,
-	getUserContainerSandbox,
+	getUserContainer,
 } from "./container-sandbox";
 import {
 	ANTHROPIC_API_HOST,
@@ -619,7 +619,7 @@ function redactSecrets(value: unknown): unknown {
  * @returns sandbox client
  */
 function getCcrSandbox(env: NeoNoumiSandboxBindings, userId: string) {
-	return getUserContainerSandbox(env.NEO_NOUMI_SANDBOX, userId);
+	return getUserContainer(env.NEO_NOUMI_SANDBOX, userId);
 }
 
 /**
@@ -776,7 +776,7 @@ export async function startCcrSandbox(
 	userId: string,
 	sessionId: string,
 ) {
-	const sandboxId = buildUserContainerSandboxId(userId);
+	const sandboxId = buildUserContainerId(userId);
 	const sandbox = getCcrSandbox(env, userId);
 	const lifecycle = await store.getSessionLifecycle(sessionId);
 	if (lifecycle?.deletedAt) {
@@ -906,7 +906,7 @@ export async function getCcrSandboxStatus(
 		.then((file) => file.content.slice(-8_000))
 		.catch(() => "");
 	return {
-		sandbox_id: buildUserContainerSandboxId(userId),
+		sandbox_id: buildUserContainerId(userId),
 		processes: redactSecrets(processes),
 		runner_log: redactSecrets(runnerLog),
 	};

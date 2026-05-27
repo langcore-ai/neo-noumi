@@ -29,7 +29,7 @@ import type {
 	WorkerInternalEvent,
 	WorkerVisibleEvent,
 } from "./ccr-types";
-import { buildUserContainerSandboxId } from "./container-identity";
+import { buildUserContainerId } from "./container-identity";
 
 /** 默认 CCR external metadata */
 const DEFAULT_EXTERNAL_METADATA: JsonObject = {
@@ -928,7 +928,7 @@ export class CcrStore {
 			create: {
 				id: crypto.randomUUID(),
 				userId,
-				sandboxId: buildUserContainerSandboxId(userId),
+				sandboxId: buildUserContainerId(userId),
 			},
 			update: {},
 		});
@@ -948,7 +948,7 @@ export class CcrStore {
 			create: {
 				id: crypto.randomUUID(),
 				userId,
-				sandboxId: data.sandboxId ?? buildUserContainerSandboxId(userId),
+				sandboxId: data.sandboxId ?? buildUserContainerId(userId),
 				containerStatus: data.containerStatus ?? "stopped",
 			},
 			update: data,

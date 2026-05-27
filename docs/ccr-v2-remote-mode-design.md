@@ -23,7 +23,7 @@
 - 同一用户的活跃 project 名称通过 PostgreSQL partial unique index 保持唯一，软删除项目不占用名称；这是 `/workspace/{projectName}` 挂载路径不串用的前置约束。
 - Project workspace 已接入 R2 bucket `neo-noumi-workspaces`，对象根目录使用 `{projectId}/...`；文件树支持列表、读写、删除、移动、新建目录以及文件/文件夹直传。所有 `/api/projects/{projectId}/workspace/*` 操作都先校验 project owner，再由后端生成 HMAC 操作签名；上传由后端下发短期 R2 presigned PUT URL，前端直接写入 R2，不经过 Worker 转发文件 body；文件读取由后端鉴权后 302 到短期 R2 presigned GET URL，Worker 不搬运文件内容。Sandbox 内 project workspace 挂载为只读，Claude Code 修改 workspace 必须通过 route-side MCP workspace 工具让主服务执行实际 R2 变更。
 - `/projects` 是 project 管理页面，基于 `/api/projects` 提供列表、创建、编辑和软删除；删除 project 会同步移除其下未删除 session，并对活跃 session 后台停止 runner，聊天页只展示未删除 project/session。
-- Cloudflare 资源使用 `NeoNoumiSandbox` / `NEO_NOUMI_SANDBOX` / `neo-noumi-sandbox` 命名，用户级 sandbox ID 使用 `neo-noumi-user-{userId}`。
+- Cloudflare 资源使用 `NeoNoumiSandbox` / `NEO_NOUMI_SANDBOX` / `neo-noumi-sandbox` 命名，用户级 sandbox ID 使用 `{namespace}-{userId}`。
 - Cloudflare outbound interception 的 CCR `--sdk-url` host 使用 `beacon.claude-ai.staging.ant.dev`；`api.anthropic.com` 作为 AI Proxy 劫持入口，由 Worker 校验短期 proxy token 后再转发到用户默认渠道或平台 fallback 渠道，真实上游 API key 不再注入 sandbox。
 - Sandbox 镜像通过 `CMD` 启动编译后的 `code-sandbox/main.ts` 观测服务，保留 Cloudflare Sandbox SDK 基础镜像的 `/container-server/sandbox` `ENTRYPOINT`；观测服务向 `neo-noumi-observability.internal` 上报 startup、heartbeat、resource、signal、shutdown、error 事件，由 Worker outbound handler 写入 `sandbox_observation_events`，不把数据库连接串注入 sandbox。
 - 容器粒度是“一个用户一个 sandbox/container”，而不是“一个 session 一个容器”。
@@ -304,7 +304,7 @@ Claude Code CLI in Cloudflare Container
 - 全量恢复下载 API：`GET /api/sessions/{sessionId}/internal-events.jsonl` 是独立的登录用户 API，不复用 `CcrStore` 恢复窗口；它直接按 `chat_internal_events.id` 每 50 条分页查询，并把每页拼成短 JSONL chunk 后立即写入响应流。
 - Claude Code 容器内的 `ANTHROPIC_BASE_URL` 固定为 `https://api.anthropic.com`，真实渠道 base URL 只在 Worker AI Proxy 转发时使用；渠道配置如果带 `/v1`，后端会先规范化，避免上游出现 `/v1/v1/messages`。
 - `POST /api/ccr/sessions/{sessionId}/container/stop` 的语义是停止用户级 sandbox 容器，而不是只杀当前 session runner；停止后会把同一用户挂在该 sandbox 上的运行态 session 收敛为 `idle/stopped`，下一次发送消息会重建容器并从数据库恢复 transcript 与 memory。
-- `/worker/events` 写入 terminal `result` 后会停止当前 session runner，并将 session 状态收敛为 `workerStatus=idle`、`containerStatus=stopped`、`runnerProcessId=null`；worker transport 鉴权时会从 token 绑定的 session 回填 owner userId，确保停止的是 `neo-noumi-user-{userId}` 对应的真实 sandbox。这个保底逻辑在后端 worker transport 层执行，不依赖前端 SSE 是否仍然连接，避免旧进程继续写入 `keep_alive`。
+- `/worker/events` 写入 terminal `result` 后会停止当前 session runner，并将 session 状态收敛为 `workerStatus=idle`、`containerStatus=stopped`、`runnerProcessId=null`；worker transport 鉴权时会从 token 绑定的 session 回填 owner userId，确保停止的是 `{namespace}-{userId}` 对应的真实 sandbox。这个保底逻辑在后端 worker transport 层执行，不依赖前端 SSE 是否仍然连接，避免旧进程继续写入 `keep_alive`。
 - chat 输入写入 client event 后如果 runner 启动失败，本次新增的 queued client events 会被标记为 `failed`；`/worker/events/stream` 只下发 `queued`，避免下一次启动误执行已经失败返回给前端的旧输入。
 
 远程模式的启动时序要求：
