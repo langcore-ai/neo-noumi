@@ -1,12 +1,16 @@
 import { Hono } from "hono";
 import { logger } from "hono/logger";
 import { createAuth, type AuthBindings } from "./lib/auth";
+import {
+	mountContainerRoutes,
+	type ContainerRouteBindings,
+} from "./lib/container-routes";
 import { mountCcrRoutes, type CcrBindings } from "./lib/ccr-routes";
 export { ContainerProxy } from "@cloudflare/containers";
 export { NeoNoumiSandbox } from "./lib/ccr-sandbox";
 
 const app = new Hono<{
-	Bindings: Env & AuthBindings & CcrBindings;
+	Bindings: Env & AuthBindings & CcrBindings & ContainerRouteBindings;
 	Variables: { userId: string };
 }>();
 
@@ -18,6 +22,7 @@ app.on(["GET", "POST"], "/api/auth/*", (c) => {
 	return auth.handler(c.req.raw);
 });
 
+mountContainerRoutes(app);
 mountCcrRoutes(app);
 
 app.get("/api/", (c) => c.json({ name: "Cloudflare" }));

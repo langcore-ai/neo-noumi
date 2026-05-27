@@ -9,6 +9,7 @@ import {
 	MessageSquareIcon,
 	RefreshCwIcon,
 	ShieldIcon,
+	TerminalIcon,
 	UserPlusIcon,
 } from "lucide-react";
 import { useState } from "react";
@@ -54,6 +55,13 @@ const FEATURE_LINKS = [
 		icon: FolderKanbanIcon,
 		variant: "outline" as const,
 	},
+	{
+		title: "容器控制台",
+		description: "打开一个按需唤醒的浏览器终端。",
+		to: "/container",
+		icon: TerminalIcon,
+		variant: "outline" as const,
+	},
 ];
 
 /** 首页展示的技术栈检查项。 */
@@ -67,6 +75,7 @@ const STACK_ITEMS = [
 const NAV_ITEMS = [
 	{ label: "首页", to: "/", icon: HomeIcon },
 	{ label: "Project", to: "/projects", icon: FolderKanbanIcon },
+	{ label: "容器", to: "/container", icon: TerminalIcon },
 ] as const;
 
 /**
