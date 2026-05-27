@@ -1,14 +1,6 @@
-/** 可持久化 JSON 基础值 */
-export type JsonPrimitive = string | number | boolean | null;
+import type { JsonObject, JsonValue } from "./json";
 
-/** 可持久化 JSON 值 */
-export type JsonValue =
-	| JsonPrimitive
-	| JsonValue[]
-	| { [key: string]: JsonValue };
-
-/** 可持久化 JSON 对象 */
-export type JsonObject = { [key: string]: JsonValue };
+export type { JsonObject, JsonPrimitive, JsonValue } from "./json";
 
 /** CCR worker 状态值 */
 export type WorkerStatus = "idle" | "running" | "requires_action";

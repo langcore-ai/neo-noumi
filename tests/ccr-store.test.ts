@@ -7,7 +7,7 @@ import {
 	normalizeProjectUpdateInput,
 	ProjectNameConflictError,
 } from "../src/worker/lib/ccr-store";
-import { mergeJsonObject } from "../src/worker/lib/ccr-json";
+import { mergeJsonObject } from "../src/worker/lib/json";
 
 type CcrStorePrisma = ConstructorParameters<typeof CcrStore>[0];
 

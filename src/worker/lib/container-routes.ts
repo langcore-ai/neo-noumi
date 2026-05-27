@@ -1,17 +1,13 @@
-import { getSandbox } from "@cloudflare/sandbox";
 import type { Context, Hono } from "hono";
 import { createAuth, type AuthBindings } from "./auth";
-import type { NeoNoumiSandbox } from "./ccr-sandbox";
 import {
-	buildUserContainerSandboxId,
-	readTerminalSessionId,
-} from "./container-terminal";
+	getUserContainerSandbox,
+	type UserContainerSandboxBindings,
+} from "./container-sandbox";
+import { readTerminalSessionId } from "./container-terminal";
 
 /** 容器管理 route 需要的 Worker 绑定。 */
-export type ContainerRouteBindings = AuthBindings & {
-	/** 用户级 Sandbox Durable Object binding。 */
-	NEO_NOUMI_SANDBOX: DurableObjectNamespace<NeoNoumiSandbox>;
-};
+export type ContainerRouteBindings = AuthBindings & UserContainerSandboxBindings;
 
 /** 容器管理 route 上下文变量。 */
 type ContainerRouteVariables = {
@@ -68,10 +64,7 @@ async function handleContainerTerminal(
 		);
 	}
 
-	const sandbox = getSandbox(
-		c.env.NEO_NOUMI_SANDBOX,
-		buildUserContainerSandboxId(c.get("userId")),
-	);
+	const sandbox = getUserContainerSandbox(c.env.NEO_NOUMI_SANDBOX, c.get("userId"));
 	const session = await sandbox.getSession(sessionId);
 	// terminal() 只在 WebSocket 建立时触达容器，页面静态打开不会唤醒 sandbox。
 	return session.terminal(c.req.raw);

@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
-	buildClaudeProjectStateDir,
 	buildProjectWorkspaceMountPrefix,
 	buildProjectWorkspaceMountPath,
 	shouldSkipWorkspaceMount,
-} from "../src/worker/lib/ccr-workspace-mount";
+} from "../src/worker/lib/project-workspace-mount";
+import { buildClaudeProjectStateDir } from "../src/worker/lib/ccr-claude-state";
 
 describe("buildProjectWorkspaceMountPath", () => {
 	test("uses the project name as the workspace mount directory", () => {

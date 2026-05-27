@@ -1,4 +1,4 @@
-import { isJsonObject } from "./ccr-json";
+import { isJsonObject } from "./json";
 
 /** session 内容读取最多允许的单页大小。 */
 const SESSION_DETAIL_MAX_PAGE_SIZE = 500;

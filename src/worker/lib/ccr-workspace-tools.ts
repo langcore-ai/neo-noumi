@@ -1,6 +1,6 @@
-import { getStringField } from "./ccr-json";
+import { getStringField } from "./json";
 import type { CcrStore } from "./ccr-store";
-import type { JsonObject } from "./ccr-types";
+import type { JsonObject } from "./json";
 import {
 	copyWorkspacePath,
 	createWorkspaceDirectory,

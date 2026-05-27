@@ -1,5 +1,12 @@
 import { Prisma, type PrismaClient } from "../../generated/prisma/client";
-import { getStringField, isJsonObject, mergeJsonObject, toJsonValue } from "./ccr-json";
+import {
+	getStringField,
+	isJsonObject,
+	mergeJsonObject,
+	toJsonValue,
+	type JsonObject,
+	type JsonValue,
+} from "./json";
 import {
 	buildRouteMcpInitializeRequest,
 	buildSetMaxThinkingTokensRequest,
@@ -19,11 +26,10 @@ import {
 } from "./ccr-protocol";
 import type {
 	ChatMessageInput,
-	JsonObject,
-	JsonValue,
 	WorkerInternalEvent,
 	WorkerVisibleEvent,
 } from "./ccr-types";
+import { buildUserContainerSandboxId } from "./container-identity";
 
 /** 默认 CCR external metadata */
 const DEFAULT_EXTERNAL_METADATA: JsonObject = {
@@ -62,9 +68,6 @@ const AI_PROXY_CREDENTIAL_NAME_MAX_LENGTH = 80;
 
 /** AI Proxy credential 密文版本前缀。 */
 const AI_PROXY_CREDENTIAL_CIPHERTEXT_PREFIX = "v1:";
-
-/** 用户级 sandbox ID 前缀，用于按用户复用同一个容器。 */
-const USER_SANDBOX_ID_PREFIX = "neo-noumi-user";
 
 /** Claude Code Agent SDK transcript 在 sessionStore 中使用的 project key。 */
 export const CLAUDE_SESSION_STORE_PROJECT_KEY = "claude-code";
@@ -925,7 +928,7 @@ export class CcrStore {
 			create: {
 				id: crypto.randomUUID(),
 				userId,
-				sandboxId: `${USER_SANDBOX_ID_PREFIX}-${userId}`,
+				sandboxId: buildUserContainerSandboxId(userId),
 			},
 			update: {},
 		});
@@ -945,7 +948,7 @@ export class CcrStore {
 			create: {
 				id: crypto.randomUUID(),
 				userId,
-				sandboxId: data.sandboxId ?? `${USER_SANDBOX_ID_PREFIX}-${userId}`,
+				sandboxId: data.sandboxId ?? buildUserContainerSandboxId(userId),
 				containerStatus: data.containerStatus ?? "stopped",
 			},
 			update: data,

@@ -1,5 +1,5 @@
-import { isJsonObject } from "./ccr-json";
-import type { JsonObject } from "./ccr-types";
+import { isJsonObject } from "./json";
+import type { JsonObject } from "./json";
 
 /** Claude Code 允许用于 CCR `--sdk-url` 的专用 host，避免拦截真实 Anthropic API 推理请求。 */
 export const CCR_SDK_APPROVED_HOST = "beacon.claude-ai.staging.ant.dev";

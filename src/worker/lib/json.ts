@@ -1,4 +1,14 @@
-import type { JsonObject, JsonValue } from "./ccr-types";
+/** 可持久化 JSON 基础值。 */
+export type JsonPrimitive = string | number | boolean | null;
+
+/** 可持久化 JSON 值。 */
+export type JsonValue =
+	| JsonPrimitive
+	| JsonValue[]
+	| { [key: string]: JsonValue };
+
+/** 可持久化 JSON 对象。 */
+export type JsonObject = { [key: string]: JsonValue };
 
 /**
  * 判断输入是否是普通 JSON 对象。
@@ -71,7 +81,7 @@ export function mergeJsonObject(base: JsonObject, patch?: JsonObject): JsonObjec
 	const merged = { ...base };
 	for (const [key, value] of Object.entries(patch)) {
 		if (value === null) {
-			// CCR worker metadata 使用 merge patch 语义，null 代表删除/清空旧状态。
+			// 遵循 JSON merge patch 的删除语义，调用方负责定义业务含义。
 			delete merged[key];
 			continue;
 		}

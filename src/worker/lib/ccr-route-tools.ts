@@ -1,5 +1,5 @@
-import { isJsonObject } from "./ccr-json";
-import type { JsonObject } from "./ccr-types";
+import { isJsonObject } from "./json";
+import type { JsonObject } from "./json";
 import {
 	WORKSPACE_ROUTE_TOOLS,
 	type RouteToolDefinition,

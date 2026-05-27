@@ -1,9 +1,6 @@
 /** Project workspace 在容器内的挂载根目录。 */
 export const PROJECT_WORKSPACE_ROOT = "/workspace";
 
-/** Claude Code 本地 project state 根目录。 */
-export const CLAUDE_PROJECT_STATE_ROOT = "/root/.claude/projects";
-
 /**
  * 将 project 名称收敛为单个 POSIX 路径段。
  * @param projectName 用户可见 project 名称
@@ -58,14 +55,4 @@ export function buildProjectWorkspaceMountPrefix(projectId: string): string {
  */
 export function shouldSkipWorkspaceMount(value: string | undefined): boolean {
 	return value === "1";
-}
-
-/**
- * 生成 Claude Code 针对 cwd 使用的本地 project state 目录。
- * @param workspacePath Claude Code 进程 cwd
- * @returns Claude Code project state 目录
- */
-export function buildClaudeProjectStateDir(workspacePath: string): string {
-	const projectKey = workspacePath.replaceAll("/", "-") || "-workspace";
-	return `${CLAUDE_PROJECT_STATE_ROOT}/${projectKey}`;
 }

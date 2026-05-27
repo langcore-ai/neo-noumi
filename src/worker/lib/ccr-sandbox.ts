@@ -1,21 +1,25 @@
-import { Sandbox, getSandbox } from "@cloudflare/sandbox";
+import { Sandbox } from "@cloudflare/sandbox";
 import type { OutboundHandlerContext } from "@cloudflare/containers";
 import { CLAUDE_SESSION_STORE_PROJECT_KEY, type CcrStore } from "./ccr-store";
-import { isJsonObject, toJsonValue } from "./ccr-json";
+import { isJsonObject, toJsonValue, type JsonObject } from "./json";
 import { CCR_SDK_APPROVED_HOST } from "./ccr-protocol";
+import { buildUserContainerSandboxId } from "./container-identity";
+import {
+	destroyUserContainerSandbox,
+	getUserContainerSandbox,
+} from "./container-sandbox";
 import {
 	ANTHROPIC_API_HOST,
 	proxyAnthropicApiRequest,
 	type AiProxyBindings,
 } from "./ccr-ai-proxy";
 import { createPrismaClient } from "./prisma";
-import type { JsonObject } from "./ccr-types";
 import {
-	buildClaudeProjectStateDir,
 	buildProjectWorkspaceMountPrefix,
 	buildProjectWorkspaceMountPath,
 	shouldSkipWorkspaceMount,
-} from "./ccr-workspace-mount";
+} from "./project-workspace-mount";
+import { buildClaudeProjectStateDir } from "./ccr-claude-state";
 
 /** Sandbox 内 CCR runner 脚本路径 */
 const RUNNER_PATH = "/tmp/neo-noumi/ccr-runner.sh";
@@ -615,7 +619,7 @@ function redactSecrets(value: unknown): unknown {
  * @returns sandbox client
  */
 function getCcrSandbox(env: NeoNoumiSandboxBindings, userId: string) {
-	return getSandbox(env.NEO_NOUMI_SANDBOX, `neo-noumi-user-${userId}`);
+	return getUserContainerSandbox(env.NEO_NOUMI_SANDBOX, userId);
 }
 
 /**
@@ -772,7 +776,7 @@ export async function startCcrSandbox(
 	userId: string,
 	sessionId: string,
 ) {
-	const sandboxId = `neo-noumi-user-${userId}`;
+	const sandboxId = buildUserContainerSandboxId(userId);
 	const sandbox = getCcrSandbox(env, userId);
 	const lifecycle = await store.getSessionLifecycle(sessionId);
 	if (lifecycle?.deletedAt) {
@@ -902,7 +906,7 @@ export async function getCcrSandboxStatus(
 		.then((file) => file.content.slice(-8_000))
 		.catch(() => "");
 	return {
-		sandbox_id: `neo-noumi-user-${userId}`,
+		sandbox_id: buildUserContainerSandboxId(userId),
 		processes: redactSecrets(processes),
 		runner_log: redactSecrets(runnerLog),
 	};
@@ -953,9 +957,7 @@ export async function stopCcrUserContainer(
 	store: CcrStore,
 	userId: string,
 ) {
-	const sandbox = getCcrSandbox(env, userId);
-	const sandboxId = `neo-noumi-user-${userId}`;
-	await sandbox.destroy();
+	const sandboxId = await destroyUserContainerSandbox(env.NEO_NOUMI_SANDBOX, userId);
 	const clearedSessions = await store.clearUserContainerSessionRunners(userId, sandboxId);
 	await store.updateUserContainer(userId, {
 		containerStatus: "stopped",

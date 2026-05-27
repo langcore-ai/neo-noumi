@@ -1,8 +1,7 @@
 import "dotenv/config";
 import { CcrStore } from "../src/worker/lib/ccr-store";
 import { createPrismaClient } from "../src/worker/lib/prisma";
-import { isJsonObject } from "../src/worker/lib/ccr-json";
-import type { JsonObject } from "../src/worker/lib/ccr-types";
+import { isJsonObject, type JsonObject } from "../src/worker/lib/json";
 
 /** 默认测试工具名称，用于和真实业务工具区分。 */
 const DEFAULT_TOOL_NAME = "AExternalToolTest";

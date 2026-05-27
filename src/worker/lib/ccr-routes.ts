@@ -22,7 +22,7 @@ import {
 	stopCcrUserContainer,
 	type NeoNoumiSandboxBindings,
 } from "./ccr-sandbox";
-import { getStringField, isJsonObject, readJsonObject, toJsonValue } from "./ccr-json";
+import { getStringField, isJsonObject, readJsonObject, toJsonValue } from "./json";
 import { isTerminalWorkerPayload, readWorkerEpoch } from "./ccr-protocol";
 import { getSessionDetailResponse } from "./session-detail";
 import { createSessionInternalEventsJsonlResponse } from "./session-internal-events-export";

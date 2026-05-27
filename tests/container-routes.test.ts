@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
-	buildUserContainerSandboxId,
 	DEFAULT_CONTAINER_TERMINAL_SESSION_ID,
 	readTerminalSessionId,
 } from "../src/worker/lib/container-terminal";
+import { buildUserContainerSandboxId } from "../src/worker/lib/container-identity";
 
 describe("container terminal route helpers", () => {
 	test("uses the existing user-level sandbox id shape", () => {

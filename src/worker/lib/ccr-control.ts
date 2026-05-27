@@ -1,11 +1,11 @@
-import { getStringField, isJsonObject } from "./ccr-json";
+import { getStringField, isJsonObject } from "./json";
 import {
 	callRouteTool,
 	listRouteTools,
 	ROUTE_MCP_SERVER_NAME,
 	type RouteToolContext,
 } from "./ccr-route-tools";
-import type { JsonObject } from "./ccr-types";
+import type { JsonObject } from "./json";
 
 /** Claude Code 对外可见的权限模式。 */
 export type CcrPermissionMode =
