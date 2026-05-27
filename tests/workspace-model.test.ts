@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
 	addOptimisticWorkspaceDirectory,
+	buildWorkspaceFileDownloadUrl,
+	buildWorkspaceFileWriteUrl,
 	canMoveWorkspaceItemIntoDirectory,
 	createEmptyWorkspaceTree,
+	isMarkdownWorkspaceFile,
+	isPdfWorkspaceFile,
 	moveOptimisticWorkspaceItem,
 	removeOptimisticWorkspaceItem,
 	type WorkspaceTreeItem,
@@ -123,5 +127,32 @@ describe("workspace optimistic tree helpers", () => {
 		expect(canMoveWorkspaceItemIntoDirectory(items["README.md"], items[WORKSPACE_ROOT_ID]))
 			.toBeFalse();
 		expect(canMoveWorkspaceItemIntoDirectory(items.src, items["src/lib"])).toBeFalse();
+	});
+});
+
+describe("workspace file preview helpers", () => {
+	test("detects PDF files by extension", () => {
+		expect(isPdfWorkspaceFile("docs/spec.PDF")).toBeTrue();
+		expect(isPdfWorkspaceFile("docs/spec.pdf.backup")).toBeFalse();
+		expect(isPdfWorkspaceFile("README.md")).toBeFalse();
+	});
+
+	test("detects Markdown files by extension", () => {
+		expect(isMarkdownWorkspaceFile("README.md")).toBeTrue();
+		expect(isMarkdownWorkspaceFile("docs/spec.MARKDOWN")).toBeTrue();
+		expect(isMarkdownWorkspaceFile("docs/spec.md.backup")).toBeFalse();
+		expect(isMarkdownWorkspaceFile("docs/spec.pdf")).toBeFalse();
+	});
+
+	test("builds an encoded workspace file download URL", () => {
+		expect(buildWorkspaceFileDownloadUrl("project 1", "dir/合同 v1.pdf")).toBe(
+			"/api/projects/project%201/workspace/file?path=dir%2F%E5%90%88%E5%90%8C+v1.pdf",
+		);
+	});
+
+	test("builds an encoded workspace file write URL", () => {
+		expect(buildWorkspaceFileWriteUrl("project 1")).toBe(
+			"/api/projects/project%201/workspace/file",
+		);
 	});
 });

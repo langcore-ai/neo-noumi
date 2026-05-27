@@ -47,6 +47,8 @@ export interface WorkspaceTreeItem {
 export interface OpenFileTab {
 	path: string;
 	name: string;
+	/** 当前文件功能模式；PDF 等只读格式固定为 preview。 */
+	mode: "preview" | "edit";
 }
 
 /** 文件重命名弹窗状态。 */
@@ -75,6 +77,9 @@ export const WORKSPACE_ROOT_ID = "root";
 /** 文件树缩进宽度。 */
 export const WORKSPACE_TREE_INDENT = 18;
 
+/** 可用 Markdown 渲染/编辑模式打开的文件扩展名。 */
+const MARKDOWN_FILE_EXTENSIONS = new Set(["md", "markdown"]);
+
 /**
  * 读取文件扩展名。
  * @param name 文件名
@@ -83,6 +88,45 @@ export const WORKSPACE_TREE_INDENT = 18;
 function getFileExtension(name: string): string | undefined {
 	const parts = name.split(".");
 	return parts.length > 1 ? parts[parts.length - 1]?.toLowerCase() : undefined;
+}
+
+/**
+ * 判断 workspace 文件是否为 PDF。
+ * @param file 文件路径或名称
+ * @returns 是否为 PDF 文件
+ */
+export function isPdfWorkspaceFile(file: string): boolean {
+	return getFileExtension(file) === "pdf";
+}
+
+/**
+ * 判断 workspace 文件是否为 Markdown。
+ * @param file 文件路径或名称
+ * @returns 是否为 Markdown 文件
+ */
+export function isMarkdownWorkspaceFile(file: string): boolean {
+	const extension = getFileExtension(file);
+	return Boolean(extension && MARKDOWN_FILE_EXTENSIONS.has(extension));
+}
+
+/**
+ * 构造 workspace 文件下载 API 地址。
+ * @param projectId Project ID
+ * @param path workspace 文件路径
+ * @returns 同源下载入口；后端负责鉴权并跳转到对象存储短期 URL
+ */
+export function buildWorkspaceFileDownloadUrl(projectId: string, path: string): string {
+	const params = new URLSearchParams({ path });
+	return `/api/projects/${encodeURIComponent(projectId)}/workspace/file?${params.toString()}`;
+}
+
+/**
+ * 构造 workspace 文件写入 API 地址。
+ * @param projectId Project ID
+ * @returns 同源写入入口；请求体携带 path 和 content
+ */
+export function buildWorkspaceFileWriteUrl(projectId: string): string {
+	return `/api/projects/${encodeURIComponent(projectId)}/workspace/file`;
 }
 
 /**

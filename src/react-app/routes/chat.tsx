@@ -603,7 +603,7 @@ function ChatPage() {
 		setOpenFileTabs((current) => {
 			return current.some((tab) => tab.path === item.path)
 				? current
-				: [...current, { path: item.path, name: item.name }];
+				: [...current, { path: item.path, name: item.name, mode: "preview" }];
 		});
 		setActiveFilePath(item.path);
 	}
@@ -620,6 +620,25 @@ function ChatPage() {
 			}
 			return nextTabs;
 		});
+	}
+
+	/**
+	 * 切换文件标签的功能模式。
+	 * @param path 文件路径
+	 * @param mode 目标模式
+	 */
+	function changeFileTabMode(path: string, mode: OpenFileTab["mode"]) {
+		setOpenFileTabs((current) =>
+			current.map((tab) => (tab.path === path ? { ...tab, mode } : tab)),
+		);
+	}
+
+	/**
+	 * 文件保存后刷新所在目录的 workspace 元数据。
+	 * @param path 文件路径
+	 */
+	async function handleWorkspaceFileSaved(path: string) {
+		await refreshWorkspaceTree([getWorkspaceParentPath(path)]);
 	}
 
 	/**
@@ -817,6 +836,7 @@ function ChatPage() {
 					}
 					const suffix = tab.path.slice(renamingTarget.path.length);
 					return {
+						...tab,
 						path: `${nextPath}${suffix}`,
 						name: tab.path === renamingTarget.path ? nextName : tab.name,
 					};
@@ -888,6 +908,7 @@ function ChatPage() {
 					}
 					const suffix = tab.path.slice(source.path.length);
 					return {
+						...tab,
 						path: `${nextPath}${suffix}`,
 						name: tab.path === source.path ? source.name : tab.name,
 					};
@@ -1092,6 +1113,7 @@ function ChatPage() {
 		<main className="h-dvh overflow-hidden bg-background text-foreground">
 			<ResizablePanelGroup orientation="horizontal" className="h-full">
 				<WorkspacePanel
+					projectId={project?.id ?? null}
 					projectName={project?.name ?? null}
 					projects={projects}
 					hasProject={Boolean(project)}
@@ -1106,6 +1128,8 @@ function ChatPage() {
 					activeFilePath={activeFilePath}
 					activeFileTab={activeFileTab}
 					hasPreviewPanel={hasPreviewPanel}
+					onFileModeChange={changeFileTabMode}
+					onFileSaved={handleWorkspaceFileSaved}
 					onRefreshWorkspaceTree={() => void refreshWorkspaceTree()}
 					onSelectWorkspaceItem={(item) => void selectWorkspaceItem(item)}
 					onDeleteWorkspaceItem={(item) => void deleteWorkspaceItem(item)}

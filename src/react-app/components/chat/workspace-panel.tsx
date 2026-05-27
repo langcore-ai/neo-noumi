@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { Tree, TreeItem, TreeItemLabel } from "@/components/tree";
+import { WorkspaceFilePreview } from "@/components/chat/workspace-file-preview";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button, buttonVariants } from "@/components/ui/button";
 import {
@@ -65,6 +66,8 @@ interface WorkspaceProjectOption {
 
 /** Workspace 面板组件属性。 */
 interface WorkspacePanelProps {
+	/** 当前 project ID。 */
+	projectId: string | null;
 	/** 当前 project 名称。 */
 	projectName: string | null;
 	/** 可选 project 列表。 */
@@ -93,6 +96,10 @@ interface WorkspacePanelProps {
 	activeFileTab: OpenFileTab | null;
 	/** 是否展示文件预览面板。 */
 	hasPreviewPanel: boolean;
+	/** 切换文件预览模式。 */
+	onFileModeChange: (path: string, mode: OpenFileTab["mode"]) => void;
+	/** 文件保存后回调。 */
+	onFileSaved?: (path: string) => void | Promise<void>;
 	/** 刷新文件树。 */
 	onRefreshWorkspaceTree: () => void;
 	/** 选择文件树项。 */
@@ -126,6 +133,7 @@ interface WorkspacePanelProps {
 export function WorkspacePanel(props: WorkspacePanelProps) {
 	const {
 		hasProject,
+		projectId,
 		projectName,
 		projects,
 		workspaceTree,
@@ -139,6 +147,8 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 		activeFilePath,
 		activeFileTab,
 		hasPreviewPanel,
+		onFileModeChange,
+		onFileSaved,
 		onRefreshWorkspaceTree,
 		onSelectWorkspaceItem,
 		onDeleteWorkspaceItem,
@@ -538,24 +548,12 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 									</button>
 								))}
 							</div>
-							<div className="flex min-h-0 flex-1 items-center justify-center p-6">
-								<div className="flex max-w-sm flex-col items-center gap-3 text-center">
-									<div className="flex size-12 items-center justify-center rounded-full bg-muted">
-										<FileIcon className="text-muted-foreground" />
-									</div>
-									<div className="flex flex-col gap-1">
-										<h2 className="break-all text-base font-semibold">
-											{activeFileTab?.name}
-										</h2>
-										<p className="break-all text-xs text-muted-foreground">
-											{activeFileTab?.path}
-										</p>
-									</div>
-									<p className="text-sm text-muted-foreground">
-										文件预览能力待接入，当前仅保留选中文件占位。
-									</p>
-								</div>
-							</div>
+							<WorkspaceFilePreview
+								projectId={projectId}
+								file={activeFileTab}
+								onFileModeChange={onFileModeChange}
+								onFileSaved={onFileSaved}
+							/>
 						</section>
 					</ResizablePanel>
 					<ResizableHandle withHandle />
