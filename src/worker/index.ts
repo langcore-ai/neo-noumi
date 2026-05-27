@@ -6,7 +6,8 @@ import {
 	type ContainerRouteBindings,
 } from "./lib/container-routes";
 import { mountCcrRoutes, type CcrBindings } from "./lib/ccr-routes";
-export { ContainerProxy } from "@cloudflare/containers";
+// ContainerProxy 必须和 Sandbox 来自同一个包入口，否则 outboundByHost 的运行时 registry 会分裂。
+export { ContainerProxy } from "@cloudflare/sandbox";
 export { NeoNoumiSandbox } from "./lib/ccr-sandbox";
 
 const app = new Hono<{

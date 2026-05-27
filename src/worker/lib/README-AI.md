@@ -5,6 +5,7 @@
 - `src/worker/lib` 同时包含 Worker 基础能力、通用业务基础设施和 CCR 业务层。
 - 当前架构方向是“通用能力 + CCR 业务层”：通用模块沉淀可复用能力，CCR 模块只表达 Claude CCR 会话、协议、runner、工具和状态流转规则。
 - 依赖方向必须保持为 `ccr-*` 调用通用模块；通用模块不能为了复用而反向 import `ccr-*`。
+- Worker 入口导出的 `ContainerProxy` 必须来自 `@cloudflare/sandbox`，以便和 `Sandbox`/`NeoNoumiSandbox.outboundByHost` 共用同一份 containers runtime registry。
 
 ## 模块结构
 
@@ -45,6 +46,7 @@
 
 - 新增的通用模块是否没有 import `ccr-*`。
 - 新增的 `ccr-*` 代码是否只组合通用能力和 CCR 业务规则。
-- 是否存在重复拼接 `{namespace}-{userId}`；应统一调用 `buildUserContainerId()`。
+- 是否存在重复拼接 `neo-noumi-user-{userId}`；应统一调用 `buildUserContainerId()`。
 - 是否把 JSON、路径、容器等基础工具错误放进了 CCR 命名文件。
+- 是否从 `@cloudflare/containers` 直接导出了 `ContainerProxy`；这会让 outbound handler registry 和 `Sandbox` 分裂，导致内部 host 走公网并返回 530。
 - 删除或移动模块后，使用 `rg "旧模块名|from \"./ccr"` 检查残留反向依赖。

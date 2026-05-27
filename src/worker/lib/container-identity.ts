@@ -1,5 +1,5 @@
-/** 用户级 sandbox ID 前缀，用于按用户复用同一个容器。 */
-export const USER_CONTAINER_SANDBOX_ID_PREFIX = "noumi";
+/** 用户级 container ID 前缀；必须保持稳定以兼容已有 session、token 和观测数据。 */
+const USER_CONTAINER_ID_PREFIX = "neo-noumi-user";
 
 /**
  * 生成当前用户级容器 ID。
@@ -7,5 +7,5 @@ export const USER_CONTAINER_SANDBOX_ID_PREFIX = "noumi";
  * @returns 用户级 container ID
  */
 export function buildUserContainerId(userId: string): string {
-	return `${USER_CONTAINER_SANDBOX_ID_PREFIX}-${userId}`;
+	return `${USER_CONTAINER_ID_PREFIX}-${userId}`;
 }

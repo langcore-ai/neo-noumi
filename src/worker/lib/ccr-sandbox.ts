@@ -60,6 +60,16 @@ const SANDBOX_OBSERVATION_EVENT_TYPES = new Set([
 	"error",
 ]);
 
+/** CCR sandbox 启动日志基础字段。 */
+type CcrSandboxStartupLogContext = {
+	/** 登录用户 ID。 */
+	userId: string;
+	/** CCR session ID。 */
+	sessionId: string;
+	/** 用户级 sandbox ID。 */
+	sandboxId: string;
+};
+
 /** Project workspace 挂载信息。 */
 type ProjectWorkspaceMount = {
 	/** 容器内挂载路径 */
@@ -71,6 +81,73 @@ type ProjectWorkspaceMount = {
 	/** 用户可见 project 名称 */
 	projectName: string;
 };
+
+/**
+ * 将错误收敛成可安全打到日志里的对象。
+ * @param error 捕获到的错误
+ * @returns 日志可序列化错误
+ */
+function serializeLogError(error: unknown) {
+	if (error instanceof Error) {
+		return {
+			name: error.name,
+			message: error.message,
+			stack: error.stack,
+		};
+	}
+	return { message: String(error) };
+}
+
+/**
+ * 输出 CCR sandbox 启动结构化日志。
+ * @param level 日志级别
+ * @param phase 启动阶段
+ * @param context 启动上下文
+ * @param details 额外字段
+ */
+function logCcrSandboxStartup(
+	level: "info" | "warn" | "error",
+	phase: string,
+	context: CcrSandboxStartupLogContext,
+	details: Record<string, unknown> = {},
+) {
+	console[level]({
+		component: "ccr-sandbox",
+		event: "ccr.sandbox.startup",
+		phase,
+		...context,
+		...details,
+	});
+}
+
+/**
+ * 包装启动阶段并记录耗时与失败原因。
+ * @param phase 阶段名称
+ * @param context 启动上下文
+ * @param task 阶段任务
+ * @returns 阶段返回值
+ */
+async function runStartupStep<T>(
+	phase: string,
+	context: CcrSandboxStartupLogContext,
+	task: () => Promise<T>,
+): Promise<T> {
+	const startedAt = Date.now();
+	logCcrSandboxStartup("info", `${phase}.begin`, context);
+	try {
+		const result = await task();
+		logCcrSandboxStartup("info", `${phase}.ok`, context, {
+			durationMs: Date.now() - startedAt,
+		});
+		return result;
+	} catch (error) {
+		logCcrSandboxStartup("error", `${phase}.error`, context, {
+			durationMs: Date.now() - startedAt,
+			error: serializeLogError(error),
+		});
+		throw error;
+	}
+}
 
 /** Neo Noumi sandbox Worker 绑定 */
 export interface NeoNoumiSandboxBindings extends AiProxyBindings {
@@ -154,18 +231,49 @@ async function recordSandboxObservation(
 	context: OutboundHandlerContext,
 ): Promise<Response> {
 	if (request.method !== "POST") {
+		console.warn({
+			component: "ccr-sandbox",
+			event: "sandbox.observation.rejected",
+			reason: "method_not_allowed",
+			method: request.method,
+			containerId: context.containerId,
+			className: context.className,
+		});
 		return new Response("Method Not Allowed", { status: 405 });
 	}
 	const url = new URL(request.url);
 	if (url.pathname !== "/events") {
+		console.warn({
+			component: "ccr-sandbox",
+			event: "sandbox.observation.rejected",
+			reason: "path_not_found",
+			pathname: url.pathname,
+			containerId: context.containerId,
+			className: context.className,
+		});
 		return new Response("Not Found", { status: 404 });
 	}
 	const input = await request.json().catch(() => null);
 	if (!isJsonObject(input)) {
+		console.warn({
+			component: "ccr-sandbox",
+			event: "sandbox.observation.rejected",
+			reason: "invalid_payload",
+			containerId: context.containerId,
+			className: context.className,
+		});
 		return Response.json({ error: "Invalid observation payload" }, { status: 400 });
 	}
 	const eventType = typeof input.eventType === "string" ? input.eventType : "";
 	if (!SANDBOX_OBSERVATION_EVENT_TYPES.has(eventType)) {
+		console.warn({
+			component: "ccr-sandbox",
+			event: "sandbox.observation.rejected",
+			reason: "invalid_event_type",
+			eventType,
+			containerId: context.containerId,
+			className: context.className,
+		});
 		return Response.json({ error: "Invalid observation event type" }, { status: 400 });
 	}
 	const payload = isJsonObject(input.payload) ? input.payload : {};
@@ -175,16 +283,40 @@ async function recordSandboxObservation(
 		typeof input.sequence === "number" && Number.isInteger(input.sequence)
 			? input.sequence
 			: null;
+	const sandboxId = readObservedSandboxId(payload, context.containerId);
 	const prisma = createPrismaClient(getDatabaseUrl(env));
-	await prisma.sandboxObservationEvent.create({
-		data: {
-			sandboxId: readObservedSandboxId(payload, context.containerId),
+	try {
+		await prisma.sandboxObservationEvent.create({
+			data: {
+				sandboxId,
+				containerId: context.containerId,
+				eventType,
+				sequence,
+				observedAt: Number.isNaN(observedAt.getTime()) ? new Date() : observedAt,
+				payload: toJsonValue(payload) ?? {},
+			},
+		});
+	} catch (error) {
+		console.error({
+			component: "ccr-sandbox",
+			event: "sandbox.observation.persist_failed",
+			sandboxId,
 			containerId: context.containerId,
+			className: context.className,
 			eventType,
 			sequence,
-			observedAt: Number.isNaN(observedAt.getTime()) ? new Date() : observedAt,
-			payload: toJsonValue(payload) ?? {},
-		},
+			error: serializeLogError(error),
+		});
+		throw error;
+	}
+	console.info({
+		component: "ccr-sandbox",
+		event: "sandbox.observation.persisted",
+		sandboxId,
+		containerId: context.containerId,
+		className: context.className,
+		eventType,
+		sequence,
 	});
 	return Response.json({ ok: true });
 }
@@ -195,6 +327,14 @@ NeoNoumiSandbox.outboundByHost = {
 		env: Env,
 		context: OutboundHandlerContext,
 	) => {
+		console.info({
+			component: "ccr-sandbox",
+			event: "sandbox.outbound.hit",
+			host: SANDBOX_OBSERVABILITY_HOST,
+			pathname: new URL(request.url).pathname,
+			containerId: context.containerId,
+			className: context.className,
+		});
 		return recordSandboxObservation(
 			request,
 			env as Env & NeoNoumiSandboxBindings,
@@ -215,10 +355,40 @@ NeoNoumiSandbox.outboundByHost = {
 					? neoNoumiEnv.CCR_PUBLIC_BASE_URL
 				: url.origin;
 		const target = new URL(url.pathname + url.search, baseUrl);
-		return fetch(new Request(target, request));
+		console.info({
+			component: "ccr-sandbox",
+			event: "sandbox.outbound.hit",
+			host: CCR_SDK_APPROVED_HOST,
+			pathname: url.pathname,
+			targetPathname: target.pathname,
+		});
+		const response = await fetch(new Request(target, request));
+		console.info({
+			component: "ccr-sandbox",
+			event: "sandbox.outbound.response",
+			host: CCR_SDK_APPROVED_HOST,
+			pathname: url.pathname,
+			status: response.status,
+		});
+		return response;
 	},
 	[ANTHROPIC_API_HOST]: async (request: Request, env: Env) => {
-		return proxyAnthropicApiRequest(request, env as Env & AiProxyBindings);
+		const url = new URL(request.url);
+		console.info({
+			component: "ccr-sandbox",
+			event: "sandbox.outbound.hit",
+			host: ANTHROPIC_API_HOST,
+			pathname: url.pathname,
+		});
+		const response = await proxyAnthropicApiRequest(request, env as Env & AiProxyBindings);
+		console.info({
+			component: "ccr-sandbox",
+			event: "sandbox.outbound.response",
+			host: ANTHROPIC_API_HOST,
+			pathname: url.pathname,
+			status: response.status,
+		});
+		return response;
 	},
 };
 
@@ -777,17 +947,32 @@ export async function startCcrSandbox(
 	sessionId: string,
 ) {
 	const sandboxId = buildUserContainerId(userId);
+	const logContext = { userId, sessionId, sandboxId };
 	const sandbox = getCcrSandbox(env, userId);
-	const lifecycle = await store.getSessionLifecycle(sessionId);
+	logCcrSandboxStartup("info", "begin", logContext);
+	const lifecycle = await runStartupStep("lifecycle.read", logContext, () =>
+		store.getSessionLifecycle(sessionId),
+	);
 	if (lifecycle?.deletedAt) {
+		logCcrSandboxStartup("warn", "session.deleted", logContext);
 		throw new Error("Session is deleting");
 	}
 	if (lifecycle?.containerStatus === "running" && lifecycle.runnerProcessId) {
-		const processes = await sandbox.listProcesses().catch(() => []);
+		const processes = await runStartupStep("processes.list_existing", logContext, () =>
+			sandbox.listProcesses().catch((error) => {
+				logCcrSandboxStartup("warn", "processes.list_existing.failed_ignored", logContext, {
+					error: serializeLogError(error),
+				});
+				return [];
+			}),
+		);
 		const process = Array.isArray(processes)
 			? processes.find((item) => getProcessId(item) === lifecycle.runnerProcessId)
 			: undefined;
 		if (process) {
+			logCcrSandboxStartup("info", "reuse_existing_process", logContext, {
+				processId: lifecycle.runnerProcessId,
+			});
 			return {
 				sandbox_id: sandboxId,
 				process,
@@ -795,68 +980,125 @@ export async function startCcrSandbox(
 			};
 		}
 		// 记录中的进程已不存在，清理后重新拉起当前 session runner。
-		await store.clearSessionRunner(sessionId);
+		await runStartupStep("runner.clear_stale", logContext, () =>
+			store.clearSessionRunner(sessionId),
+		);
 	}
-	await store.getUserContainer(userId);
-	const workerAccessToken = await store.rotateWorkerAccessToken(sessionId);
-	const aiProxyToken = await store.rotateAiProxyToken(userId, sessionId, sandboxId);
-	await store.updateUserContainer(userId, {
-		containerStatus: "starting",
-		sandboxId,
-	});
-	await store.updateActiveContainer(sessionId, {
-		containerStatus: "starting",
-		sandboxId,
-	});
-	await sandbox.setEnvVars({
-		// 非敏感标识注入容器，供观测主进程上报时标记用户级 sandbox。
-		NEO_NOUMI_SANDBOX_ID: sandboxId,
-		NEO_NOUMI_OBSERVABILITY_ENDPOINT: `http://${SANDBOX_OBSERVABILITY_HOST}/events`,
-	});
-	const workspaceMount = await ensureProjectWorkspaceMounted(
-		sandbox,
-		env,
-		store,
-		sessionId,
+	await runStartupStep("user_container.ensure", logContext, () =>
+		store.getUserContainer(userId),
 	);
-	const restoredState = await restoreClaudeLocalState(
-		sandbox,
-		store,
-		sessionId,
-		workspaceMount.mountPath,
+	const workerAccessToken = await runStartupStep("worker_token.rotate", logContext, () =>
+		store.rotateWorkerAccessToken(sessionId),
 	);
-	await sandbox.exec(`mkdir -p ${shellQuote(dirname(RUNNER_PATH))}`, {
-		origin: "internal",
+	const aiProxyToken = await runStartupStep("ai_proxy_token.rotate", logContext, () =>
+		store.rotateAiProxyToken(userId, sessionId, sandboxId),
+	);
+	await runStartupStep("user_container.mark_starting", logContext, () =>
+		store.updateUserContainer(userId, {
+			containerStatus: "starting",
+			sandboxId,
+		}),
+	);
+	await runStartupStep("session_container.mark_starting", logContext, () =>
+		store.updateActiveContainer(sessionId, {
+			containerStatus: "starting",
+			sandboxId,
+		}),
+	);
+	await runStartupStep("sandbox.env.set", logContext, () =>
+		sandbox.setEnvVars({
+			// 非敏感标识注入容器，供观测主进程上报时标记用户级 sandbox。
+			NEO_NOUMI_SANDBOX_ID: sandboxId,
+			NEO_NOUMI_OBSERVABILITY_ENDPOINT: `http://${SANDBOX_OBSERVABILITY_HOST}/events`,
+		}),
+	);
+	const workspaceMount = await runStartupStep("workspace.mount", logContext, () =>
+		ensureProjectWorkspaceMounted(
+			sandbox,
+			env,
+			store,
+			sessionId,
+		),
+	);
+	logCcrSandboxStartup("info", "workspace.mount.ok", logContext, {
+		mountPath: workspaceMount.mountPath,
+		mounted: workspaceMount.mounted,
+		projectId: workspaceMount.projectId,
+		projectName: workspaceMount.projectName,
 	});
-	await sandbox.writeFile(ENV_PATH, buildEnvScript(env));
-	await sandbox.writeFile(RUNNER_PATH, buildRunnerScript());
-	await sandbox.exec(`chmod 600 ${ENV_PATH}`);
-	await sandbox.exec(`chmod +x ${RUNNER_PATH}`);
-	const process = await sandbox.startProcess(
-		[
-			"sh -lc",
-			shellQuote(
-				[
-					`. ${ENV_PATH};`,
-					"exec",
-					RUNNER_PATH,
-					shellQuote(sessionId),
-					shellQuote(workerAccessToken),
-					shellQuote(aiProxyToken),
-					shellQuote(restoredState.sessionMode),
-					shellQuote(workspaceMount.mountPath),
-					`> ${shellQuote(RUNNER_LOG_PATH)} 2>&1`,
-				].join(" "),
-			),
-		].join(" "),
-		{ cwd: workspaceMount.mountPath },
+	const restoredState = await runStartupStep("claude_state.restore", logContext, () =>
+		restoreClaudeLocalState(
+			sandbox,
+			store,
+			sessionId,
+			workspaceMount.mountPath,
+		),
+	);
+	logCcrSandboxStartup("info", "claude_state.restore.ok", logContext, {
+		sessionMode: restoredState.sessionMode,
+		transcriptEvents: restoredState.transcriptEvents,
+	});
+	await runStartupStep("runner.dir.ensure", logContext, () =>
+		sandbox.exec(`mkdir -p ${shellQuote(dirname(RUNNER_PATH))}`, {
+			origin: "internal",
+		}),
+	);
+	await runStartupStep("runner.env.write", logContext, () =>
+		sandbox.writeFile(ENV_PATH, buildEnvScript(env)),
+	);
+	await runStartupStep("runner.script.write", logContext, () =>
+		sandbox.writeFile(RUNNER_PATH, buildRunnerScript()),
+	);
+	await runStartupStep("runner.env.chmod", logContext, () =>
+		sandbox.exec(`chmod 600 ${ENV_PATH}`),
+	);
+	await runStartupStep("runner.script.chmod", logContext, () =>
+		sandbox.exec(`chmod +x ${RUNNER_PATH}`),
+	);
+	const process = await runStartupStep("runner.process.start", logContext, () =>
+		sandbox.startProcess(
+			[
+				"sh -lc",
+				shellQuote(
+					[
+						`. ${ENV_PATH};`,
+						"exec",
+						RUNNER_PATH,
+						shellQuote(sessionId),
+						shellQuote(workerAccessToken),
+						shellQuote(aiProxyToken),
+						shellQuote(restoredState.sessionMode),
+						shellQuote(workspaceMount.mountPath),
+						`> ${shellQuote(RUNNER_LOG_PATH)} 2>&1`,
+					].join(" "),
+				),
+			].join(" "),
+			{ cwd: workspaceMount.mountPath },
+		),
 	);
 	try {
-		await store.setSessionRunner(sessionId, sandboxId, process.id);
+		await runStartupStep("runner.db.bind", logContext, () =>
+			store.setSessionRunner(sessionId, sandboxId, process.id),
+		);
 	} catch (error) {
 		// 如果 project/session 在启动进程期间被删除，必须立刻杀掉刚创建的 runner。
-		await sandbox.killProcess(process.id).catch(() => undefined);
-		const remainingProcesses = await sandbox.listProcesses().catch(() => null);
+		logCcrSandboxStartup("warn", "runner.db.bind.cleanup", logContext, {
+			processId: process.id,
+			error: serializeLogError(error),
+		});
+		await sandbox.killProcess(process.id).catch((killError) => {
+			logCcrSandboxStartup("warn", "runner.cleanup.kill_failed", logContext, {
+				processId: process.id,
+				error: serializeLogError(killError),
+			});
+			return undefined;
+		});
+		const remainingProcesses = await sandbox.listProcesses().catch((listError) => {
+			logCcrSandboxStartup("warn", "runner.cleanup.list_failed", logContext, {
+				error: serializeLogError(listError),
+			});
+			return null;
+		});
 		if (Array.isArray(remainingProcesses)) {
 			await store.updateUserContainer(userId, {
 				containerStatus: remainingProcesses.length > 0 ? "running" : "stopped",
@@ -865,23 +1107,31 @@ export async function startCcrSandbox(
 		}
 		throw error;
 	}
-	await store.updateUserContainer(userId, {
-		containerStatus: "running",
-		sandboxId,
-	});
-	await store.recordOperation(sessionId, {
-		direction: "route_internal",
-		category: "sandbox_started",
-		payload: {
-			sandbox_id: sandboxId,
-			process_id: process.id,
-			claude_session_mode: restoredState.sessionMode,
-			transcript_events: restoredState.transcriptEvents,
-			workspace_mount_path: workspaceMount.mountPath,
-			workspace_project_id: workspaceMount.projectId,
-			workspace_project_name: workspaceMount.projectName,
-			workspace_mounted: workspaceMount.mounted,
-		},
+	await runStartupStep("user_container.mark_running", logContext, () =>
+		store.updateUserContainer(userId, {
+			containerStatus: "running",
+			sandboxId,
+		}),
+	);
+	await runStartupStep("operation.record_started", logContext, () =>
+		store.recordOperation(sessionId, {
+			direction: "route_internal",
+			category: "sandbox_started",
+			payload: {
+				sandbox_id: sandboxId,
+				process_id: process.id,
+				claude_session_mode: restoredState.sessionMode,
+				transcript_events: restoredState.transcriptEvents,
+				workspace_mount_path: workspaceMount.mountPath,
+				workspace_project_id: workspaceMount.projectId,
+				workspace_project_name: workspaceMount.projectName,
+				workspace_mounted: workspaceMount.mounted,
+			},
+		}),
+	);
+	logCcrSandboxStartup("info", "complete", logContext, {
+		processId: process.id,
+		sessionMode: restoredState.sessionMode,
 	});
 	return {
 		sandbox_id: sandboxId,

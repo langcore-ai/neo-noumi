@@ -3,17 +3,11 @@ import {
 	DEFAULT_CONTAINER_TERMINAL_SESSION_ID,
 	readTerminalSessionId,
 } from "../src/worker/lib/container-terminal";
-import {
-	buildUserContainerId,
-	USER_CONTAINER_SANDBOX_ID_PREFIX,
-} from "../src/worker/lib/container-identity";
+import { buildUserContainerId } from "../src/worker/lib/container-identity";
 
 describe("container terminal route helpers", () => {
 	test("uses the existing user-level sandbox id shape", () => {
-		const userId = "user123";
-		expect(buildUserContainerId(userId)).toBe(
-			`${USER_CONTAINER_SANDBOX_ID_PREFIX}-${userId}`,
-		);
+		expect(buildUserContainerId("user123")).toBe("neo-noumi-user-user123");
 	});
 
 	test("defaults terminal session without requiring a query", () => {

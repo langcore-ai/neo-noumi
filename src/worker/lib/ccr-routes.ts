@@ -992,13 +992,35 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			return streamSse(c, async (output) => {
 				let acceptedEvents: Awaited<ReturnType<CcrStore["enqueueChatInput"]>> = [];
 				try {
+					console.info({
+						component: "ccr-routes",
+						event: "ccr.messages.sse.begin",
+						sessionId,
+						userId: c.get("userId"),
+						cursor,
+						messageCount: messages.length,
+					});
 					// 先写入 session frame，让浏览器在 sandbox 启动前就建立长连接。
 					await output.write(
 						formatSseControlFrame("session", {
 							session,
 						}),
 					);
+					console.info({
+						component: "ccr-routes",
+						event: "ccr.messages.sse.session_frame_written",
+						sessionId,
+						userId: c.get("userId"),
+					});
 					acceptedEvents = await store.enqueueChatInput(sessionId, messages, control);
+					console.info({
+						component: "ccr-routes",
+						event: "ccr.messages.sse.input_enqueued",
+						sessionId,
+						userId: c.get("userId"),
+						acceptedEventCount: acceptedEvents.length,
+						acceptedEventIds: acceptedEvents.map((event) => event.event_id),
+					});
 					try {
 						await startCcrSandbox(
 							c.req.raw,
@@ -1008,18 +1030,52 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 							sessionId,
 						);
 					} catch (error) {
+						console.error({
+							component: "ccr-routes",
+							event: "ccr.messages.sse.sandbox_start_failed",
+							sessionId,
+							userId: c.get("userId"),
+							acceptedEventIds: acceptedEvents.map((event) => event.event_id),
+							error: error instanceof Error
+								? {
+										name: error.name,
+										message: error.message,
+										stack: error.stack,
+									}
+								: { message: String(error) },
+						});
 						// 输入已入库但 runner 未启动时，不能继续保留 queued，避免下次启动误执行旧输入。
 						await store.markClientEventsFailed(
 							sessionId,
 							acceptedEvents.map((event) => event.event_id),
 						);
+						console.warn({
+							component: "ccr-routes",
+							event: "ccr.messages.sse.input_marked_failed",
+							sessionId,
+							userId: c.get("userId"),
+							acceptedEventIds: acceptedEvents.map((event) => event.event_id),
+						});
 						throw error;
 					}
+					console.info({
+						component: "ccr-routes",
+						event: "ccr.messages.sse.sandbox_started",
+						sessionId,
+						userId: c.get("userId"),
+					});
 					await output.write(
 						formatSseControlFrame("session", {
 							session: await store.findUserSessionSummary(c.get("userId"), sessionId),
 						}),
 					);
+					console.info({
+						component: "ccr-routes",
+						event: "ccr.messages.sse.timeline_stream_begin",
+						sessionId,
+						userId: c.get("userId"),
+						cursor,
+					});
 					await streamChatTimeline(
 						output,
 						store,
@@ -1030,7 +1086,26 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 							closeOnTerminal: true,
 						},
 					);
+					console.info({
+						component: "ccr-routes",
+						event: "ccr.messages.sse.timeline_stream_end",
+						sessionId,
+						userId: c.get("userId"),
+					});
 				} catch (error) {
+					console.error({
+						component: "ccr-routes",
+						event: "ccr.messages.sse.error",
+						sessionId,
+						userId: c.get("userId"),
+						error: error instanceof Error
+							? {
+									name: error.name,
+									message: error.message,
+									stack: error.stack,
+								}
+							: { message: String(error) },
+					});
 					await output.write(
 						formatSseControlFrame("error", {
 							error: error instanceof Error ? error.message : String(error),
