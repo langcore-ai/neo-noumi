@@ -44,7 +44,7 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
 		if (!projectId || !file) {
 			return null;
 		}
-		return buildWorkspaceFileDownloadUrl(projectId, file.path);
+		return buildWorkspaceFileDownloadUrl(projectId, file.path, file.etag);
 	}, [file, projectId]);
 	const writeUrl = useMemo(() => {
 		if (!projectId) {

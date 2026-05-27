@@ -522,6 +522,43 @@ describe("workspace R2 operations", () => {
 		).resolves.toBeNull();
 	});
 
+	test("checks etag before creating R2 presigned download urls", async () => {
+		const { bucket } = createFakeR2Bucket({
+			"project-1/src/readme.md": "hello",
+		});
+
+		await expect(
+			createWorkspaceDownloadUrl(
+				{
+					PROJECT_WORKSPACE_BUCKET_NAME: "test-workspaces",
+					R2_ACCOUNT_ID: "account-id",
+					R2_ACCESS_KEY_ID: "access-key",
+					R2_SECRET_ACCESS_KEY: "secret-key",
+				},
+				bucket,
+				"project-1",
+				"src/readme.md",
+				{ ifMatch: "etag-project-1/src/readme.md" },
+			),
+		).resolves.toMatchObject({
+			etag: "etag-project-1/src/readme.md",
+		});
+		await expect(
+			createWorkspaceDownloadUrl(
+				{
+					PROJECT_WORKSPACE_BUCKET_NAME: "test-workspaces",
+					R2_ACCOUNT_ID: "account-id",
+					R2_ACCESS_KEY_ID: "access-key",
+					R2_SECRET_ACCESS_KEY: "secret-key",
+				},
+				bucket,
+				"project-1",
+				"src/readme.md",
+				{ ifMatch: "stale-etag" },
+			),
+		).rejects.toThrow("Workspace file etag does not match");
+	});
+
 	test("rejects presigned upload urls above the file size limit", async () => {
 		await expect(
 			createWorkspaceUploadUrls(

@@ -145,8 +145,8 @@ describe("workspace file preview helpers", () => {
 	});
 
 	test("builds an encoded workspace file download URL", () => {
-		expect(buildWorkspaceFileDownloadUrl("project 1", "dir/合同 v1.pdf")).toBe(
-			"/api/projects/project%201/workspace/file?path=dir%2F%E5%90%88%E5%90%8C+v1.pdf",
+		expect(buildWorkspaceFileDownloadUrl("project 1", "dir/合同 v1.pdf", "etag 1")).toBe(
+			"/api/projects/project%201/workspace/file?path=dir%2F%E5%90%88%E5%90%8C+v1.pdf&etag=etag+1",
 		);
 	});
 

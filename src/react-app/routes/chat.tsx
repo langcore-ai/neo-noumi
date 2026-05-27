@@ -324,6 +324,21 @@ function ChatPage() {
 		}
 	}, [sessionModel, sessionPermissionMode]);
 
+	useEffect(() => {
+		setOpenFileTabs((current) =>
+			current.map((tab) => {
+				const item = workspaceItems[tab.path];
+				if (!item || item.type !== "file") {
+					return tab;
+				}
+				// 文件树刷新后同步 etag，确保预览 URL 只在文件版本变化时更新。
+				return item.etag === tab.etag && item.name === tab.name
+					? tab
+					: { ...tab, etag: item.etag, name: item.name };
+			}),
+		);
+	}, [workspaceItems]);
+
 	/**
 	 * 重置完整对话上下文。
 	 */
@@ -603,7 +618,15 @@ function ChatPage() {
 		setOpenFileTabs((current) => {
 			return current.some((tab) => tab.path === item.path)
 				? current
-				: [...current, { path: item.path, name: item.name, mode: "preview" }];
+				: [
+						...current,
+						{
+							path: item.path,
+							name: item.name,
+							etag: item.etag,
+							mode: "preview",
+						},
+					];
 		});
 		setActiveFilePath(item.path);
 	}
@@ -1145,10 +1168,9 @@ function ChatPage() {
 				/>
 
 				<ResizablePanel
-					defaultSize={hasPreviewPanel ? 33 : 50}
-					minSize={30}
-					maxSize={60}
-					className="min-w-96"
+					defaultSize={hasPreviewPanel ? "49%" : "83%"}
+					minSize={hasPreviewPanel ? "30%" : "75%"}
+					maxSize={hasPreviewPanel ? "60%" : "86%"}
 				>
 					<section className="flex h-full min-h-0 min-w-0 flex-col">
 						<header className="flex shrink-0 items-center justify-between gap-3 border-b px-4 py-3">

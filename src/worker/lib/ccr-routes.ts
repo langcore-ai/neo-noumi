@@ -35,6 +35,7 @@ import {
 	normalizeWorkspacePath,
 	signWorkspaceOperation,
 	createWorkspaceUploadUrls,
+	WORKSPACE_DOWNLOAD_URL_TTL_SECONDS,
 	WORKSPACE_UPLOAD_MAX_FILE_SIZE,
 	WORKSPACE_UPLOAD_MAX_FILES,
 	writeWorkspaceFile,
@@ -617,15 +618,28 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 		if ("error" in pathResult) {
 			return c.json({ error: pathResult.error }, 400);
 		}
-		const download = await createWorkspaceDownloadUrl(
-			c.env,
-			c.env.PROJECT_WORKSPACE_BUCKET,
-			projectId,
-			pathResult.path,
-		);
+		const etag = c.req.query("etag");
+		let download;
+		try {
+			download = await createWorkspaceDownloadUrl(
+				c.env,
+				c.env.PROJECT_WORKSPACE_BUCKET,
+				projectId,
+				pathResult.path,
+				{ ifMatch: etag },
+			);
+		} catch (error) {
+			if (error instanceof Error && error.message === "Workspace file etag does not match") {
+				return c.json({ error: error.message }, 412);
+			}
+			throw error;
+		}
 		if (!download) {
 			return c.json({ error: "Workspace file not found" }, 404);
 		}
+		c.header("Cache-Control", `private, max-age=${WORKSPACE_DOWNLOAD_URL_TTL_SECONDS}`);
+		c.header("X-Workspace-ETag", download.etag);
+		c.header("Vary", "Cookie, Authorization");
 		return c.redirect(download.downloadUrl, 302);
 	});
 

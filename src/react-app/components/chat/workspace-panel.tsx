@@ -169,8 +169,8 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 
 	return (
 		<>
-			<ResizablePanel defaultSize={17} minSize={14} maxSize={25} className="min-w-64">
-				<section className="flex h-full min-h-0 flex-col border-r bg-muted/20">
+			<ResizablePanel defaultSize="17%" minSize="14%" maxSize="25%">
+				<section className="flex h-full min-h-0 min-w-0 flex-col border-r bg-muted/20">
 					<header className="flex shrink-0 flex-col gap-3 border-b p-4">
 						<div className="flex items-center justify-between gap-3">
 							<div className="min-w-0">
@@ -518,12 +518,11 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 			{hasPreviewPanel ? (
 				<>
 					<ResizablePanel
-						defaultSize={34}
-						minSize={24}
-						maxSize={50}
-						className="min-w-80"
+						defaultSize="34%"
+						minSize="24%"
+						maxSize="50%"
 					>
-						<section className="flex h-full min-h-0 flex-col border-r bg-background">
+						<section className="flex h-full min-h-0 min-w-0 flex-col border-r bg-background">
 							<div className="flex shrink-0 items-end gap-1 overflow-x-auto border-b bg-muted/20 px-3 pt-3">
 								{openFileTabs.map((tab) => (
 									<button

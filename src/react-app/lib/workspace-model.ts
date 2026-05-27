@@ -4,6 +4,8 @@ export interface WorkspaceTreeNode {
 	name: string;
 	type: "directory" | "file";
 	size?: number;
+	/** 文件 etag，用于构造稳定的预览版本 URL。 */
+	etag?: string;
 	uploaded?: string;
 }
 
@@ -38,6 +40,8 @@ export interface WorkspaceTreeItem {
 	children?: string[];
 	fileExtension?: string;
 	size?: number;
+	/** 文件 etag，用于预览缓存和编辑防旧写。 */
+	etag?: string;
 	uploaded?: string;
 	isLoaded?: boolean;
 	isTruncated?: boolean;
@@ -47,6 +51,8 @@ export interface WorkspaceTreeItem {
 export interface OpenFileTab {
 	path: string;
 	name: string;
+	/** 打开文件时对应的 etag，文件更新后会随文件树刷新同步。 */
+	etag?: string;
 	/** 当前文件功能模式；PDF 等只读格式固定为 preview。 */
 	mode: "preview" | "edit";
 }
@@ -113,10 +119,18 @@ export function isMarkdownWorkspaceFile(file: string): boolean {
  * 构造 workspace 文件下载 API 地址。
  * @param projectId Project ID
  * @param path workspace 文件路径
+ * @param etag 文件版本 etag；存在时作为缓存版本参数
  * @returns 同源下载入口；后端负责鉴权并跳转到对象存储短期 URL
  */
-export function buildWorkspaceFileDownloadUrl(projectId: string, path: string): string {
+export function buildWorkspaceFileDownloadUrl(
+	projectId: string,
+	path: string,
+	etag?: string,
+): string {
 	const params = new URLSearchParams({ path });
+	if (etag) {
+		params.set("etag", etag);
+	}
 	return `/api/projects/${encodeURIComponent(projectId)}/workspace/file?${params.toString()}`;
 }
 
@@ -376,6 +390,7 @@ export function workspaceNodeToTreeItem(node: WorkspaceTreeNode): WorkspaceTreeI
 		children: node.type === "directory" ? [] : undefined,
 		fileExtension: node.type === "file" ? getFileExtension(node.name) : undefined,
 		size: node.size,
+		etag: node.etag,
 		uploaded: node.uploaded,
 		isLoaded: node.type === "file",
 	};

@@ -732,12 +732,16 @@ export async function createWorkspaceDownloadUrl(
 	bucket: R2Bucket,
 	projectId: string,
 	path: string,
+	options: { ifMatch?: string } = {},
 ): Promise<WorkspaceDownloadUrl | null> {
 	const normalizedPath = normalizeWorkspacePath(path);
 	const objectKey = buildWorkspaceObjectKey(projectId, normalizedPath);
 	const object = await bucket.head(objectKey);
 	if (!object) {
 		return null;
+	}
+	if (options.ifMatch && object.etag !== options.ifMatch) {
+		throw new Error("Workspace file etag does not match");
 	}
 	const signed = await createPresignedWorkspaceObjectUrl(env, {
 		key: objectKey,

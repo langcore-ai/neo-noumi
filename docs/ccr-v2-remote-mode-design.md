@@ -1057,7 +1057,7 @@ Neo Noumi 当前至少会恢复 Claude Code 自己的运行期状态：
 - 后端 API 负责校验 project ownership、规范化相对路径并拒绝 `..` 越权路径。
 - 每次 workspace API 操作都会基于 `WORKSPACE_SIGNING_SECRET` 生成后端 HMAC 签名，签名覆盖操作类型、projectId、路径、请求体摘要和过期时间。
 - 文件树读取只使用 POST JSON body 传递 `prefix`，避免深层目录或长中文路径突破 URL 长度限制。
-- 文件/文件夹上传先由后端校验数量、声明大小和路径，再签发短期 R2 S3 presigned PUT URL，由前端直接 PUT 到 R2；文件读取先由后端校验 project owner 和 workspace 路径，再签发短期 R2 S3 presigned GET URL 并重定向。部署时 `PROJECT_WORKSPACE_BUCKET_NAME` 必须和 R2 binding bucket 保持一致，bucket 必须允许前端 origin 对 R2 S3 endpoint 发起 `PUT` / `GET` 的 CORS 请求。
+- 文件/文件夹上传先由后端校验数量、声明大小和路径，再签发短期 R2 S3 presigned PUT URL，由前端直接 PUT 到 R2；文件读取先由后端校验 project owner 和 workspace 路径，再签发短期 R2 S3 presigned GET URL 并重定向。前端预览 URL 会携带当前文件 `etag` 作为版本参数，后端在 etag 匹配时给 302 返回 `private` 短缓存，文件更新后 URL 随 etag 改变以自然失效。部署时 `PROJECT_WORKSPACE_BUCKET_NAME` 必须和 R2 binding bucket 保持一致，bucket 必须允许前端 origin 对 R2 S3 endpoint 发起 `PUT` / `GET` 的 CORS 请求。
 - 每次 chat 启动 Claude Code runner 前，A 会校验 session 所属 project 的 workspace 是否已经挂载到 sandbox：目标路径是 `/workspace/{projectName}`，R2 prefix 是 `/{projectId}`；已挂载时跳过，未挂载时通过 `PROJECT_WORKSPACE_BUCKET` binding 执行只读 `mountBucket`。
 - workspace 写入由主服务的 route-side MCP 工具执行，当前工具包括 `workspace_stat`、`workspace_list`、`workspace_read_file`、`workspace_mkdir`、`workspace_create_file`、`workspace_write_file`、`workspace_delete`、`workspace_move` 和 `workspace_copy`。这些工具只接收 workspace 相对路径，project 从当前 CCR session 推导，避免模型传入任意 projectId。
 - MCP 写工具的约束：路径拒绝父级穿越、控制字符和 Windows drive path，写入目标的父级不能是文件；`workspace_read_file` 限制单文件读取大小；`workspace_delete` 删除目录必须显式 `recursive=true`；`workspace_mkdir` 支持 `recursive=true` 的 `mkdir -p` 行为；`workspace_create_file` 不覆盖已有文件；`workspace_write_file` 只做全量写入并支持 `ifMatch` etag 防旧写；`workspace_move` / `workspace_copy` 默认不覆盖目标路径，目录操作限制最大对象数。
