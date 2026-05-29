@@ -26,6 +26,7 @@ import { getStringField, isJsonObject, readJsonObject, toJsonValue } from "./jso
 import { isTerminalWorkerPayload, readWorkerEpoch } from "./ccr-protocol";
 import { getSessionDetailResponse } from "./session-detail";
 import { createSessionInternalEventsJsonlResponse } from "./session-internal-events-export";
+import { getRouteMcpServerName, type WorkerEnvInput } from "./worker-env";
 import {
 	createWorkspaceDirectory,
 	createWorkspaceDownloadUrl,
@@ -73,7 +74,10 @@ type HeaderContext = {
 };
 
 /** CCR route 需要的 Worker 绑定 */
-export type CcrBindings = AuthBindings & NeoNoumiSandboxBindings & ProjectWorkspaceBindings;
+export type CcrBindings = AuthBindings &
+	NeoNoumiSandboxBindings &
+	ProjectWorkspaceBindings &
+	WorkerEnvInput;
 
 /** CCR route 上下文变量 */
 type CcrVariables = {
@@ -88,6 +92,7 @@ type CcrVariables = {
 function createStore(env: CcrBindings): CcrStore {
 	return new CcrStore(createRoutePrismaClient(env), {
 		aiProxyCredentialSecret: env.AI_PROXY_CREDENTIAL_SECRET,
+		routeMcpServerName: getRouteMcpServerName(env),
 	});
 }
 
@@ -1287,6 +1292,7 @@ export function mountCcrRoutes(app: Hono<{ Bindings: Env & CcrBindings; Variable
 			}
 			const response = await handleControlRequest(payload, {
 				env: c.env,
+				routeMcpServerName: getRouteMcpServerName(c.env),
 				sessionId,
 				store,
 				userId: c.get("userId"),

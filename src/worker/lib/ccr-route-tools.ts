@@ -6,39 +6,11 @@ import {
 	type WorkspaceToolContext,
 } from "./ccr-workspace-tools";
 
-/** route 侧 MCP server 名称，必须和初始化注入的 sdkMcpServers 保持一致。 */
-export const ROUTE_MCP_SERVER_NAME = "ccr-route";
-
-/** Claude Code 可见的测试工具名。 */
-export const A_EXTERNAL_TOOL_TEST_NAME = "AExternalToolTest";
-
 /** route 侧工具执行上下文。 */
 export type RouteToolContext = WorkspaceToolContext;
 
 /** route 侧内置工具列表。 */
-const ROUTE_TOOLS: RouteToolDefinition[] = [
-	{
-		name: A_EXTERNAL_TOOL_TEST_NAME,
-		description:
-			"Test route-side remote tool. Echoes a small message from the Neo Noumi CCR route process.",
-		inputSchema: {
-			type: "object",
-			properties: {
-				message: { type: "string" },
-			},
-		},
-		async call(input, context) {
-			// 测试工具只回显输入和 session，避免默认 route-side 工具具备高风险能力。
-			return JSON.stringify({
-				ok: true,
-				tool: A_EXTERNAL_TOOL_TEST_NAME,
-				sessionId: context.sessionId,
-				message: typeof input.message === "string" ? input.message : "ccr remote tool ping",
-			});
-		},
-	},
-	...WORKSPACE_ROUTE_TOOLS,
-];
+const ROUTE_TOOLS: RouteToolDefinition[] = [...WORKSPACE_ROUTE_TOOLS];
 
 /**
  * 列出 route 侧 MCP 工具。

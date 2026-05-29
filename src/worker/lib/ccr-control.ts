@@ -2,9 +2,9 @@ import { getStringField, isJsonObject } from "./json";
 import {
 	callRouteTool,
 	listRouteTools,
-	ROUTE_MCP_SERVER_NAME,
 	type RouteToolContext,
 } from "./ccr-route-tools";
+import { DEFAULT_ROUTE_MCP_SERVER_NAME } from "./worker-env";
 import type { JsonObject } from "./json";
 
 /** Claude Code 对外可见的权限模式。 */
@@ -35,15 +35,24 @@ export interface ControlResponsePayload extends JsonObject {
 /** 工具权限申请的用户决策。 */
 export type ToolPermissionDecision = "allow" | "deny";
 
+/** route control_request 处理上下文。 */
+export type RouteControlContext = RouteToolContext & {
+	/** 当前请求使用的 route-side MCP server 名称。 */
+	routeMcpServerName?: string;
+};
+
 /**
  * 构造 route-side MCP 初始化 control_request。
+ * @param routeMcpServerName route 侧 MCP server 名称
  * @returns 下发给 Claude Code 的 control_request payload
  */
-export function buildRouteMcpInitializeRequest(): JsonObject {
+export function buildRouteMcpInitializeRequest(
+	routeMcpServerName: string = DEFAULT_ROUTE_MCP_SERVER_NAME,
+): JsonObject {
 	return {
 		type: "control_request",
 		request_id: crypto.randomUUID(),
-		request: { subtype: "initialize", sdkMcpServers: [ROUTE_MCP_SERVER_NAME] },
+		request: { subtype: "initialize", sdkMcpServers: [routeMcpServerName] },
 	};
 }
 
@@ -159,7 +168,7 @@ export function buildControlError(
  */
 export async function handleControlRequest(
 	payload: JsonObject,
-	context: RouteToolContext,
+	context: RouteControlContext,
 ): Promise<ControlResponsePayload | null> {
 	const requestId = getStringField(payload, "request_id");
 	const request = isJsonObject(payload.request) ? payload.request : undefined;
@@ -224,14 +233,15 @@ export function buildCanUseToolDecisionResponse(
  */
 async function handleMcpMessage(
 	request: JsonObject,
-	context: RouteToolContext,
+	context: RouteControlContext,
 ): Promise<JsonObject> {
+	const routeMcpServerName = context.routeMcpServerName ?? DEFAULT_ROUTE_MCP_SERVER_NAME;
 	const message = isJsonObject(request.message) ? request.message : {};
 	const method = getStringField(message, "method");
 	const id = message.id ?? null;
 	const serverName = getStringField(request, "server_name");
 
-	if (serverName && serverName !== ROUTE_MCP_SERVER_NAME) {
+	if (serverName && serverName !== routeMcpServerName) {
 		return {
 			mcp_response: {
 				jsonrpc: "2.0",
@@ -249,7 +259,7 @@ async function handleMcpMessage(
 				result: {
 					protocolVersion: "2024-11-05",
 					capabilities: { tools: {} },
-					serverInfo: { name: ROUTE_MCP_SERVER_NAME, version: "0.1.0" },
+					serverInfo: { name: routeMcpServerName, version: "0.1.0" },
 				},
 			},
 		};

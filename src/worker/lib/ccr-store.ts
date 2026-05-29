@@ -508,7 +508,12 @@ const projectSessionLifecycleSelect = {
 export class CcrStore {
 	constructor(
 		private readonly prisma: PrismaClient,
-		private readonly options: { aiProxyCredentialSecret?: string } = {},
+		private readonly options: {
+			/** 用户级 AI Proxy credential 加密密钥。 */
+			aiProxyCredentialSecret?: string;
+			/** route-side MCP server 名称，用于首轮初始化注入。 */
+			routeMcpServerName?: string;
+		} = {},
 	) {}
 
 	/**
@@ -1523,7 +1528,7 @@ export class CcrStore {
 		const builtControls = this.buildChatControlEvents(control);
 		const events: ClientEventEnqueueInput[] = [
 			{
-				payload: buildRouteMcpInitializeRequest(),
+				payload: buildRouteMcpInitializeRequest(this.options.routeMcpServerName),
 				eventType: "control_request",
 				source: "chat-api",
 			},

@@ -8,14 +8,10 @@ import {
 	handleControlRequest,
 	isCcrPermissionMode,
 } from "../src/worker/lib/ccr-control";
-import {
-	A_EXTERNAL_TOOL_TEST_NAME,
-	callRouteTool,
-	listRouteTools,
-	ROUTE_MCP_SERVER_NAME,
-} from "../src/worker/lib/ccr-route-tools";
+import { callRouteTool, listRouteTools } from "../src/worker/lib/ccr-route-tools";
 import type { CcrStore } from "../src/worker/lib/ccr-store";
 import { WORKSPACE_READ_MAX_FILE_SIZE } from "../src/worker/lib/project-workspace";
+import { DEFAULT_ROUTE_MCP_SERVER_NAME } from "../src/worker/lib/worker-env";
 
 /**
  * 创建 workspace MCP 工具测试上下文。
@@ -42,9 +38,9 @@ function createWorkspaceToolContext(bucket?: R2Bucket) {
 }
 
 describe("route MCP tools", () => {
-	test("lists AExternalToolTest for Claude Code", () => {
-		expect(listRouteTools()).toContainEqual(
-			expect.objectContaining({ name: A_EXTERNAL_TOOL_TEST_NAME }),
+	test("does not expose the removed AExternalToolTest MCP tool", () => {
+		expect(listRouteTools()).not.toContainEqual(
+			expect.objectContaining({ name: "AExternalToolTest" }),
 		);
 	});
 
@@ -65,7 +61,16 @@ describe("route MCP tools", () => {
 		expect(payload.type).toBe("control_request");
 		expect(payload.request).toEqual({
 			subtype: "initialize",
-			sdkMcpServers: [ROUTE_MCP_SERVER_NAME],
+			sdkMcpServers: [DEFAULT_ROUTE_MCP_SERVER_NAME],
+		});
+	});
+
+	test("builds the initial control request with overridden route MCP server", () => {
+		const payload = buildRouteMcpInitializeRequest("custom-route");
+
+		expect(payload.request).toEqual({
+			subtype: "initialize",
+			sdkMcpServers: ["custom-route"],
 		});
 	});
 
@@ -108,7 +113,7 @@ describe("route MCP tools", () => {
 				request_id: "request-1",
 				request: {
 					subtype: "mcp_message",
-					server_name: ROUTE_MCP_SERVER_NAME,
+					server_name: DEFAULT_ROUTE_MCP_SERVER_NAME,
 					message: { jsonrpc: "2.0", id: 1, method: "tools/list" },
 				},
 			},
@@ -125,20 +130,20 @@ describe("route MCP tools", () => {
 		});
 	});
 
-	test("handles AExternalToolTest tools/call MCP message", async () => {
+	test("returns an MCP tool error for the removed AExternalToolTest tool", async () => {
 		const response = await handleControlRequest(
 			{
 				type: "control_request",
 				request_id: "request-2",
 				request: {
 					subtype: "mcp_message",
-					server_name: ROUTE_MCP_SERVER_NAME,
+					server_name: DEFAULT_ROUTE_MCP_SERVER_NAME,
 					message: {
 						jsonrpc: "2.0",
 						id: 2,
 						method: "tools/call",
 						params: {
-							name: A_EXTERNAL_TOOL_TEST_NAME,
+							name: "AExternalToolTest",
 							arguments: { message: "hello route" },
 						},
 					},
@@ -155,10 +160,13 @@ describe("route MCP tools", () => {
 				id: 2,
 				result: expect.objectContaining({
 					content: expect.any(Array),
+					isError: true,
 				}),
 			}),
 		);
-		expect(JSON.stringify(mcpResponse)).toContain("hello route");
+		expect(mcpResponse?.result?.content?.[0]?.text).toContain(
+			"Unknown route tool: AExternalToolTest",
+		);
 	});
 
 	test("handles workspace stat tools/call MCP message", async () => {
@@ -168,7 +176,7 @@ describe("route MCP tools", () => {
 				request_id: "request-workspace-stat",
 				request: {
 					subtype: "mcp_message",
-					server_name: ROUTE_MCP_SERVER_NAME,
+					server_name: DEFAULT_ROUTE_MCP_SERVER_NAME,
 					message: {
 						jsonrpc: "2.0",
 						id: 20,
@@ -195,6 +203,33 @@ describe("route MCP tools", () => {
 			}),
 		);
 		expect(mcpResponse?.result?.content?.[0]?.text).toContain("\"stat\":null");
+	});
+
+	test("handles MCP messages for an overridden route server name", async () => {
+		const response = await handleControlRequest(
+			{
+				type: "control_request",
+				request_id: "request-custom-server",
+				request: {
+					subtype: "mcp_message",
+					server_name: "custom-route",
+					message: { jsonrpc: "2.0", id: 21, method: "initialize" },
+				},
+			},
+			{ routeMcpServerName: "custom-route", sessionId: "session-1" },
+		);
+
+		expect(response?.response.response).toEqual({
+			mcp_response: {
+				jsonrpc: "2.0",
+				id: 21,
+				result: {
+					protocolVersion: "2024-11-05",
+					capabilities: { tools: {} },
+					serverInfo: { name: "custom-route", version: "0.1.0" },
+				},
+			},
+		});
 	});
 
 	test("rejects oversized workspace read_file route tool calls", async () => {

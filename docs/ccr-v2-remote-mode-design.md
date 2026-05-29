@@ -103,7 +103,10 @@ CLAUDE_CODE_ENVIRONMENT_KIND=bridge
 CLAUDE_CODE_USE_CCR_V2=1
 CLAUDE_CODE_WORKER_EPOCH={workerEpoch}
 CLAUDE_CODE_SESSION_ACCESS_TOKEN={workerJwt}
+ROUTE_MCP_SERVER_NAME=ccr-route
 ```
+
+`ROUTE_MCP_SERVER_NAME` 由 Worker 侧 `src/worker/lib/worker-env.ts` 通过 `@t3-oss/env-core` 管理，默认值是 `ccr-route`，部署环境可以通过同名环境变量覆盖。该配置只属于 Worker server env：后端代码使用 Hono/Cloudflare 运行时传入的 `c.env`，前端 Vite 代码不能 import 这个模块；如果未来有前端环境变量，应建立独立 client env 并遵循 Vite 的公开变量前缀。
 
 ### Claude Code 版本约束
 
@@ -906,13 +909,12 @@ AgentTool / subagent
 - A 回填结果时应使用 `control_response`、tool result message，还是专用外部工具响应。
 - 回填后 `/worker/internal-events` 是否需要同步写入，避免 resume 丢失。
 
-现有 route-side MCP 测试工具：
+现有 route-side MCP 能力：
 
 - Chat 输入入队时会先下发 `control_request.initialize`，声明 `sdkMcpServers: ["ccr-route"]`，让 Claude Code 初始化 route-side MCP server。
 - route 已实现最小 MCP JSON-RPC 处理器，支持 `initialize`、`tools/list`、`notifications/initialized` 和 `tools/call`。
-- 当前暴露给 Claude Code 的测试工具是 `AExternalToolTest`，它在 Worker route 进程内执行，返回一段包含 `ok`、`tool`、`sessionId` 和输入 `message` 的 JSON 文本。
+- route-side MCP 只暴露实际业务工具，不再保留 `AExternalToolTest` 这类回显测试工具。
 - `can_use_tool` 不做 route 侧自动授权；用户在 Chat 页选择允许或拒绝后，后端按原始 timeline 中的 request 构造 `control_response` 并投递给容器中的 Claude Code。
-- `bun run test:ccr-remote-tool -- --session-id <session-id> --base-url <origin>` 仍保留为低层协议测试脚本：它绕过 Claude，直接写入一条 assistant `tool_use` visible event、一条对应 internal event，并把 `/worker` 状态置为 `requires_action`，用于验证 route 侧 pending action 持久化。
 
 ## 会话和进程模型
 
@@ -1121,9 +1123,7 @@ Neo Noumi 现在仍以 CCR v2 的 `/worker/internal-events` 和 `/worker` metada
 
 - 通过 `control_request.initialize` 注入 `ccr-route` MCP server。
 - 处理 Claude Code 发出的 `mcp_message`，支持 `tools/list` 和 `tools/call`。
-- 保留测试工具 `AExternalToolTest`，在 route 进程内执行并通过 `control_response` 回填结果。
 - 暴露 workspace MCP 工具，由 route 根据 `sessionId` 和 `userId` 校验 session 归属并推导 project，再调用主服务的 R2 workspace 操作函数。
-- `scripts/ccr-remote-tool-test.ts` 仍保留为 pending action 持久化的低层协议测试脚本。
 
 ## 风险
 

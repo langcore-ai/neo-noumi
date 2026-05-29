@@ -47,8 +47,8 @@ const claudeSessionStorePath = (projectStateDir: string, subpath: string) =>
 /** 启动前恢复 internal events 的分页大小。 */
 const TRANSCRIPT_RESTORE_PAGE_SIZE = 500;
 
-/** Claude Code 默认模型；固定到网关可识别的 Sonnet 模型，避免 CLI 选择 Opus 后缀模型。 */
-const CLAUDE_MODEL = "claude-sonnet-4-6";
+/** Claude Code runner 启动默认模型；真实业务模型由前端 set_model control_request 决定。 */
+const CLAUDE_RUNNER_BOOT_MODEL = "claude-sonnet-4-6";
 
 /** Sandbox 观测事件类型白名单。 */
 const SANDBOX_OBSERVATION_EVENT_TYPES = new Set([
@@ -165,8 +165,6 @@ export interface NeoNoumiSandboxBindings extends AiProxyBindings {
 	ANTHROPIC_API_KEY?: string;
 	/** Anthropic 兼容 API base URL；仅由 Worker AI Proxy 转发时读取。 */
 	ANTHROPIC_BASE_URL?: string;
-	/** Claude Code 模型名；默认固定使用 claude-sonnet-4-6 */
-	CLAUDE_MODEL?: string;
 	/** AI Proxy fallback credential 使用的鉴权头类型。 */
 	AI_PROXY_AUTH_HEADER?: string;
 	/** 用户级 AI Proxy credential 加密密钥。 */
@@ -432,7 +430,7 @@ if [ "\${NEO_NOUMI_ENABLE_REAL_CLAUDE:-0}" = "1" ] && command -v claude >/dev/nu
   exec claude --print \
     --sdk-url "https://${CCR_SDK_APPROVED_HOST}/v1/code/sessions/$SESSION_ID" \
     "$CLAUDE_SESSION_ARG" "$SESSION_ID" \
-    --model "\${CLAUDE_MODEL:-${CLAUDE_MODEL}}" \
+    --model "${CLAUDE_RUNNER_BOOT_MODEL}" \
     --input-format stream-json \
     --output-format stream-json \
     --replay-user-messages \
@@ -753,7 +751,6 @@ function buildEnvScript(env: NeoNoumiSandboxBindings): string {
 		`export NEO_NOUMI_ENABLE_REAL_CLAUDE=${shellQuote(
 			env.NEO_NOUMI_ENABLE_REAL_CLAUDE ?? env.CCR_ENABLE_REAL_CLAUDE,
 		)}`,
-		`export CLAUDE_MODEL=${shellQuote(env.CLAUDE_MODEL ?? CLAUDE_MODEL)}`,
 		"",
 	].join("\n");
 }

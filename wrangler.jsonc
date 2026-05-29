@@ -11,7 +11,8 @@
 	},
 	"upload_source_maps": true,
 	"vars": {
-		"PROJECT_WORKSPACE_BUCKET_NAME": "neo-noumi-workspaces"
+		"PROJECT_WORKSPACE_BUCKET_NAME": "neo-noumi-workspaces",
+		"ROUTE_MCP_SERVER_NAME": "ccr-route"
 	},
 	"assets": {
 		"directory": "./dist/client",
